@@ -1179,43 +1179,153 @@ class QuantizedLinear:
         if self.bias is not None: y_np += self.bias
         return torch.from_numpy(y_np)
 
-class QuantizedGRUCell:
-    """A quantized GRU cell implementation using QuantizedLinear layers."""
-    def __init__(self, input_size, hidden_size, name_prefix, q_data):
-        self.input_size, self.hidden_size = input_size, hidden_size
-        self.W_ir = QuantizedLinear(f'{name_prefix}.W_ir', q_data)
-        self.W_hr = QuantizedLinear(f'{name_prefix}.W_hr', q_data)
-        self.W_iz = QuantizedLinear(f'{name_prefix}.W_iz', q_data)
-        self.W_hz = QuantizedLinear(f'{name_prefix}.W_hz', q_data)
-        self.W_in = QuantizedLinear(f'{name_prefix}.W_in', q_data)
-        self.W_hn = QuantizedLinear(f'{name_prefix}.W_hn', q_data)
+class QuantizedRWKVCell:
+    def __init__(self, n_embd, name_prefix, q_data):
+        self.n_embd = n_embd
+        self.key = QuantizedLinear(f'{name_prefix}.key', q_data)
+        self.value = QuantizedLinear(f'{name_prefix}.value', q_data)
+        self.receptance = QuantizedLinear(f'{name_prefix}.receptance', q_data)
+        self.output = QuantizedLinear(f'{name_prefix}.output', q_data)
+        self.key_cm = QuantizedLinear(f'{name_prefix}.key_cm', q_data)
+        self.receptance_cm = QuantizedLinear(f'{name_prefix}.receptance_cm', q_data)
+        self.value_cm = QuantizedLinear(f'{name_prefix}.value_cm', q_data)
 
-    def __call__(self, x: torch.Tensor, h: torch.Tensor, device: str = "cpu") -> torch.Tensor:
-        r = torch.sigmoid(self.W_ir(x, device) + self.W_hr(h, device))
-        z = torch.sigmoid(self.W_iz(x, device) + self.W_hz(h, device))
-        n = torch.tanh(self.W_in(x, device) + r * self.W_hn(h, device))
-        return (1 - z) * n + z * h
+        def load_raw(name):
+            return torch.from_numpy(q_data[f'{name_prefix}.{name}'].item()['raw'])
 
-class GRUCell(nn.Module):
-    """A custom GRU cell implementation using individual Linear layers."""
-    def __init__(self, input_size, hidden_size):
+        self.time_decay = load_raw('time_decay')
+        self.time_first = load_raw('time_first')
+        self.time_mix_k = load_raw('time_mix_k')
+        self.time_mix_v = load_raw('time_mix_v')
+        self.time_mix_r = load_raw('time_mix_r')
+        self.time_mix_k_cm = load_raw('time_mix_k_cm')
+        self.time_mix_r_cm = load_raw('time_mix_r_cm')
+
+    def __call__(self, x, state, device="cpu"):
+        for p in [self.time_decay, self.time_first, self.time_mix_k, self.time_mix_v,
+                  self.time_mix_r, self.time_mix_k_cm, self.time_mix_r_cm]:
+            if p.device.type != device:
+                p = p.to(device)
+
+        sx, aa, bb, pp, sx_cm = state.unbind(dim=2)
+
+        # Time mixing
+        xk = x * self.time_mix_k + sx * (1 - self.time_mix_k)
+        xv = x * self.time_mix_v + sx * (1 - self.time_mix_v)
+        xr = x * self.time_mix_r + sx * (1 - self.time_mix_r)
+
+        r = torch.sigmoid(self.receptance(xr, device))
+        k = self.key(xk, device)
+        v = self.value(xv, device)
+
+        ww = self.time_first + k
+        p = torch.maximum(pp, ww)
+        e1 = torch.exp(pp - p)
+        e2 = torch.exp(ww - p)
+        wkv = (e1 * aa + e2 * v) / (e1 * bb + e2 + 1e-8)
+        x = x + self.output(r * wkv, device)
+
+        ww = pp + self.time_decay
+        p = torch.maximum(ww, k)
+        e1 = torch.exp(ww - p)
+        e2 = torch.exp(k - p)
+        aa = e1 * aa + e2 * v
+        bb = e1 * bb + e2
+        pp = p
+
+        # Channel mixing
+        xk = x * self.time_mix_k_cm + sx_cm * (1 - self.time_mix_k_cm)
+        xr = x * self.time_mix_r_cm + sx_cm * (1 - self.time_mix_r_cm)
+        r = torch.sigmoid(self.receptance_cm(xr, device))
+        k = torch.square(torch.relu(self.key_cm(xk, device)))
+        x = x + r * self.value_cm(k, device)
+
+        new_state = torch.stack([x, aa, bb, pp, x], dim=2)
+        return x, new_state
+
+class RWKVCell(nn.Module):
+    def __init__(self, n_embd):
         super().__init__()
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        # Using individual layers ensures names like "h_rnn.W_ir.weight"
-        self.W_ir = nn.Linear(input_size, hidden_size)
-        self.W_hr = nn.Linear(hidden_size, hidden_size)
-        self.W_iz = nn.Linear(input_size, hidden_size)
-        self.W_hz = nn.Linear(hidden_size, hidden_size)
-        self.W_in = nn.Linear(input_size, hidden_size)
-        self.W_hn = nn.Linear(hidden_size, hidden_size)
+        self.n_embd = n_embd
 
-    def forward(self, x: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
-        r = torch.sigmoid(self.W_ir(x) + self.W_hr(h))
-        z = torch.sigmoid(self.W_iz(x) + self.W_hz(h))
-        n = torch.tanh(self.W_in(x) + r * self.W_hn(h))
-        return (1 - z) * n + z * h
+        # Time mixing
+        self.time_decay = nn.Parameter(torch.zeros(n_embd))
+        self.time_first = nn.Parameter(torch.zeros(n_embd))
+        
+        # Init as (1, 1, n_embd) to match your existing checkpoints/setup
+        self.time_mix_k = nn.Parameter(torch.zeros(1, 1, n_embd))
+        self.time_mix_v = nn.Parameter(torch.zeros(1, 1, n_embd))
+        self.time_mix_r = nn.Parameter(torch.zeros(1, 1, n_embd))
 
+        self.key = nn.Linear(n_embd, n_embd, bias=False)
+        self.value = nn.Linear(n_embd, n_embd, bias=False)
+        self.receptance = nn.Linear(n_embd, n_embd, bias=False)
+        self.output = nn.Linear(n_embd, n_embd, bias=False)
+
+        # Channel mixing
+        self.time_mix_k_cm = nn.Parameter(torch.zeros(1, 1, n_embd))
+        self.time_mix_r_cm = nn.Parameter(torch.zeros(1, 1, n_embd))
+
+        self.key_cm = nn.Linear(n_embd, n_embd * 4, bias=False)
+        self.receptance_cm = nn.Linear(n_embd, n_embd, bias=False)
+        self.value_cm = nn.Linear(n_embd * 4, n_embd, bias=False)
+
+    def forward(self, x, state):
+        # --- FIX: Handle torch.compile artifacts (fake extra batch dim) ---
+        # We verify dimensions to ensure we are working with [Batch, Hidden]
+        if x.dim() == 3 and x.shape[0] == 1:
+            x = x.squeeze(0)
+        if state.dim() == 4 and state.shape[0] == 1:
+            state = state.squeeze(0)
+        # ------------------------------------------------------------------
+
+        # Flatten mixing parameters to 1D to prevent accidental 3D broadcasting
+        # This ensures input [B, H] * param [H] -> [B, H], not [1, B, H]
+        tm_k = self.time_mix_k.view(-1)
+        tm_v = self.time_mix_v.view(-1)
+        tm_r = self.time_mix_r.view(-1)
+        tm_k_cm = self.time_mix_k_cm.view(-1)
+        tm_r_cm = self.time_mix_r_cm.view(-1)
+
+        # Use dim=-1 (last dimension) to be robust against leading batch dims
+        sx, aa, bb, pp, sx_cm = state.unbind(dim=-1)
+
+        # --- Time mixing ---
+        xk = x * tm_k + sx * (1 - tm_k)
+        xv = x * tm_v + sx * (1 - tm_v)
+        xr = x * tm_r + sx * (1 - tm_r)
+
+        r = torch.sigmoid(self.receptance(xr))
+        k = self.key(xk)
+        v = self.value(xv)
+
+        ww = self.time_first + k
+        p = torch.maximum(pp, ww)
+        e1 = torch.exp(pp - p)
+        e2 = torch.exp(ww - p)
+        wkv = (e1 * aa + e2 * v) / (e1 * bb + e2 + 1e-8)
+        x = x + self.output(r * wkv)
+
+        # Update state
+        ww = pp + self.time_decay
+        p = torch.maximum(ww, k)
+        e1 = torch.exp(ww - p)
+        e2 = torch.exp(k - p)
+        aa = e1 * aa + e2 * v
+        bb = e1 * bb + e2
+        pp = p
+
+        # --- Channel mixing ---
+        xk = x * tm_k_cm + sx_cm * (1 - tm_k_cm)
+        xr = x * tm_r_cm + sx_cm * (1 - tm_r_cm)
+        r = torch.sigmoid(self.receptance_cm(xr))
+        k = torch.square(torch.relu(self.key_cm(xk)))
+        x = x + r * self.value_cm(k)
+
+        # NEW STATE: Stack on last dimension (dim=-1)
+        new_state = torch.stack([x, aa, bb, pp, x], dim=-1)
+
+        return x, new_state
 class LTMModule(nn.Module):
     """Titans Long-Term Memory Module. Capable of test-time updates."""
     # SOURCE_ID definitions
@@ -1225,13 +1335,17 @@ class LTMModule(nn.Module):
 
     def __init__(self, n_slots=1024, key_dim=64, val_dim=64, lr=1e-3, momentum=0.9, wd=1e-4):
         super().__init__()
+        # Keys must remain random so they are distinct and addressable by attention queries
         self.keys = nn.Parameter(torch.randn(n_slots, key_dim) * 0.02)
-        self.vals = nn.Parameter(torch.randn(n_slots, val_dim) * 0.02)
+        
+        # FIX 1: Zero Initialization for Values
+        # This prevents random noise injection before the model learns to write data.
+        self.vals = nn.Parameter(torch.zeros(n_slots, val_dim))
+        
         self.register_buffer("_mom_vals", torch.zeros_like(self.vals.data))
         self.lr, self.momentum, self.weight_decay = lr, momentum, wd
 
         # Buffers are not parameters; they are part of the model's state
-        # but are not updated by the optimizer during training.
         self.register_buffer("timestamps", torch.zeros(n_slots, dtype=torch.float32))
         self.register_buffer("sources", torch.full((n_slots,), self.SRC_UNKNOWN, dtype=torch.long))
 
@@ -1378,422 +1492,319 @@ class HierarchosCore(nn.Module):
         super().__init__()
         # Use AttrDict for config to support both dot-notation and .get() method access
         self.config = AttrDict(config)
-
         # --- Ensure required config values exist ---
         required_keys = ['vocab_size', 'context_dim', 'max_length', 'persistent_dim',
                          'ltm_slots', 'ltm_key_dim', 'ltm_val_dim', 'ltm_lr',
                          'ltm_topk', 'h_hidden', 'l_hidden', 'max_h_steps',
-                         'max_l_steps', 'l_conv_atol'] # <<< REMOVED gradient_checkpointing from required
+                         'max_l_steps', 'l_conv_atol']
         for key in required_keys:
-            # Allow max_length to be None initially, it might be set later
             if key not in self.config and key != 'max_length':
                 raise ValueError(f"Missing required configuration key: '{key}'")
-            # Handle case where max_length might be None in config, use a default if needed for pos_emb
             if key == 'max_length' and not self.config.get('max_length'):
-                print("Warning: max_length not found in config during model init. Using default 1024 for pos_emb.")
-                self.config['max_length'] = 1024 # Set a default if missing
+                print("Warning: max_length not found in config during model init. Using default 1024.")
+                self.config['max_length'] = 1024
 
-        # <<< NEW: Add gradient_checkpointing to config with a default >>>
         if 'gradient_checkpointing' not in self.config:
-             self.config['gradient_checkpointing'] = False # Default to False if not provided
-        # <<< END >>>
+            self.config['gradient_checkpointing'] = False
 
         self.tok_emb = nn.Embedding(self.config.vocab_size, self.config.context_dim)
-        # Use the potentially defaulted max_length for pos_emb
-        self.pos_emb = nn.Embedding(self.config.max_length, self.config.context_dim)
-
+        
+        # REMOVED: self.pos_emb = nn.Embedding(...) 
+        # RWKV relies on internal state and time_decay for position/time information.
+        
         self.persistent = nn.Parameter(torch.randn(self.config.persistent_dim) * 0.02)
+
+        # --- FIX: Learnable LTM Gate ---
+        # Initialized to -5.0 so sigmoid(-5.0) is approx 0.006 (closed gate).
+        self.ltm_gate_logit = nn.Parameter(torch.tensor(-5.0))
+
         self.ltm = LTMModule(
             n_slots=self.config.ltm_slots,
             key_dim=self.config.ltm_key_dim,
             val_dim=self.config.ltm_val_dim,
-            lr=self.config.ltm_lr # Note: lr here is mainly for potential direct training, chat uses its own LR
+            lr=self.config.ltm_lr
         )
-        self.qproj = nn.Linear(self.config.context_dim, self.config.ltm_key_dim, bias=False)
 
+        self.qproj = nn.Linear(self.config.context_dim, self.config.ltm_key_dim, bias=False)
         in_dim = self.config.context_dim + self.config.persistent_dim + (self.config.ltm_val_dim * self.config.ltm_topk)
         self.in_proj = nn.Linear(in_dim, self.config.context_dim)
 
-        self.h_rnn = GRUCell(self.config.context_dim, self.config.h_hidden)
+        # RWKV cells
+        self.h_rnn = RWKVCell(self.config.h_hidden)
         self.h_to_context = nn.Linear(self.config.h_hidden, self.config.context_dim)
-        self.l_rnn = GRUCell(self.config.context_dim * 2, self.config.l_hidden)
+
+        self.l_input_proj = nn.Linear(self.config.context_dim * 2, self.config.l_hidden)
+        self.l_rnn = RWKVCell(self.config.l_hidden)
         self.l_to_out = nn.Linear(self.config.l_hidden, self.config.context_dim)
 
-        # Add the halting projection layer
         self.h_halt_proj = nn.Linear(self.config.h_hidden, 1)
-
         self.out_norm = nn.LayerNorm(self.config.context_dim)
         self.lm_head = nn.Linear(self.config.context_dim, self.config.vocab_size, bias=False)
-        self.tok_emb.weight = self.lm_head.weight # Weight tying
+        self.tok_emb.weight = self.lm_head.weight  # weight tying
 
-        # Ensure model config reflects its parameters
-        self.config.model_type = 'hierarchos'
-
-        # <<< NEW: Apply torch.compile to the adaptive HRM step >>>
-        # This compiles the helper method that contains the static L-module loop
-        # for optimized training.
+        # Keep torch.compile — you confirmed it's faster even on CPU!
         try:
-                # Check if torch.compile is available (requires PyTorch 2.0+)
-                if hasattr(torch, "compile"):
-                    print("INFO: torch.compile available. Compiling _adaptive_hrm_step...")
-                    print("INFO: Setting compiler options (no CUDAGraphs, dynamic shapes).")
-
-                    # Note: This line re-binds the method on the instance
-                    self._adaptive_hrm_step = torch.compile(
-                        self._adaptive_hrm_step,
-                        dynamic=True,                     # Fixes recompilation on variable length
-                        options={"triton.cudagraphs": False} # Fixes DataLoader hang
-                    )
-                else:
-                    print("INFO: torch.compile not found (requires PyTorch 2.0+). Skipping compilation.")
+            if hasattr(torch, "compile"):
+                print("INFO: Applying torch.compile to HRM loop (enabled for CPU too!)")
+                self._adaptive_hrm_step = torch.compile(
+                    self._adaptive_hrm_step,
+                    dynamic=True,
+                    fullgraph=False,  # safer with variable loop steps
+                    options={"triton.cudagraphs": False}
+                )
         except Exception as e:
-            print(f"Warning: Failed to apply torch.compile. {e}. Proceeding without compilation.")
+            print(f"WARNING: torch.compile failed ({e}) — falling back to eager mode")
 
-    # Methods to satisfy the PEFT library
-    def prepare_inputs_for_generation(self, input_ids, **kwargs):
-        return {"input_ids": input_ids}
-
-    def _get_prompt_embedding(self, prompt_embedding):
-        return prompt_embedding
-
-    # <<< NEW: Helper method for the Adaptive HRM Loop >>>
     def _adaptive_hrm_step(self, enc, h_state, l_state):
-        """ Performs the Adaptive HRM computation for a single token's encoding. """
+        """
+        Fully torch.compile-safe RWKV-based HRM step.
+        Handles fake batch dims from Dynamo tracing automatically via RWKVCell internals.
+        """
+        # Sanitize inputs in case torch.compile passed 3D/4D wrappers at the start
+        if enc.dim() == 3 and enc.shape[0] == 1:
+            enc = enc.squeeze(0)
+        if h_state.dim() == 4 and h_state.shape[0] == 1:
+            h_state = h_state.squeeze(0)
+        if l_state.dim() == 4 and l_state.shape[0] == 1:
+            l_state = l_state.squeeze(0)
+
+        B = enc.shape[0]
         step_outputs = []
         halt_probs = []
-        current_enc = enc # Start with the initial encoding for this token
+        current_enc = enc
 
-        for h_step in range(self.config.max_h_steps):
-            h_state = self.h_rnn(current_enc, h_state)
-            context = self.h_to_context(h_state)
-            l_input = torch.cat([current_enc, context], dim=-1)
+        for _ in range(self.config.max_h_steps):
+            h_out, h_state = self.h_rnn(current_enc, h_state)
+            
+            # RWKVCell now guarantees 2D output [B, H] if input was 2D.
+            # But we check just in case compiler re-wrapped it.
+            if h_out.dim() == 3 and h_out.shape[0] == 1:
+                h_out = h_out.squeeze(0)
 
-            # --- MODIFICATION: Make L-Module loop static for training ---
-            # This avoids the torch.allclose() graph break, making the loop
-            # compatible with torch.compile.
+            context = self.h_to_context(h_out)  # (B, context_dim)
+
+            # Safe concat — both are now guaranteed (B, D)
+            l_input = self.l_input_proj(torch.cat([current_enc, context], dim=-1))
+
+            # L-RWKV loop
             if not self.training:
-                # During inference, we can use the dynamic convergence check for efficiency.
-                l_state_prev = torch.zeros_like(l_state) # Initialize for the first check
+                l_prev = l_state.clone()
                 for _ in range(self.config.max_l_steps):
-                    l_state_prev = l_state.clone() # Must clone to prevent reference issues
-                    l_state = self.l_rnn(l_input, l_state)
-                    # Check for convergence
-                    if torch.allclose(l_state, l_state_prev, atol=self.config.l_conv_atol):
+                    l_out, l_state = self.l_rnn(l_input, l_state)
+                    
+                    # Use dim=-1 to check the state components for convergence
+                    # components: 0=x, 1=aa, 2=bb, 4=sx_cm (skip 3=pp)
+                    idx = [0, 1, 2, 4]
+                    if torch.allclose(l_state[..., idx], l_prev[..., idx], atol=self.config.l_conv_atol):
                         break
+                    l_prev = l_state.clone()
             else:
-                # During training, always run for the fixed number of steps.
-                # This creates a static graph that torch.compile can optimize.
                 for _ in range(self.config.max_l_steps):
-                    # We don't need l_state_prev, just iterate
-                    l_state = self.l_rnn(l_input, l_state)
-            # --- END MODIFICATION ---
+                    l_out, l_state = self.l_rnn(l_input, l_state)
 
-            # The output for this H-step is the converged L-state applied as a residual
-            step_update = self.l_to_out(l_state)
-            current_enc = current_enc + step_update
+            current_enc = current_enc + self.l_to_out(l_out)
 
-            # Calculate halt probability for this step
-            halt_logit = self.h_halt_proj(h_state).squeeze(-1) # Shape: (B,)
+            halt_logit = self.h_halt_proj(h_out).squeeze(-1)
             halt_prob = torch.sigmoid(halt_logit)
-
             step_outputs.append(current_enc)
             halt_probs.append(halt_prob)
 
-            # For inference, we can exit early for efficiency
-            # This H-module check is *already* compile-friendly, as it's guarded by `not self.training`.
-            halt_thresh = getattr(self.config, 'h_halt_thresh', 0.9)
-            if not self.training and (halt_prob.mean() > halt_thresh): # Check mean halt prob across batch
+            if not self.training and halt_prob.mean() > getattr(self.config, 'h_halt_thresh', 0.9):
                 break
 
-        # After the loop, calculate the final output and ponder cost using ACT logic
+        # Ponder cost & weighted average
         if not step_outputs:
-            print(f"Warning: No HRM steps executed. Using initial encoding.")
-            final_enc_out = enc
-            ponder_cost_out = torch.tensor(0.0, device=enc.device) # No ponder cost if no steps
-        else:
-            step_outputs_t = torch.stack(step_outputs, dim=0) # Shape: (H, B, D)
-            halt_probs_t = torch.stack(halt_probs, dim=0)     # Shape: (H, B)
-            num_steps_taken = halt_probs_t.shape[0]
+            return enc, h_state, l_state, torch.tensor(0.0, device=enc.device)
 
-            # Calculate probabilities for weighting
-            unhalt_probs = 1.0 - halt_probs_t
-            unhalt_probs_shifted = torch.cat([torch.ones_like(unhalt_probs[:1]), unhalt_probs[:-1]], dim=0)
-            cum_unhalt_probs = torch.cumprod(unhalt_probs_shifted, dim=0)
-            weights = halt_probs_t * cum_unhalt_probs
-            remainder = cum_unhalt_probs[-1] * (1.0 - halt_probs_t[-1])
+        step_outputs_t = torch.stack(step_outputs, dim=0)  # (Steps, B, D)
+        halt_probs_t   = torch.stack(halt_probs,   dim=0)  # (Steps, B)
 
-            # Normalize weights
-            total_prob_sum = weights.sum(dim=0) + remainder + 1e-8 # Add epsilon
-            weights_normalized = weights / total_prob_sum.unsqueeze(0)
-            remainder_normalized = remainder / total_prob_sum
+        remain = 1.0 - halt_probs_t
+        remain_shifted = torch.cat([torch.ones_like(remain[:1]), remain[:-1]], dim=0)
+        cum_remain = torch.cumprod(remain_shifted, dim=0)
 
-            # Weighted average + remainder
-            final_enc_out = (weights_normalized.unsqueeze(-1) * step_outputs_t).sum(dim=0) + \
-                            remainder_normalized.unsqueeze(-1) * step_outputs_t[-1]
+        weights = halt_probs_t * cum_remain
+        remainder = cum_remain[-1] * (1.0 - halt_probs_t[-1])
 
-            # Ponder cost
-            ponder_cost_out = num_steps_taken + remainder # Shape: [B]
+        total = weights.sum(dim=0) + remainder + 1e-8
+        weights = weights / total.unsqueeze(0)
+        remainder = remainder / total
 
-        # Return the final encoding, updated states, and ponder cost
-        return final_enc_out, h_state, l_state, ponder_cost_out
-    # <<< END Helper Method >>>
+        final_enc = (weights.unsqueeze(-1) * step_outputs_t).sum(dim=0) + \
+                    remainder.unsqueeze(-1) * step_outputs_t[-1]
+        ponder_cost = len(step_outputs) + remainder.mean()
 
-    def forward(self, input_ids: torch.LongTensor, attention_mask: Optional[torch.LongTensor] = None, labels: Optional[torch.LongTensor] = None, min_timestamp: float = 0.0, source_filter: Optional[int] = None, **kwargs):
+        return final_enc, h_state, l_state, ponder_cost
+
+    def forward(self, input_ids, attention_mask=None, labels=None, min_timestamp=0.0, source_filter=None, **kwargs):
         B, T = input_ids.shape
         device = input_ids.device
 
-        tok_embs = self.tok_emb(input_ids)
-        pos_indices = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
-        pos_indices = pos_indices % self.config.max_length # Use modulo
-        pos_embs = self.pos_emb(pos_indices)
+        # REMOVED: self.pos_emb(...)
+        # Just use token embeddings. RWKV handles position via state decay.
+        x = self.tok_emb(input_ids)
 
-        x = tok_embs + pos_embs
+        # <<< RWKV states: (B, hidden, 5) >>>
+        h_state = torch.zeros(B, self.config.h_hidden, 5, device=device)
+        l_state = torch.zeros(B, self.config.l_hidden, 5, device=device)
+        h_state[:, :, 3] = -1e30   # pp init
+        l_state[:, :, 3] = -1e30
 
-        if attention_mask is None: attention_mask = torch.ones_like(input_ids)
-
-        all_topk_vals = []
-        all_topk_idx = []
-        final_token_embeddings = []
-        all_ponder_costs = []
-
-        # <<< MODIFICATION: Initialize states outside the loop >>>
-        h_state = torch.zeros(B, self.config.h_hidden, device=device)
-        l_state = torch.zeros(B, self.config.l_hidden, device=device)
+        final_embs = []
+        ponder_costs = []
 
         for t in range(T):
-            token_emb = x[:, t, :]
+            token_x = x[:, t]
+            p = self.persistent.unsqueeze(0).expand(B, -1)
+            q = self.qproj(token_x)
+            topk_vals, topk_idx = self.ltm.retrieve_topk(q, self.config.ltm_topk, min_timestamp, source_filter)
 
-            p_read = self.persistent.unsqueeze(0).expand(B, -1)
-            query = self.qproj(token_emb)
+            # --- FIX: Apply Gate ---
+            # Calculate gating factor (0 to 1)
+            gate = torch.sigmoid(self.ltm_gate_logit)
+            # Scale the retrieved memory values
+            gated_vals = topk_vals * gate
 
-            topk_vals, topk_idx = self.ltm.retrieve_topk(
-                query,
-                topk=self.config.ltm_topk,
-                min_timestamp=min_timestamp,
-                source_filter=source_filter
-            )
+            # Use gated_vals for the MAC input
+            mac_in = torch.cat([token_x, p, gated_vals.view(B, -1)], dim=-1)
+            
+            enc = F.gelu(self.in_proj(mac_in))
 
-            # Retain grad for LTM update
-            if self.training or torch.is_grad_enabled():
-                if topk_vals.requires_grad:
-                    if topk_vals.grad_fn is not None:
-                        topk_vals.retain_grad()
-
-            all_topk_vals.append(topk_vals)
-            all_topk_idx.append(topk_idx)
-
-            ltm_summary_flat = topk_vals.view(B, -1)
-
-            mac_input = torch.cat([token_emb, p_read, ltm_summary_flat], dim=-1)
-            enc = F.gelu(self.in_proj(mac_input))
-
-            # <<< MODIFICATION: Conditional Gradient Checkpointing >>>
-            # Apply checkpointing only during training and if enabled in config
-            if self.config.gradient_checkpointing and self.training and torch.is_grad_enabled():
-                # Pass the helper method, inputs, and ensure states are updated
-                # use_reentrant=False is generally recommended for performance
-                final_enc, h_state, l_state, ponder_cost = checkpoint(
-                    self._adaptive_hrm_step, enc, h_state, l_state, use_reentrant=False
-                )
+            if self.config.gradient_checkpointing and self.training:
+                enc, h_state, l_state, pc = checkpoint(self._adaptive_hrm_step, enc, h_state, l_state, use_reentrant=False)
             else:
-                # Call the helper method directly if not checkpointing
-                final_enc, h_state, l_state, ponder_cost = self._adaptive_hrm_step(
-                    enc, h_state, l_state
-                )
-            # <<< END MODIFICATION >>>
+                enc, h_state, l_state, pc = self._adaptive_hrm_step(enc, h_state, l_state)
 
-            all_ponder_costs.append(ponder_cost)
-            final_token_embeddings.append(final_enc)
+            final_embs.append(enc)
+            ponder_costs.append(pc)
 
-            # <<< NOTE: h_state and l_state are now updated correctly for the next iteration >>>
+        final = self.out_norm(torch.stack(final_embs, dim=1))
+        logits = self.lm_head(final)
 
-        final_embeddings = torch.stack(final_token_embeddings, dim=1)
-        final_embeddings = self.out_norm(final_embeddings)
-        logits = self.lm_head(final_embeddings)
-
-        # ... (Loss calculation remains the same) ...
+        # loss calculation (unchanged)
         loss = None
         ponder_cost_out = None
         if labels is not None:
-            # Shift so that tokens < n predict n
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
-            loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
+            loss = F.cross_entropy(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
+            if ponder_costs:
+                ponder_cost_out = torch.stack(ponder_costs).mean()
 
-            # Average the ponder cost
-            if all_ponder_costs:
-                valid_ponder_costs = [pc if isinstance(pc, torch.Tensor) else torch.tensor(pc, device=device) for pc in all_ponder_costs]
-                if valid_ponder_costs: # Check if list is not empty
-                    stacked_costs = torch.stack(valid_ponder_costs, dim=1) # Stack along sequence dim -> [B, T]
-                    ponder_cost_out = stacked_costs.mean() # Mean over all elements
-                else:
-                    ponder_cost_out = torch.tensor(0.0, device=device)
-            else: # Handle edge case T=0 or no valid HRM steps
-                ponder_cost_out = torch.tensor(0.0, device=device)
-
-        # Ensure returned tensors are correctly shaped even if loop didn't run
-        seq_topk_vals = torch.stack(all_topk_vals, dim=1) if all_topk_vals else torch.empty(B, 0, self.config.ltm_topk, self.config.ltm_val_dim, device=device)
-        seq_topk_idx = torch.stack(all_topk_idx, dim=1) if all_topk_idx else torch.empty(B, 0, self.config.ltm_topk, dtype=torch.long, device=device)
-
-
-        return {"loss": loss, "logits": logits, "topk_vals": seq_topk_vals, "topk_idx": seq_topk_idx, "ponder_cost": ponder_cost_out}
-
+        return {"loss": loss, "logits": logits, "ponder_cost": ponder_cost_out,
+                "topk_vals": topk_vals, "topk_idx": topk_idx}
 
 class Quantizedhierarchos:
-    # ... (Quantizedhierarchos remains unchanged) ...
-    """The quantized hierarchos model for CPU/Vulkan inference."""
+    """The quantized hierarchos model for CPU/Vulkan inference (now using RWKV cells)."""
     def __init__(self, config: dict, q_data: dict):
         if not _HAS_KERNEL:
             raise ImportError("Cannot initialize Quantizedhierarchos: C++ kernel not found.")
-
         self.config = AttrDict(config)
-        self.qtype = None # Will be determined from the first quantized layer
+        self.qtype = None
 
-        # Load raw (non-quantized) parameters first
+        # Load raw (non-quantized) parameters first (unchanged)
         try:
             self.tok_emb = nn.Embedding.from_pretrained(torch.from_numpy(q_data['tok_emb.weight'].item()['raw']))
-            self.pos_emb = nn.Embedding.from_pretrained(torch.from_numpy(q_data['pos_emb.weight'].item()['raw']))
+            # REMOVED: self.pos_emb = ...
+            
             self.persistent = torch.from_numpy(q_data['persistent'].item()['raw'])
             self.out_norm = nn.LayerNorm(self.config.context_dim)
             self.out_norm.load_state_dict({
                 'weight': torch.from_numpy(q_data['out_norm.weight'].item()['raw']),
                 'bias': torch.from_numpy(q_data['out_norm.bias'].item()['raw'])
             })
-            self.ltm = LTMModule(n_slots=self.config.ltm_slots, key_dim=self.config.ltm_key_dim, val_dim=self.config.ltm_val_dim)
-            # Load LTM state, ignoring momentum buffer etc.
+            self.ltm = LTMModule(n_slots=self.config.ltm_slots,
+                                 key_dim=self.config.ltm_key_dim,
+                                 val_dim=self.config.ltm_val_dim)
+            # LTM state loading (unchanged)
             ltm_state = {}
-            expected_ltm_keys = ['ltm.keys', 'ltm.vals', 'ltm.timestamps', 'ltm.sources']
-            missing_ltm_keys = []
-            for k in expected_ltm_keys:
-                if k in q_data and 'raw' in q_data[k].item():
-                    ltm_state[k.split('.', 1)[1]] = torch.from_numpy(q_data[k].item()['raw']) # Remove 'ltm.' prefix
-                else:
-                    missing_ltm_keys.append(k)
-
-            if missing_ltm_keys:
-                raise KeyError(f"Missing expected LTM parameters in quantized file: {missing_ltm_keys}")
-            self.ltm.load_state_dict(ltm_state, strict=False) # strict=False to ignore _mom_vals etc.
-
-        except KeyError as e:
-            raise KeyError(f"Missing expected raw parameter in quantized file: {e}")
+            for k in ['ltm.keys', 'ltm.vals', 'ltm.timestamps', 'ltm.sources']:
+                if k in q_data:
+                    ltm_state[k.split('.', 1)[1]] = torch.from_numpy(q_data[k].item()['raw'])
+            self.ltm.load_state_dict(ltm_state, strict=False)
         except Exception as e:
             raise RuntimeError(f"Error loading raw parameters: {e}")
 
-
-        # Initialize quantized layers, determining qtype from the first one found
+        # ---------- Quantized RWKV layers ----------
+        expected_quantized = [
+            'qproj', 'in_proj', 'h_rnn', 'h_to_context',
+            'l_input_proj', 'l_rnn', 'l_to_out', 'lm_head', 'h_halt_proj'
+        ]
         quantized_layers = {}
-        expected_quantized = ['qproj', 'in_proj', 'h_rnn', 'h_to_context', 'l_rnn', 'l_to_out', 'lm_head', 'h_halt_proj']
+        for layer_name in expected_quantized:
+            if layer_name in ['h_rnn', 'l_rnn']:
+                hidden = self.config.h_hidden if layer_name == 'h_rnn' else self.config.l_hidden
+                quantized_layers[layer_name] = QuantizedRWKVCell(hidden, layer_name, q_data)
+                if self.qtype is None:
+                    self.qtype = quantized_layers[layer_name].key.qtype
+            else:
+                quantized_layers[layer_name] = QuantizedLinear(layer_name, q_data)
+                if self.qtype is None:
+                    self.qtype = quantized_layers[layer_name].qtype
 
-        for layer_base_name in expected_quantized:
-            try:
-                if layer_base_name in ['h_rnn', 'l_rnn']:
-                    input_sz = self.config.context_dim if layer_base_name == 'h_rnn' else self.config.context_dim * 2
-                    hidden_sz = self.config.h_hidden if layer_base_name == 'h_rnn' else self.config.l_hidden
-                    quantized_layers[layer_base_name] = QuantizedGRUCell(input_sz, hidden_sz, layer_base_name, q_data)
-                    # Determine qtype from the first sub-layer if not already set
-                    if self.qtype is None:
-                        self.qtype = quantized_layers[layer_base_name].W_ir.qtype
-                else:
-                    # Check if weight exists for this linear layer before creating QuantizedLinear
-                    weight_key = f"{layer_base_name}.weight"
-                    if weight_key not in q_data:
-                        raise KeyError(f"Weight key '{weight_key}' not found for layer '{layer_base_name}'")
+        # assign to self
+        self.qproj          = quantized_layers['qproj']
+        self.in_proj        = quantized_layers['in_proj']
+        self.h_rnn          = quantized_layers['h_rnn']
+        self.h_to_context   = quantized_layers['h_to_context']
+        self.l_input_proj   = quantized_layers['l_input_proj']
+        self.l_rnn          = quantized_layers['l_rnn']
+        self.l_to_out       = quantized_layers['l_to_out']
+        self.lm_head        = quantized_layers['lm_head']
+        self.h_halt_proj    = quantized_layers['h_halt_proj']
 
-                    quantized_layers[layer_base_name] = QuantizedLinear(layer_base_name, q_data)
-                    if self.qtype is None:
-                        self.qtype = quantized_layers[layer_base_name].qtype
-            except KeyError as e:
-                raise KeyError(f"Missing expected quantized layer data for '{layer_base_name}' in file: {e}")
-            except Exception as e:
-                raise RuntimeError(f"Error initializing quantized layer '{layer_base_name}': {e}")
+        print(f"Initialized Quantizedhierarchos ({self.qtype}) with RWKV recurrence.")
 
-
-        # Assign quantized layers to attributes
-        self.qproj = quantized_layers['qproj']
-        self.in_proj = quantized_layers['in_proj']
-        self.h_rnn = quantized_layers['h_rnn']
-        self.h_to_context = quantized_layers['h_to_context']
-        self.l_rnn = quantized_layers['l_rnn']
-        self.l_to_out = quantized_layers['l_to_out']
-        self.lm_head = quantized_layers['lm_head']
-        self.h_halt_proj = quantized_layers['h_halt_proj']
-
-
-        if self.qtype is None:
-            raise ValueError("Could not determine quantization type from the loaded model file.")
-
-        print(f"Initialized Quantizedhierarchos model ({self.qtype}) from config.")
-
-
-    def __call__(self, input_ids: torch.LongTensor, h_state: torch.Tensor, l_state: torch.Tensor, device: str = "cpu", min_timestamp: float = 0.0, source_filter: Optional[int] = None):
+    def __call__(self, input_ids: torch.LongTensor, h_state: torch.Tensor, l_state: torch.Tensor,
+                 device: str = "cpu", min_timestamp: float = 0.0, source_filter: Optional[int] = None):
         B, T = input_ids.shape
-        # Use T-1 for single-token generation, but allow for longer sequences during initial prompt processing.
         current_pos_start = T - 1 if T > 1 else 0
 
-        # Process the entire input_ids sequence token-by-token (or just the last token if T > 1)
         for t in range(current_pos_start, T):
-            # Ensure inputs to embeddings are LongTensors on CPU
-            current_token_ids = input_ids[:, t].cpu().long()
-            # Calculate position, handle wrapping
-            pos_id_val = t % self.config.max_length
-            pos_ids = torch.tensor([pos_id_val], dtype=torch.long).cpu()
-
-            token_emb = self.tok_emb(current_token_ids) + self.pos_emb(pos_ids)
-
+            token_ids = input_ids[:, t].cpu().long()
+            
+            # REMOVED: pos_id logic
+            token_emb = self.tok_emb(token_ids) 
             p_read = self.persistent.unsqueeze(0).expand(B, -1)
-            query = self.qproj(token_emb, device=device) # Query projection happens on target device
 
-            # Pass filters to retrieve_topk
-            topk_vals, _ = self.ltm.retrieve_topk(
-                query,
-                topk=self.config.ltm_topk,
-                min_timestamp=min_timestamp,
-                source_filter=source_filter
-            )
+            query = self.qproj(token_emb, device=device)
+            topk_vals, _ = self.ltm.retrieve_topk(query, topk=self.config.ltm_topk,
+                                                  min_timestamp=min_timestamp,
+                                                  source_filter=source_filter)
+            ltm_summary = topk_vals.view(B, -1).cpu()
 
-            # Ensure topk_vals is on CPU for concatenation if needed, though subsequent ops use target device
-            ltm_summary_flat = topk_vals.view(B, -1).cpu()
+            mac_input = torch.cat([token_emb.cpu(), p_read.cpu(), ltm_summary], dim=-1)
+            enc = F.gelu(self.in_proj(mac_input, device=device))
 
-
-            mac_input = torch.cat([token_emb.cpu(), p_read.cpu(), ltm_summary_flat], dim=-1)
-            enc = F.gelu(self.in_proj(mac_input, device=device)) # Input projection on target device
-
-            # Ensure RNN states are on CPU before passing to QuantizedGRUCell
-            h_state = h_state.cpu()
-            l_state = l_state.cpu()
-
-            # Adaptive HRM Loop for Inference
+            # ---- Adaptive HRM with RWKV ----
             for _ in range(self.config.max_h_steps):
-                h_state = self.h_rnn(enc, h_state, device=device) # GRU cell computes on target device
+                h_out, h_state = self.h_rnn(enc, h_state, device=device)
 
-                # Check for halt condition
-                halt_logit = self.h_halt_proj(h_state, device=device) # Projection on target device
+                halt_logit = self.h_halt_proj(h_out, device=device)
                 halt_prob = torch.sigmoid(halt_logit)
 
-                context = self.h_to_context(h_state, device=device) # Context projection on target device
-                # L-module runs for its max steps; convergence check is omitted for speed in quantized inference
+                context = self.h_to_context(h_out, device=device)
+
+                l_input_raw = torch.cat([enc.cpu(), context.cpu()], dim=-1)
+                l_input = self.l_input_proj(l_input_raw, device=device)
+
                 for _ in range(self.config.max_l_steps):
-                    l_input = torch.cat([enc.cpu(), context.cpu()], dim=-1) # Concat on CPU
-                    l_state = self.l_rnn(l_input, l_state, device=device) # GRU cell on target device
+                    l_out, l_state = self.l_rnn(l_input, l_state, device=device)
 
-                # Add residual on target device
-                enc = enc + self.l_to_out(l_state, device=device)
+                enc = enc + self.l_to_out(l_out, device=device)
 
-                # Use getattr for safe access, provide default if missing
                 halt_thresh = getattr(self.config, 'h_halt_thresh', 0.9)
-                # Early exit based on halt probability (checked on CPU)
-                if halt_prob.cpu().item() > halt_thresh:
+                if halt_prob.cpu().mean().item() > halt_thresh:
                     break
 
-        # Final operations
-        final_embedding = self.out_norm(enc.cpu()).to(enc.dtype) # Norm on CPU, ensure correct dtype
-        logits = self.lm_head(final_embedding, device=device) # LM head on target device
+        final_embedding = self.out_norm(enc.cpu())
+        logits = self.lm_head(final_embedding, device=device)
 
-        # Return states on CPU as expected by the chat loop for quantized models
-        return {"logits": logits.unsqueeze(1), "h_state": h_state.cpu(), "l_state": l_state.cpu()}
-
+        return {
+            "logits": logits.unsqueeze(1),
+            "h_state": h_state.cpu(),
+            "l_state": l_state.cpu()
+        }
 
 def load_quantized(model_path: str):
     """Loads a quantized model directory, automatically finding the .npz and tokenizer."""
@@ -2484,14 +2495,20 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len): # <<< Pass da
     lora_config = LoraConfig(
         r=lora_r,
         lora_alpha=args.lora_alpha,
-        # Target more layers, including internal GRU weights if needed
-        target_modules=["qproj", "in_proj", "h_to_context", "l_to_out", "h_halt_proj", "W_ir", "W_hr", "W_iz", "W_hz", "W_in", "W_hn"],
+        target_modules=[
+            # RWKV time-mixing
+            "key", "value", "receptance", "output",
+            # RWKV channel-mixing
+            "key_cm", "receptance_cm", "value_cm",
+            # Hierarchos-specific layers
+            "qproj", "in_proj", "h_to_context",
+            "l_input_proj", "l_to_out", "h_halt_proj"
+        ],
         lora_dropout=0.05,
         bias="none",
         task_type="CAUSAL_LM",
-        modules_to_save=["ltm"], # Ensure LTM can still be updated directly
+        modules_to_save=["ltm"],  # LTM still updated directly
     )
-
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
@@ -2751,6 +2768,20 @@ def _handle_interrupt(sig, frame):
         sys.exit(1)
 
 # <<< CHAT Function (Modified) >>>
+def is_positive_feedback(text: str) -> bool:
+    """Checks if the user input looks like positive validation."""
+    text = text.lower().strip()
+    positive_triggers = {
+        "good", "great", "correct", "yes", "nice", "cool", "perfect", 
+        "thanks", "thx", "+", "right", "accurate"
+    }
+    # Check exact match or starts with (e.g., "Good job")
+    if text in positive_triggers:
+        return True
+    first_word = text.split(' ')[0] if ' ' in text else text
+    # Remove punctuation from first word for check (e.g. "Good," -> "good")
+    first_word = ''.join(c for c in first_word if c.isalnum())
+    return first_word in positive_triggers or text.startswith("/learn")
 def chat(args, device, tokenizer):
     print("Running in CHAT mode...")
 
@@ -2770,6 +2801,10 @@ def chat(args, device, tokenizer):
     is_quantized = False
     inference_device = "cpu" # Default for quantized models
     ltm_has_been_updated = False # Flag to track if we need to save
+    
+    # <<< NEW: Buffer for Anti-Echo-Chamber Logic >>>
+    # We store the PREVIOUS turn here. We only train on it if the CURRENT turn is positive.
+    pending_training_data = None 
 
     # Determine if loading quantized or full model from the same --model-path
     if not args.model_path or not os.path.isdir(args.model_path):
@@ -2926,7 +2961,6 @@ def chat(args, device, tokenizer):
                         source_id_filter = None
                         print("[INFO: Memory filters have been reset.]")
                         continue
-
                     for part in parts[1:]:
                         if '=' not in part: raise ValueError(f"Invalid filter format: {part}")
                         key, value = part.split('=', 1)
@@ -2949,7 +2983,113 @@ def chat(args, device, tokenizer):
                 except Exception as e: # Catch broader errors like split issues
                     print(f"[ERROR: Invalid filter format. Use 'time=-<seconds>' or 'source=<id>'. Details: {e}]")
                 continue
+            
+            # =================================================================
+            # A. CHECK FOR FEEDBACK & PERFORM DELAYED UPDATE (Anti-Echo-Chamber)
+            # =================================================================
+            if pending_training_data is not None:
+                should_learn = is_positive_feedback(prompt) or prompt.strip() == "/learn"
+                
+                if should_learn:
+                    p_ids = pending_training_data['prompt_ids']
+                    r_ids = pending_training_data['response_ids']
+                    
+                    # Select appropriate model (shadow or base)
+                    update_model = shadow_model if is_quantized else model
+                    target_device = device
 
+                    print("[Feedback detected. Updating LTM...]", end="", flush=True)
+
+                    update_model.train()
+                    with torch.enable_grad():
+                        # Reconstruct sequence
+                        full_sequence = torch.cat([p_ids[0], r_ids], dim=0).unsqueeze(0)
+                        labels = torch.cat([torch.full_like(p_ids[0], -100), r_ids], dim=0).unsqueeze(0)
+                        
+                        if full_sequence.shape[1] > config.max_length:
+                             full_sequence = full_sequence[:, -config.max_length:]
+                             labels = labels[:, -config.max_length:]
+
+                        # Zero grads
+                        if use_amp: dummy_optimizer.zero_grad(set_to_none=True)
+                        update_model.zero_grad(set_to_none=True)
+
+                        # Forward / Backward
+                        with autocast(device_type=target_device.type, enabled=use_amp):
+                            outputs = update_model(input_ids=full_sequence, labels=labels)
+                            loss = outputs["loss"]
+                            combined_loss = loss 
+
+                        if combined_loss is not None:
+                            if use_amp:
+                                scaler.scale(combined_loss).backward()
+                            else:
+                                combined_loss.backward()
+                            
+                            ltm_grads = None
+                            if outputs.get("topk_vals") is not None and outputs["topk_vals"].grad is not None:
+                                ltm_grads = outputs["topk_vals"].grad
+
+                            if ltm_grads is not None:
+                                ltm_grads_copy = ltm_grads.detach().clone()
+                                
+                                # Handle LR
+                                current_ltm_lr = args.ltm_lr
+                                if ltm_scheduler:
+                                    current_ltm_lr = ltm_scheduler.get_last_lr()[0]
+                                    ltm_scheduler.step()
+
+                                # Handle AMP Unscale
+                                if use_amp:
+                                    current_scale = scaler.get_scale()
+                                    if current_scale != 1.0:
+                                        ltm_grads_copy = ltm_grads_copy / current_scale
+                                
+                                # --- UPDATE LTM ---
+                                update_model.ltm.inner_update(
+                                    outputs["topk_idx"], 
+                                    ltm_grads_copy, 
+                                    current_lr=current_ltm_lr, 
+                                    source=LTMModule.SRC_USER_INTERACTION
+                                )
+                                ltm_has_been_updated = True
+                                
+                                # Clean up AMP scaler state
+                                if use_amp:
+                                    scaler.unscale_(dummy_optimizer)
+                                    scaler.step(dummy_optimizer)
+                                    scaler.update()
+                                    
+                                update_model.zero_grad(set_to_none=True)
+                                
+                                # Sync back to quantized model if needed
+                                if is_quantized:
+                                    model.ltm.load_state_dict(update_model.ltm.state_dict())
+                                    
+                                print(f" Done. (Loss: {loss.item():.3f})")
+                            else:
+                                print(" (No LTM gradients generated)")
+                        else:
+                            print(" (Loss invalid, skipped)")
+                    
+                    update_model.eval()
+                else:
+                    # User did not approve. The pending data is essentially discarded here.
+                    pass 
+
+            # Clear pending data after processing logic
+            pending_training_data = None
+
+            # If user typed strictly "/learn" to trigger update, don't generate a response to "/learn"
+            if prompt.strip() == "/learn":
+                print("[Ready for next input]")
+                continue
+
+
+            # =================================================================
+            # B. GENERATION LOGIC
+            # =================================================================
+            
             # Kayla format assumes ### wrappers
             prompt_format = f"### Instruction:\n{prompt}\n\n### Response:\n"
 
@@ -3025,124 +3165,18 @@ def chat(args, device, tokenizer):
                     if current_ids.shape[1] > config.max_length:
                         current_ids = current_ids[:, -config.max_length:]
 
+            print("\n")
 
-            # --- Online Learning Step ---
+            # =================================================================
+            # C. BUFFER DATA FOR NEXT TURN
+            # =================================================================
+            # Instead of learning immediately, we buffer.
             learning_enabled = not is_quantized or args.enable_quantized_learning
             if len(response_ids) > 0 and learning_enabled:
-                update_model = shadow_model if is_quantized else model
-                target_device = device # Learning happens on the main device
-
-                if is_quantized:
-                    print("\n[Updating LTM via shadow model...]", end="", flush=True)
-
-                update_model.train() # Set to train mode to enable gradients
-                with torch.enable_grad(): # Ensure grads are enabled
-                    # Prepare inputs for the learning pass
-                    full_sequence = torch.cat([prompt_ids[0], torch.tensor(response_ids, device=target_device)], dim=0).unsqueeze(0)
-                    # Create labels, masking out the prompt part
-                    labels = torch.cat([torch.full_like(prompt_ids[0], -100), torch.tensor(response_ids, device=target_device)], dim=0).unsqueeze(0)
-
-                    # Ensure sequence length doesn't exceed model capacity for learning pass
-                    if full_sequence.shape[1] > config.max_length:
-                        full_sequence = full_sequence[:, -config.max_length:]
-                        labels = labels[:, -config.max_length:]
-
-
-                    # Zero grads before the learning forward pass
-                    optimizer_to_zero = dummy_optimizer if use_amp else None # For AMP scaler state
-                    if optimizer_to_zero: optimizer_to_zero.zero_grad(set_to_none=True)
-                    update_model.zero_grad(set_to_none=True)
-
-                    # Forward pass for learning with AMP context
-                    # <<< FIXED: Added device_type >>>
-                    with autocast(device_type=target_device.type, enabled=use_amp):
-                        outputs = update_model(input_ids=full_sequence, labels=labels)
-                        cross_entropy_loss = outputs["loss"]
-                        ponder_cost = outputs["ponder_cost"]
-                        # Use get with default for ponder weight in case it's missing in older configs
-                        ponder_loss_weight = update_model.config.get('ponder_loss_weight', 0.01)
-
-                        combined_loss = None
-                        ce_valid = cross_entropy_loss is not None and not torch.isnan(cross_entropy_loss) and not torch.isinf(cross_entropy_loss)
-                        pc_valid = ponder_cost is not None and not torch.isnan(ponder_cost) and not torch.isinf(ponder_cost)
-
-                        if ce_valid and pc_valid:
-                            print(f"[CE Loss: {cross_entropy_loss.item():.3f}, Ponder Cost: {ponder_cost.item():.2f}]", end="", flush=True)
-                            combined_loss = cross_entropy_loss + ponder_loss_weight * ponder_cost
-                        elif ce_valid:
-                            print(f"[CE Loss: {cross_entropy_loss.item():.3f}, Ponder Cost: NaN/Inf]", end="", flush=True)
-                            combined_loss = cross_entropy_loss
-                        else:
-                            print(f"[CE Loss: NaN/Inf, Skipping LTM update]", end="", flush=True)
-                            combined_loss = None # Ensure it's None
-
-                    # Backward pass for LTM gradients
-                    if combined_loss is not None:
-                        if use_amp:
-                            scaler.scale(combined_loss).backward()
-                        else:
-                            combined_loss.backward()
-
-                        ltm_grads = None
-                        if outputs.get("topk_vals") is not None and outputs["topk_vals"].requires_grad and outputs["topk_vals"].grad_fn is not None:
-                            if outputs["topk_vals"].grad is not None:
-                                ltm_grads = outputs["topk_vals"].grad
-
-                        if ltm_grads is not None:
-                            ltm_grads_copy = ltm_grads.detach().clone() # Use a copy
-
-                            # Determine the current LTM learning rate
-                            current_ltm_lr = args.ltm_lr # Default to static LR
-                            if ltm_scheduler:
-                                current_ltm_lr = ltm_scheduler.get_last_lr()[0]
-                                print(f"[LTM LR: {current_ltm_lr:.2e}]", end="", flush=True)
-                                ltm_scheduler.step() # Step scheduler *after* using the LR
-
-                            # Unscale LTM grads if using AMP
-                            if use_amp:
-                                current_scale = scaler.get_scale()
-                                if current_scale != 1.0 and scaler._enabled and scaler._scale is not None:
-                                    assert current_scale > 0.0
-                                    ltm_grads_copy = ltm_grads_copy / current_scale
-                                elif current_scale != 1.0:
-                                    print(f"\nWarning: Scaler inconsistent during LTM update, grads might be scaled.")
-
-                            # Perform the LTM inner update
-                            update_model.ltm.inner_update(outputs["topk_idx"], ltm_grads_copy, current_lr=current_ltm_lr, source=LTMModule.SRC_USER_INTERACTION)
-                            ltm_has_been_updated = True # Mark that a change has occurred
-
-                        # --- Necessary steps for AMP scaler state even without optimizer step ---
-                        if use_amp:
-                            # Unscale the dummy optimizer to check for infs/NaNs
-                            scaler.unscale_(dummy_optimizer)
-                            # Step dummy optimizer (will be skipped by scaler if infs found)
-                            scaler.step(dummy_optimizer)
-                            # Update scale for next iteration
-                            scaler.update()
-
-                        # --- Important: Zero grads on the update_model ---
-                        update_model.zero_grad(set_to_none=True)
-
-                        # Copy the updated LTM weights back to the live quantized model
-                        if is_quantized:
-                            model.ltm.load_state_dict(update_model.ltm.state_dict())
-
-                    else: # Combined loss was None (e.g., NaN)
-                        # Still need to handle AMP scaler state if used
-                        if use_amp:
-                            # Even if backward wasn't called, step/update cycle might be needed
-                            scaler.unscale_(dummy_optimizer)
-                            scaler.step(dummy_optimizer)
-                            scaler.update()
-                        # Zero any potential stale grads
-                        update_model.zero_grad(set_to_none=True)
-
-
-                update_model.eval() # Set back to eval mode after learning step
-                if is_quantized:
-                    print("[Done]", end="", flush=True)
-
-            print("\n\n" + "="*50)
+                 pending_training_data = {
+                    'prompt_ids': prompt_ids,
+                    'response_ids': torch.tensor(response_ids, device=device)
+                 }
 
     except KeyboardInterrupt:
         print("\n\n[Ctrl+C detected. Exiting chat.]")
@@ -3154,8 +3188,7 @@ def chat(args, device, tokenizer):
 
         # --- SAVE ON EXIT LOGIC ---
         updatable_model = shadow_model if is_quantized and args.enable_quantized_learning else model
-
-        # Check if we have a model capable of updates
+        # Check if updatable_model is valid before proceeding
         can_update = updatable_model is not None and (not is_quantized or args.enable_quantized_learning)
 
         if can_update and args.ltm_lora_path and hasattr(updatable_model.ltm, 'accumulate_deltas') and updatable_model.ltm.accumulate_deltas:
@@ -3196,7 +3229,8 @@ def chat(args, device, tokenizer):
                     except EOFError:
                         print("\nEOF detected. Assuming 'no' for saving.")
                         break
-            else: # Need to re-quantize the shadow model
+            else:
+                # Re-quantize prompt
                 output_dir = args.model_path # Overwrite the existing quantized model dir
                 while True:
                     try: # Handle potential EOFError
@@ -3228,7 +3262,7 @@ def chat(args, device, tokenizer):
                         break
 
         elif ltm_has_been_updated:
-            print("\nLTM was updated, but saving is disabled (e.g., quantized mode without --enable-quantized-learning). Changes will be lost.")
+             print("\n[Warning] LTM was updated, but no valid save configuration was found. Changes lost.")
 def main():
     parser = argparse.ArgumentParser(description="hierarchos: A Hybrid Memory-Reasoning Architecture")
     parser.add_argument("mode", type=str, choices=["train", "finetune", "chat", "quantize", "merge-lora"], help="Operation mode.")

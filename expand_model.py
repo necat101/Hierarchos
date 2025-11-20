@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn 
 import argparse
 import os
 import json
@@ -66,7 +67,13 @@ def transplant_weights(old_model_path: str, new_config: dict, output_dir: str, d
     if not os.path.exists(old_weights_path):
         raise FileNotFoundError(f"'hierarchos.pt' not found in directory: {old_model_path}")
     
-    checkpoint = torch.load(old_weights_path, map_location=device)
+    # Safe load handling for PyTorch 2.6+ security
+    try:
+        with torch.serialization.safe_globals([AttrDict]):
+            checkpoint = torch.load(old_weights_path, map_location=device, weights_only=True)
+    except Exception:
+        checkpoint = torch.load(old_weights_path, map_location=device, weights_only=False)
+
     old_state_dict = checkpoint['model_state_dict']
     old_config = AttrDict(checkpoint.get('config', {}))
 
@@ -102,7 +109,14 @@ def transplant_weights(old_model_path: str, new_config: dict, output_dir: str, d
                      print(f"  - WARNING: Could not slice weights for '{name}'. Shapes might be incompatible beyond simple expansion. Retaining new initialization.")
 
         else:
-            print(f"  - Layer '{name}' not found in old model (or is new). Retaining new initialization.")
+            # --- SPECIFIC HANDLING FOR NEW CONTEXT DRIFT LAYER ---
+            if "context_drift_proj" in name:
+                print(f"  - [NEW FEATURE] Found 'context_drift_proj' which was missing in old model.")
+                print(f"  - Explicitly initializing '{name}' with low variance (std=0.01) to ensure stable start.")
+                # Ensure this delta-predictor starts with very small weights so it doesn't shock the model
+                nn.init.normal_(new_state_dict[name], mean=0.0, std=0.01)
+            else:
+                print(f"  - Layer '{name}' not found in old model (or is new). Retaining new initialization.")
             
     # Note: 'pos_emb' from old_state_dict is effectively ignored here because it 
     # does not exist in new_state_dict.
@@ -143,8 +157,8 @@ if __name__ == "__main__":
     dim_group.add_argument("--ltm_slots", type=int, help="New number of LTM slots.")
     dim_group.add_argument("--ltm_key_dim", type=int, help="New LTM key dimension.")
     dim_group.add_argument("--ltm_val_dim", type=int, help="New LTM value dimension.")
-    dim_group.add_argument("--h_hidden", type=int, help="New H-RNN hidden size.")
-    dim_group.add_argument("--l_hidden", type=int, help="New L-RNN hidden size.")
+    dim_group.add_argument("--h_hidden", type=int, help="New H-RNN hidden size. (Defaults to context_dim if not set)")
+    dim_group.add_argument("--l_hidden", type=int, help="New L-RNN hidden size. (Defaults to context_dim if not set)")
 
     # Arguments for changing max_length
     length_group = parser.add_argument_group('Sequence Length Expansion (Optional)')
@@ -162,7 +176,14 @@ if __name__ == "__main__":
     old_weights_path = os.path.join(args.old_model_path, "hierarchos.pt")
     if not os.path.exists(old_weights_path):
          raise FileNotFoundError(f"'hierarchos.pt' not found in directory: {args.old_model_path}")
-    old_checkpoint = torch.load(old_weights_path, map_location=device)
+    
+    # Safe load logic for config reading
+    try:
+        with torch.serialization.safe_globals([AttrDict]):
+            old_checkpoint = torch.load(old_weights_path, map_location=device, weights_only=True)
+    except Exception:
+        old_checkpoint = torch.load(old_weights_path, map_location=device, weights_only=False)
+
     old_config = old_checkpoint.get('config', {})
     if not old_config:
         raise ValueError(f"Could not find 'config' dictionary in old model checkpoint: {old_weights_path}")
@@ -181,6 +202,24 @@ if __name__ == "__main__":
         for k, v in updated_dims.items():
             print(f"  - {k}: {final_config.get(k, 'N/A')} -> {v}")
         final_config.update(updated_dims)
+
+    # --- AUTO-SYNC LOGIC [ADDED] ---
+    # If context_dim was updated, but h/l_hidden were NOT specified, sync them to context_dim
+    # to prevent element-wise multiplication errors (e.g. 60 vs 20).
+    current_ctx = final_config.get('context_dim')
+    
+    if args.h_hidden is None and current_ctx is not None:
+        old_h = final_config.get('h_hidden', 'N/A')
+        if old_h != current_ctx:
+            print(f"  - [Auto-Sync] h_hidden: {old_h} -> {current_ctx} (Synced to context_dim)")
+            final_config['h_hidden'] = current_ctx
+
+    if args.l_hidden is None and current_ctx is not None:
+        old_l = final_config.get('l_hidden', 'N/A')
+        if old_l != current_ctx:
+            print(f"  - [Auto-Sync] l_hidden: {old_l} -> {current_ctx} (Synced to context_dim)")
+            final_config['l_hidden'] = current_ctx
+    # -------------------------------
 
     # --- Determine and update max_length ---
     new_max_len = None

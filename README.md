@@ -1,5 +1,6 @@
+
 -----
-# Hierarchos v0.9 (alpha): A Hybrid Memory-Reasoning Architecture
+# Hierarchos v0.9.5 (alpha): A Hybrid Memory-Reasoning Architecture
 
 A novel AI architecture that synergistically integrates Google's Titans memory system with a Hierarchical Reasoning Model (HRM) to move beyond the limitations of scale and take a decisive step on the path to AGI.
 
@@ -7,54 +8,49 @@ Due to Amazon's "Chronos" forecasting models (still based on transformers BTW) I
 
 -----
 
-### 🚀 **Major Update in v0.9.0: The RWKV Paradigm Shift**
+### 🚀 **New in v0.9.5: Context Drift & Enforced Symmetry**
 
-> This version marks a fundamental architectural evolution, replacing the previous Gated Recurrent Unit (GRU) controllers with **RWKV (Receptance Weighted Key Value)** cells.
+> This update focuses on architectural stability and dynamic adaptability.
 >
-> 1.  **RWKV Architecture:** 🧠 Hierarchos now leverages the benefits of Linear Transformers within an RNN framework. This allows for parallelizable training (like Transformers) while maintaining constant memory usage during inference (like RNNs), offering significantly better performance/efficiency trade-offs than standard GRUs.
-> 2.  **Removal of Positional Embeddings:** 🚫 We have removed explicit learned Positional Embeddings (`pos_emb`). RWKV handles temporal relationships and token positions naturally via its internal state decay (`time_decay`). This creates a model that is **state-invariant** rather than position-dependent, improving generalization to sequence lengths far beyond the training window (e.g., training on 1024 tokens and inferencing on 4096+).
-> 3.  **Quantized RWKV Support:** ⚡ The C++ kernel and quantization logic have been updated to support the new RWKV cell structure (Time Mixing and Channel Mixing) for high-performance INT4/Q4_0 inference.
+> 1.  **Enforced Size Symmetry:** ⚖️ To ensure numerical stability during the "pondering" phases, the High-Level Manager (H-RNN) and Low-Level Worker (L-RNN) hidden sizes are now **strictly locked** to the `context_dim`. The `--h_hidden` and `--l_hidden` flags have been deprecated/removed in favor of a single `--context_dim` argument that scales the entire hierarchy uniformly.
+> 2.  **Context Drift (Sliding Context):** 🌊 The connection between the Manager and Worker is no longer static. A new `context_drift_proj` layer allows the Worker to slightly "slide" or evolve its instruction context *during* its execution loop, enabling fluid reasoning without full interrupts.
+> 3.  **Anti-Echo Chamber Learning:** 🛡️ The chat interface now supports **Negative Reinforcement**. Telling the model "No" or "Bad" triggers an update with *inverted gradients*, penalizing the specific memory pathways used in the error.
 
-### 🚀 **Major Update in v0.8.5: Reworked Build System & Vulkan Auto-Setup**
+### 🚀 **Major Paradigm Shift (v0.9.0): The RWKV Backbone**
 
-> This version completely overhauls the C++ kernel build process for simplicity and cross-platform reliability, especially for the optional Vulkan backend.
->
-> 1.  **CPU-First Default:** ⚙️ The build scripts (`setup.bat`, `setup.sh`) now compile the **CPU-optimized kernel by default**.
-> 2.  **Opt-in Vulkan Build:** 🔥 To enable the Vulkan backend for GPU-accelerated quantized inference, simply pass the `--vulkan` flag.
-> 3.  **Automatic Dependency Installation (Linux):** 🐧 The `setup.sh` script will automatically detect missing Vulkan tools and install them via `apt`.
+> 1.  **RWKV Architecture:** 🧠 Hierarchos leverages Linear Transformers within an RNN framework, allowing parallelizable training and constant inference memory.
+> 2.  **State-Invariant Processing:** 🚫 Explicit Positional Embeddings (`pos_emb`) have been removed. The model handles temporal relationships via RWKV's internal state decay (`time_decay`), improving generalization to infinite sequence lengths.
 
 ## About The Project
 
-The field of AI has been dominated by a paradigm of unprecedented scale, yet fundamental limitations in today's Transformer models are becoming apparent. The path to Artificial General Intelligence (AGI) may not be paved with scale alone. Hierarchos challenges this paradigm by focusing on **architectural intelligence**.
+The field of AI has been dominated by a paradigm of unprecedented scale, yet fundamental limitations in today's Transformer models are becoming apparent. Hierarchos challenges this paradigm by focusing on **architectural intelligence**.
 
 This project introduces a novel hybrid model where a deep reasoning engine operates within a dynamic, lifelong learning memory environment. Hierarchos is conceived not merely to process information, but to **think, learn, and remember** in a cohesive, integrated, and human-like manner.
 
 ## Core Concepts
 
-Hierarchos is built on two revolutionary, brain-inspired pillars:
-
 🧠 **Titans Architecture (The Cognitive Substrate)**
-A sophisticated, multi-tiered memory workspace that enables dynamic, lifelong learning. It learns *what to remember* based on the principle of "surprise," and its memory slots are structured with timestamps and source metadata, allowing for sophisticated, context-aware queries.
+A sophisticated, multi-tiered memory workspace that enables dynamic, lifelong learning. It learns *what to remember* based on the principle of "surprise," and its memory slots are structured with timestamps and source metadata.
 
 ⚙️ **Hierarchical Reasoning Model (The Cognitive Process)**
-A powerful, data-efficient, and deep reasoning engine. Now powered by **RWKV Recurrence**, the dual-module design (a high-level "CEO" and low-level "Workers") allows for profound computational depth through **iterative convergence**. This enables it to solve complex, multi-step algorithmic problems where massive LLMs fail.
+A powerful, data-efficient, and deep reasoning engine powered by **RWKV Recurrence**.
+* **The Manager (H-RNN):** Sets the high-level plan.
+* **The Worker (L-RNN):** Executes the plan via iterative convergence.
+* **Context Drift:** The Worker can now subtly adjust the Manager's plan in real-time as it generates tokens, allowing for fluid adaptation.
 
 ## Features ✨
 
-  * 🧠 **RWKV-Based Recurrence**: Replaces legacy GRU cells with RWKV, offering better scalability, numerical stability, and "time-decay" based temporal processing.
-  * 📏 **Infinite Length Generalization**: By removing absolute positional embeddings, the model relies on state carry-over, allowing it to process sequences significantly longer than those seen during training.
-  * 🔥 **PyTorch 2.0+ Compiled Training**: **Automatically uses `torch.compile`** on the core HRM loop for massive speedups (1.5x-3x+) on modern NVIDIA GPUs after an initial "warmup" compilation.
-  * 🌐 **Hugging Face `datasets` Integration**: Load datasets directly from the HF Hub or local paths in various formats (CSV, Parquet, JSON, etc.) using `--hf_dataset`.
-  * 💾 **Optimized Consolidated Chunk Loading**: Dramatically reduces RAM usage and speeds up training startup for large datasets using pre-processed, consolidated `.pt` tensor files (`--pre_pt_dataset`).
-  * ✂️ **Dataset Consolidation Script (`dataset_chunk_create.py`)**: Enhanced tool to prepare large datasets, chunking them into **consolidated `.pt` files** and creating a `manifest.jsonl`.
-  * 📉 **Gradient Checkpointing**: Significantly reduces VRAM usage during training/fine-tuning (`--gradient-checkpointing`), enabling larger models or batches on memory-constrained hardware.
-  * 🤔 **Adaptive "Ponder" Time**: Dynamically adjusts its reasoning depth, "thinking" longer for complex problems and saving computation on simpler ones.
-  * 🕰️ **Structured & Queryable Memory**: LTM slots are augmented with timestamps and source data, enabling powerful temporal and contextual queries during chat.
-  * ⚡ **Accelerated Training with AMP**: Supports Automatic Mixed Precision (`--amp`) for faster training and reduced memory usage on compatible NVIDIA GPUs.
-  * 📦 **Self-Contained & Portable Models**: Models are saved as directories containing weights, tokenizer, and architecture config.
-  * 🌱 **Enhanced Model Expansion**: `expand_model.py` allows transplanting weights to larger models. (Updated in v0.9 to automatically drop legacy positional embeddings).
-  * ⚡ **High-Performance Inference**: Utilizes a custom C++ kernel inspired by `llama.cpp` for state-of-the-art quantization (`INT4`, `Q4_0`, `Q8_0`, `Q2_K`). *(Requires compiled kernel)*
-  * 💻 **CPU & GPU Support**: Runs fast quantized inference on standard CPUs (with AVX/NEON) or on GPUs via Vulkan for broad hardware compatibility. *(Requires compiled kernel)*
+* 🧠 **RWKV-Based Recurrence**: Replaces legacy GRU cells with RWKV for linear scaling.
+* ⚖️ **Symmetric Architecture**: Enforces dimension matching between hierarchy levels for improved gradient flow.
+* 🌐 **Hugging Face `datasets` Integration**: Stream datasets directly from the HF Hub (e.g., Wikitext, C4, Alpaca).
+* 🌊 **Sliding Context Mechanism**: New projection layer allowing the Worker to evolve the context vector dynamically.
+* 🛡️ **Negative Reinforcement Learning**: In-chat capability to penalize specific memory recalls via gradient inversion.
+* 🔥 **PyTorch 2.0+ Compiled Training**: Automatically uses `torch.compile` for massive speedups on NVIDIA GPUs.
+* 💾 **Optimized Consolidated Chunk Loading**: Support for instant loading of massive pre-tokenized datasets via `.pt` files.
+* 📉 **Gradient Checkpointing**: Reduce VRAM usage during training (`--gradient-checkpointing`).
+* 🕰️ **Structured & Queryable Memory**: LTM slots include timestamps and source IDs, allowing temporal filtering.
+* ⚡ **High-Performance Quantized Inference**: Custom C++ kernel (AVX2/AVX512/NEON) for `INT4`, `Q4_0`, `Q8_0`, and `Q2_K`.
+* 🎮 **Vulkan Acceleration**: Optional GPU backend for quantized inference via `setup.bat --vulkan` / `setup.sh --vulkan`.
 
 -----
 
@@ -64,17 +60,14 @@ Follow these steps to get a local copy up and running.
 
 ### Prerequisites
 
-  * Python 3.8+
-  * **PyTorch 2.0+ (Required for `torch.compile` speedups)**
-  * `pip install datasets`
-  * **Optional (Quantization/Vulkan):** C++ compiler, CMake, Vulkan SDK.
+* Python 3.8+
+* **PyTorch 2.0+ (Required for `torch.compile`)**
+* `pip install datasets`
+* **Optional:** C++ compiler (MSVC/GCC/Clang), CMake, Vulkan SDK.
 
 ### Installation
 
------
-
 1.  **Clone the repository:**
-
     ```bash
     git clone [https://github.com/necat101/Hierarchos.git](https://github.com/necat101/Hierarchos.git)
     cd Hierarchos
@@ -82,21 +75,8 @@ Follow these steps to get a local copy up and running.
 
 2.  **Run the Setup Script:**
     This script builds the C++ kernel required for quantization and optimized inference.
-
-    **Default CPU Build (Recommended):**
-    ```bash
-    # On Windows
-    setup.bat
-
-    # On Linux/macOS
-    bash setup.sh
-    ```
-
-    **Vulkan Build (Optional):**
-    ```bash
-    setup.bat --vulkan   # Windows
-    bash setup.sh --vulkan # Linux/macOS
-    ```
+    * **Default (CPU):** `setup.bat` (Windows) or `bash setup.sh` (Linux/macOS)
+    * **Vulkan (GPU):** `setup.bat --vulkan` or `bash setup.sh --vulkan`
 
 -----
 
@@ -104,138 +84,182 @@ Follow these steps to get a local copy up and running.
 
 ### Workflow 1: Training a New Model
 
-**(A) Local JSON/JSONL File (Fits in RAM):**
+**Note:** You no longer need to specify `h_hidden` or `l_hidden`. Setting `--context_dim` automatically scales the entire architecture.
+
+#### **(A) Hugging Face Datasets (Recommended)**
+
+**Example: Pre-training on Wikitext-103**
+```bash
+python hierarchos.py train \
+    --hf_dataset "wikitext" \
+    --hf_dataset_config "wikitext-103-raw-v1" \
+    --hf_dataset_split "train" \
+    --text_column "text" \
+    --tokenizer-path "openai-community/gpt2" \
+    --out-dir "./hierarchos_wikitext" \
+    --auto-max-length \
+    --context_dim 768 \
+    --batch_size 4 \
+    --gradient-checkpointing \
+    --amp
+````
+
+#### **(B) Local JSON/JSONL File**
 
 ```bash
 python hierarchos.py train \
     --train "path/to/your_data.jsonl" \
     --tokenizer-path "openai-community/gpt2" \
-    --out-dir "./my_Hierarchos_model" \
+    --out-dir "./my_model" \
     --epochs 3 \
     --batch_size 4 \
     --accumulation-steps 2 \
-    --auto-max-length \
     --context_dim 768 \
-    --h_hidden 768 \
-    --l_hidden 768 \
     --max_h_steps 5 \
     --max_l_steps 5 \
-    --amp \
-    --gradient-checkpointing
-````
+    --auto-max-length \
+    --amp
+```
 
-**(B) Pre-Chunked Local Dataset (Very Large Dataset):**
+#### **(C) Pre-Chunked Local Dataset (Massive Scale)**
 
-  * **Step 1: Create Chunks**
+For datasets larger than RAM, use the chunking tool first.
+
+1.  **Create Chunks:**
     ```bash
     python dataset_chunk_create.py \
-        --dataset "path/to/very_large_data.jsonl" \
+        --dataset "path/to/huge_corpus.jsonl" \
         --tokenizer-path "openai-community/gpt2" \
-        --output-dir "./very_large_data_chunked" \
-        --overlap 512 \
+        --output-dir "./chunked_data" \
         --chunks-per-file 1000
-    # Note the MAX_SEQ_LENGTH printed by the script (e.g., 3153)
     ```
-  * **Step 2: Train using Chunks**
+2.  **Train:**
     ```bash
     python hierarchos.py train \
         --pre_pt_dataset \
-        --train "./very_large_data_chunked" \
-        --max_length 3153 `# MUST match chunker output` \
+        --train "./chunked_data" \
+        --max_length 3153 `# Must match output of chunk script` \
         --tokenizer-path "openai-community/gpt2" \
-        --out-dir "./my_large_model" \
-        --epochs 1 \
-        --batch_size 1 \
-        --accumulation-steps 8 \
-        --amp \
-        --gradient-checkpointing
+        --out-dir "./my_large_model"
     ```
 
------
+### Workflow 2: Running Chat with Online Learning
 
-## ⚠️ **HRM Convergence & Training Speed:** Higher `--max_h_steps` and `--max_l_steps` allow deeper reasoning but **significantly increase training time** per batch due to the iterative HRM process. Adjust based on your task and compute resources.
-
-### Workflow 2: Fine-Tuning with LoRA
-
-```bash
-python hierarchos.py finetune \
-    --model-path "./my_Hierarchos_model" \
-    --hf_dataset "squad" \
-    --prompt_column "question" \
-    --completion_column "answers" \
-    --text_column "context" \
-    --out-dir "./my_squad_lora" \
-    --epochs 1 \
-    --lora_r 16 \
-    --amp \
-    --gradient-checkpointing
-```
-
-### Workflow 3: Merging LoRA Adapter
-
-```bash
-python hierarchos.py merge-lora \
-    --model-path "./my_Hierarchos_model" \
-    --lora-adapter-path "./my_squad_lora" \
-    --out-dir "./my_model_merged_squad"
-```
-
-### Workflow 4: Quantizing a Model *(Requires Compiled Kernel)*
-
-```bash
-python hierarchos.py quantize \
-    --model-path "./my_model_merged_squad" \
-    --out-dir "./my_model_merged_squad-Q4_0" \
-    --qtype Q4_0 `# Choose format: INT4, Q4_0, Q8_0, Q2_K`
-```
-
-### Workflow 5: Running Chat Inference
-
-**Full Precision:**
-
-```bash
-python hierarchos.py chat --model-path "./my_model_merged_squad"
-```
-
-**Quantized:**
+To enable learning while running a quantized model (INT4/Q4\_0), you must provide the path to the original full-precision weights (`--shadow-model-path`).
 
 ```bash
 python hierarchos.py chat \
-    --model-path "./my_model_merged_squad-Q4_0" \
-    --device cpu `# Use "vulkan" if compiled with support`
+    --model-path "./my_model-Q4_0" \
+    --shadow-model-path "./my_model" \
+    --enable-quantized-learning \
+    --device vulkan `# Optional`
 ```
 
-### Workflow 7: Expanding a Model
+#### **Chat Interaction Guide**
 
-Create a larger model architecture initialized with weights from a smaller trained one. *Note: Legacy positional embeddings are automatically dropped.*
+  * **Positive Feedback:** Type `"Good"`, `"Yes"`, or `"Correct"` to reinforce the *previous* interaction.
+  * **Negative Reinforcement:** Type `"No"`, `"Bad"`, or `"Wrong"` to **penalize** the *previous* interaction via gradient inversion.
+  * **Corrections:** Start a reply with `"No, actually..."` to trigger immediate learning of new facts.
+
+### Workflow 3: Expanding a Model
+
+Upgrade a trained model to a larger size. The script automatically handles the new layers and enforces size symmetry.
 
 ```bash
 python expand_model.py \
     --old-model-path "./my_Hierarchos_model" \
     --output-dir "./expanded_model" \
-    --context_dim 1024 \
-    --h_hidden 1024 \
-    --l_hidden 1024
+    --context_dim 1024 `# Will automatically set h_hidden and l_hidden to 1024`
 ```
 
 -----
 
 ## ⚙️ Command-Line Reference
 
-*(Refer to the code or previous documentation for full argument list. Key additions in v0.9 below)*
-
 ### `hierarchos.py` Arguments
 
 | Argument | Mode(s) | Description | Default |
 | :--- | :--- | :--- | :--- |
-| `--max_length` | `train`, `finetune` | Maximum sequence length. Even though `pos_emb` is removed, this is used for data chunking and buffer sizing. | `1024` |
-| `--context_dim` | `train` | Core embedding dimension. | `768` |
-| `--h_hidden` | `train` | Hidden size of the High-Level (CEO) RNN (now RWKV). | `768` |
-| `--l_hidden` | `train` | Hidden size of the Low-Level (Worker) RNN (now RWKV). | `768` |
+| **Paths & Data** | | | |
+| `--train` | `train`, `finetune` | Path to **local** data: JSON/JSONL file, or directory for `--pre_pt_dataset`. Use flag without path if using `--hf_dataset`. Mutually Exclusive with `--hf_dataset` path. | `None` |
+| `--hf_dataset` | `train`, `finetune` | Name or path to a Hugging Face dataset (e.g., 'wikitext', 'c4'). Mutually Exclusive with `--train` path. | `None` |
+| `--hf_dataset_config` | `train`, `finetune` | Optional configuration name for the HF dataset (e.g., 'wikitext-103-raw-v1'). | `None` |
+| `--hf_dataset_split` | `train`, `finetune` | Dataset split to use (e.g., 'train', 'validation', 'train[:10%]'). | `train` |
+| `--text_column` | `train`, `finetune` | Column name for text completion data in HF dataset. Defaults to 'text' if available. | `None` |
+| `--prompt_column` | `train`, `finetune` | Column name for prompt/instruction in HF dataset. Use with `--completion_column`. | `None` |
+| `--completion_column` | `train`, `finetune` | Column name for completion/response in HF dataset. Use with `--prompt_column`. | `None` |
+| `--pre_chunked_dataset` | `train`, `finetune` | Load pre-chunked **JSONL** dataset iteratively (requires `--max_length`). | `False` |
+| `--pre_pt_dataset` | `train`, `finetune` | Load pre-chunked **consolidated .pt tensor** dataset from directory specified in `--train` (requires `--max_length`). | `False` |
+| `--model-path` | `train`, `finetune`, `merge`, `quantize`, `chat` | Path to model directory. [Train]: Loads weights only (fresh start). [Other]: Loads for specified mode. | `None` |
+| `--out-dir` | `train`, `finetune`, `merge`, `quantize` | Directory to save new models, checkpoints, or adapters. | `./Hierarchos_model` |
+| `--tokenizer-path` | `train`, `finetune`, `merge`, `quantize` | Path or HF name of tokenizer (if not loading from model-path). | `openai-community/gpt2` |
+| `--resume-from-ckpt` | `train` | Path to `.pt` checkpoint to **resume full training state** (optimizer, etc.). | `None` |
+| `--shadow-model-path` | `chat` | Path to full-precision model dir for online learning with quantized model. | `None` |
+| `--lora-adapter-path` | `merge`, `finetune` | Path to the trained LoRA adapter directory. | `None` |
+| **Training/Fine-Tuning** | | | |
+| `--epochs` | `train`, `finetune` | Number of training epochs. | `3` |
+| `--batch_size` | `train`, `finetune` | Number of samples per forward pass. | `4` |
+| `--accumulation-steps` | `train`, `finetune` | Number of steps to accumulate gradients over (simulates larger batch size). | `1` |
+| `--gradient-checkpointing` | `train`, `finetune` | Enable gradient checkpointing to save VRAM (trades compute for memory). | `False` |
+| `--grad-clip` | `train`, `finetune` | Gradient clipping value. Prevents gradient explosion (0 to disable). | `1.0` |
+| `--ponder-loss-weight` | `train`, `finetune` | Weight for the Ponder Cost auxiliary loss. | `0.01` |
+| `--override-scheduling` | `train` | [If resuming] Ignore checkpoint's schedule state and use new LR args. | `False` |
+| `--starting-lr` | `train`, `finetune` | Max Learning Rate for the schedule, or fixed LR if schedule disabled. | `1e-4` |
+| `--min-lr` | `train`, `finetune` | Minimum Learning Rate for cosine annealing schedule. | `1e-6` |
+| `--disable-lr-schedule` | `train`, `finetune` | Use a fixed Learning Rate (`--starting-lr`) instead of cosine annealing. | `False` |
+| `--ltm_lr` | `train`, `finetune`, `chat` | Learning Rate for LTM "surprise" updates (or max LR for LTM schedule in chat). | `0.01` |
+| `--amp` | `train`, `finetune`, `chat` | Enable Automatic Mixed Precision (requires CUDA). | `False` |
+| `--num_workers` | `train`, `finetune` | Number of CPU workers for data loading (and HF dataset mapping if applicable). | `0` |
+| `--lora_r` | `finetune` | LoRA rank 'r'. | `8` |
+| `--lora_alpha` | `finetune` | LoRA alpha scaling factor. | `16` |
+| `--finetune-unlock-percent`| `finetune` | Target % of params to train (approx.). Overrides `--lora_r` if set. | `None` |
+| `--kayla` | `train`, `finetune` | Enable Kayla-style instruction tuning format (with thought-process). Ignored if using pre-chunked formats. | `False` |
+| **Quantization/Inference** | | | |
+| `--qtype` | `quantize`, `train` | Quantization format (`INT4`, `Q4_0`, `Q8_0`, `Q2_K`). Used by `quantize` or `--quantize-on-complete`. | `INT4` |
+| `--quantize-on-complete` | `train` | Automatically run quantization after training finishes. Requires compiled kernel. | `False` |
+| `--device` | `chat` | Device for **quantized** inference (`cpu`, `vulkan`). Requires kernel compiled with `--vulkan` flag. | `cpu` |
+| `--h-halt-thresh` | `chat` | Probability threshold for early exiting the HRM reasoning loop during inference. | `0.9` |
+| `--max-new-tokens` | `chat` | Maximum number of tokens to generate in chat mode. | `512` |
+| `--enable-quantized-learning`| `chat` | Enable LTM updates for quantized models (requires `--shadow-model-path`). | `False` |
+| `--ltm-lora-path` | `chat` | Optional: Path to save/load LTM updates as a separate delta file in chat mode. | `None` |
+| `--static-ltm-lr` | `chat` | Disable cosine annealing for chat LTM updates, use fixed `--ltm_lr`. | `False` |
+| `--ltm-schedule-steps` | `chat` | Number of chat updates per LTM LR cosine cycle. | `100` |
+| `--ltm-schedule-min-lr` | `chat` | Minimum LR for chat LTM cosine schedule. | `1e-5` |
+| **Architecture (Train)** | | *(Used only if starting train from scratch)* | |
+| `--context_dim` | `train` | Core embedding dimension. **Sets `h_hidden` and `l_hidden` automatically.** | `768` |
+| `--persistent_dim` | `train` | Dimension of the fixed Persistent Memory. | `128` |
+| `--ltm_slots` | `train` | Number of slots in the Long-Term Memory. | `1024` |
+| `--ltm_key_dim` | `train` | Dimension of LTM keys. | `128` |
+| `--ltm_val_dim` | `train` | Dimension of LTM values. | `128` |
+| `--max_h_steps` | `train` | Maximum number of reasoning steps H-module can take. Impacts training speed. | `5` |
+| `--max_l_steps` | `train` | Maximum number of iterations for L-module convergence per H-step. Impacts training speed. | `5` |
+| `--l_conv_atol` | `train` | Absolute tolerance for checking L-module state convergence. | `1e-4` |
+| `--ltm_topk` | `train` | Number of LTM slots to retrieve per token. | `2` |
+| `--max_length` | `train`, `finetune` | Maximum sequence length. Required if using pre-chunked formats. | `1024` |
+| `--auto-max-length` | `train`, `finetune` | Automatically scan dataset (`--train` or `--hf_dataset`) to set `max_length`. | `False` |
+| **Other** | | | |
+| `--threads` | `All` | Number of CPU threads for PyTorch/OpenMP. | `CPU/2` |
+
+### `dataset_chunk_create.py` Arguments ✂️
+
+| Argument | Description | Required | Default |
+| :--- | :--- | :--- | :--- |
+| `--dataset` | Path to the input JSONL dataset file (Kayla format recommended). | **Yes** | |
+| `--tokenizer-path` | Path or Hugging Face name of the tokenizer to use for chunking. | No | `openai-community/gpt2` |
+| `--output-dir` | Directory to save the output **consolidated** `.pt` chunk files and `manifest.jsonl`. | No | `train_Hierarchos_chunked_tensors` |
+| `--overlap` | Number of tokens to overlap between consecutive chunks. | No | `1024` |
+| `--chunks-per-file` | Number of individual chunks to **consolidate** into a single `.pt` file. | No | `1000` |
+
+### `expand_model.py` Arguments 🌱
+
+| Argument | Description | Required | Default |
+| :--- | :--- | :--- | :--- |
+| `--old-model-path` | Path to the trained smaller model `.pt` checkpoint file. | **Yes** | |
+| `--output-path` | Path to save the new, expanded `.pt` model file. | **Yes** | |
+| `--context_dim` | **Required:** New context dimension (Auto-syncs hidden sizes). | **Yes** | |
+| **Other Arch Args** | Optional: Add other architectural args like `--ltm_slots`, `--max_length`, etc., if changing them. | No | *(Uses old model's value)* |
 
 -----
-
-
 
 ## Roadmap
 
@@ -262,35 +286,24 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
 
 ## Changelog
 
-### v0.9 (alpha)
+### v0.9.5 (alpha)
 
-  * **Architectural Overhaul (RWKV)**: Replaced GRU controllers with **RWKV** cells. This improves efficiency and scalability.
-  * **Positional Embedding Removal**: Removed explicit `pos_emb`. The model now relies on RWKV's state decay for time perception, improving generalization to sequences longer than the training context.
-  * **Quantization Update**: Updated `Quantizedhierarchos` and C++ kernels to support quantized RWKV layers (Time Mixing/Channel Mixing).
-  * **Model Expansion Fix**: Updated `expand_model.py` to handle the removal of positional embeddings when transplanting weights.
+  * **Enforced Symmetry**: Removed `h_hidden`/`l_hidden` flags. Both now sync to `context_dim` for stability.
+  * **Context Drift**: Added `context_drift_proj` layer for dynamic context adaptation.
+  * **Hugging Face Integration**: Added native support for HF datasets via `--hf_dataset`.
+  * **Negative Reinforcement**: Chat loop now supports penalizing memory ("No", "Bad").
+  * **Robust Signals**: Improved `Ctrl+C` handling for graceful exits.
 
-### v0.8.6 (alpha)
+### v0.9.0 (alpha)
 
-  * **Improved alpaca dataset handling**: "Instruction" and "input" are now merged during training as needed to follow the alpaca dataset format\!
+  * **Architectural Overhaul (RWKV)**: Replaced GRU controllers with **RWKV** cells.
+  * **Positional Embedding Removal**: Removed explicit `pos_emb`.
+  * **Quantization Update**: Updated C++ kernels for RWKV layers.
 
 ### v0.8.5 (alpha)
 
   * **Reworked Kernel Build System**: CPU-only by default, optional `--vulkan` flag.
-  * **Linux Auto-Install**: `setup.sh` detects missing Vulkan tools and installs them.
-
-### v0.8.0 (alpha)
-
-  * **Added Experimental `torch.compile` Support**: Massive speedups on NVIDIA GPUs.
-
-### v0.7.5 (alpha)
-
-  * **Added Gradient Checkpointing**: Significantly reduces VRAM usage.
-
-### v0.7.0 (alpha)
-
-  * **Added Hugging Face `datasets` Support**.
 
 -----
 
 © 2025 Makhi Burroughs
-

@@ -235,10 +235,7 @@ python expand_model.py \
 
 -----
 
-### Real world training performance (ROG ALLY Z1 Extreme CPU on Hierarchos v0.8.0 alpha):
 
-\<img width="1113" height="626" alt="WindowsTerminal\_GXV9uDzz0R" src="https://github.com/user-attachments/assets/ade557e2-b577-4df9-a688-06bbf0ec49b2" /\>
-\<img width="1824" height="647" alt="chrome\_wX62mwSBIH" src="https://github.com/user-attachments/assets/8b864948-4320-41cd-b619-665309fd1f48" /\>
 
 ## Roadmap
 

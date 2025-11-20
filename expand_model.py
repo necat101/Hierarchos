@@ -1,12 +1,11 @@
 import torch
 import argparse
 import os
-import json # MODIFICATION: Added for dataset scanning
+import json
 from tqdm import tqdm
-from transformers import AutoTokenizer # MODIFICATION: Added for tokenizer loading
-from hierarchos import HierarchosCore, AttrDict # We import your model definition
+from transformers import AutoTokenizer
+from hierarchos import HierarchosCore, AttrDict 
 
-# --- MODIFICATION START: Add dataset scanning function (adapted from hierarchos.py) ---
 def scan_dataset_for_max_length(dataset_path: str, tokenizer, kayla_mode: bool) -> int:
     """Scans a JSON or JSONL dataset to find the maximum token sequence length."""
     max_found_length = 0
@@ -55,34 +54,33 @@ def scan_dataset_for_max_length(dataset_path: str, tokenizer, kayla_mode: bool) 
     else:
         print("⚠️ WARNING: Auto-scan did not find any valid entries.")
         return 0
-# --- MODIFICATION END ---
 
-def transplant_weights(old_model_path: str, new_config: dict, output_dir: str, device: str): # MODIFICATION: Changed output_path to output_dir
+def transplant_weights(old_model_path: str, new_config: dict, output_dir: str, device: str):
     """
     Loads weights from a smaller, trained model into a new, larger model,
-    handling changes in dimensions and max_length. Saves as a model directory.
+    handling changes in dimensions. Saves as a model directory.
     """
     print(f"Loading old model directory: {old_model_path}")
-    # --- MODIFICATION START: Load from directory ---
+    
     old_weights_path = os.path.join(old_model_path, "hierarchos.pt")
     if not os.path.exists(old_weights_path):
         raise FileNotFoundError(f"'hierarchos.pt' not found in directory: {old_model_path}")
+    
     checkpoint = torch.load(old_weights_path, map_location=device)
     old_state_dict = checkpoint['model_state_dict']
     old_config = AttrDict(checkpoint.get('config', {}))
-    # --- MODIFICATION END ---
 
     # Ensure vocab size is present in the new config if it was in the old one
     if 'vocab_size' in old_config and 'vocab_size' not in new_config:
         new_config['vocab_size'] = old_config.vocab_size
-    # --- MODIFICATION START: Ensure max_length consistency ---
+    
+    # Ensure max_length consistency
     if 'max_length' not in new_config:
-        new_config['max_length'] = old_config.max_length # Default to old if not specified/auto-detected
+        new_config['max_length'] = old_config.max_length 
     print(f"Target max_length for new model: {new_config['max_length']}")
-    # --- MODIFICATION END ---
-
 
     print("Initializing new, larger model...")
+    # The new model structure (without pos_emb) is initialized here
     new_model = HierarchosCore(new_config).to(device)
     new_state_dict = new_model.state_dict()
 
@@ -90,20 +88,6 @@ def transplant_weights(old_model_path: str, new_config: dict, output_dir: str, d
     for name, new_param in tqdm(new_state_dict.items()):
         if name in old_state_dict:
             old_param = old_state_dict[name]
-
-            # --- MODIFICATION START: Special handling for pos_emb ---
-            if name == "pos_emb.weight":
-                old_len = old_param.shape[0]
-                new_len = new_param.shape[0]
-                if new_len >= old_len:
-                    print(f"  - Transplanting positional embeddings (new: {new_len}, old: {old_len})")
-                    new_state_dict[name][:old_len, :].copy_(old_param)
-                else:
-                    # Should not happen if expanding, but handle just in case
-                    print(f"  - WARNING: New max_length ({new_len}) is smaller than old ({old_len}). Truncating positional embeddings.")
-                    new_state_dict[name].copy_(old_param[:new_len, :])
-                continue # Skip the general slicing logic below for pos_emb
-            # --- MODIFICATION END ---
 
             if new_param.shape == old_param.shape:
                 # If shapes match, copy directly
@@ -118,11 +102,13 @@ def transplant_weights(old_model_path: str, new_config: dict, output_dir: str, d
                      print(f"  - WARNING: Could not slice weights for '{name}'. Shapes might be incompatible beyond simple expansion. Retaining new initialization.")
 
         else:
-            print(f"  - Layer '{name}' not found in old model. Retaining new initialization.")
+            print(f"  - Layer '{name}' not found in old model (or is new). Retaining new initialization.")
+            
+    # Note: 'pos_emb' from old_state_dict is effectively ignored here because it 
+    # does not exist in new_state_dict.
 
     new_model.load_state_dict(new_state_dict)
 
-    # --- MODIFICATION START: Save as a model directory ---
     print(f"\nSaving expanded model directory to: {output_dir}")
     os.makedirs(output_dir, exist_ok=True)
     output_weights_path = os.path.join(output_dir, "hierarchos.pt")
@@ -139,21 +125,18 @@ def transplant_weights(old_model_path: str, new_config: dict, output_dir: str, d
         print("✅ Tokenizer copied successfully.")
     except Exception as e:
          print(f"⚠️ WARNING: Could not load or save tokenizer from '{old_model_path}'. You may need to manually copy tokenizer files. Error: {e}")
-    # --- MODIFICATION END ---
 
     print("✅ Model expansion complete.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Expand a trained hierarchos model to a larger architecture, including max_length.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter # MODIFICATION: Better help format
+        description="Expand a trained hierarchos model to a larger architecture.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    # MODIFICATION: Changed to model directory
     parser.add_argument("--old-model-path", type=str, required=True, help="Path to the trained model *directory* of the smaller model.")
-    # MODIFICATION: Changed to output directory
     parser.add_argument("--output-dir", type=str, required=True, help="Path to save the new, expanded model *directory*.")
 
-    # --- MODIFICATION START: Arguments for changing dimensions ---
+    # Arguments for changing dimensions
     dim_group = parser.add_argument_group('Architecture Dimension Expansion (Optional)')
     dim_group.add_argument("--context_dim", type=int, help="New context dimension (embedding size).")
     dim_group.add_argument("--persistent_dim", type=int, help="New persistent memory dimension.")
@@ -162,15 +145,13 @@ if __name__ == "__main__":
     dim_group.add_argument("--ltm_val_dim", type=int, help="New LTM value dimension.")
     dim_group.add_argument("--h_hidden", type=int, help="New H-RNN hidden size.")
     dim_group.add_argument("--l_hidden", type=int, help="New L-RNN hidden size.")
-    # --- MODIFICATION END ---
 
-    # --- MODIFICATION START: Arguments for changing max_length ---
+    # Arguments for changing max_length
     length_group = parser.add_argument_group('Sequence Length Expansion (Optional)')
     length_group.add_argument("--new-max-length", type=int, help="Manually specify the new maximum sequence length.")
     length_group.add_argument("--auto-max-length", action="store_true", help="Automatically determine new max length by scanning a dataset (requires --dataset-for-length). Overrides --new-max-length if both are given.")
     length_group.add_argument("--dataset-for-length", type=str, help="Path to dataset (.jsonl or .json) to scan if using --auto-max-length.")
     length_group.add_argument("--kayla", action="store_true", help="Use Kayla formatting when scanning dataset with --auto-max-length.")
-    # --- MODIFICATION END ---
 
     args = parser.parse_args()
 
@@ -207,12 +188,10 @@ if __name__ == "__main__":
         if not args.dataset_for_length:
             parser.error("--auto-max-length requires --dataset-for-length to be specified.")
         try:
-            # --- MODIFICATION START: Load tokenizer for scanning ---
             print(f"Loading tokenizer from old model path: {args.old_model_path}")
             tokenizer = AutoTokenizer.from_pretrained(args.old_model_path, trust_remote_code=True)
             if tokenizer.pad_token is None:
                 tokenizer.pad_token = tokenizer.eos_token
-            # --- MODIFICATION END ---
 
             determined_len = scan_dataset_for_max_length(args.dataset_for_length, tokenizer, args.kayla)
             if determined_len > 0:
@@ -230,10 +209,8 @@ if __name__ == "__main__":
         print(f"Updating max_length: {old_len} -> {new_max_len}")
         final_config['max_length'] = new_max_len
     elif 'max_length' not in final_config:
-         # Fallback if length wasn't in old config and not specified/auto-detected
          default_len = 1024
          print(f"Warning: max_length not found in old config and not specified/auto-detected. Defaulting to {default_len}.")
          final_config['max_length'] = default_len
-
 
     transplant_weights(args.old_model_path, final_config, args.output_dir, device)

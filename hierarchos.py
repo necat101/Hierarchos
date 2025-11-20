@@ -1248,23 +1248,38 @@ class RWKVCell(nn.Module):
         super().__init__()
         self.n_embd = n_embd
 
-        # Time mixing
-        self.time_decay = nn.Parameter(torch.zeros(n_embd))
-        self.time_first = nn.Parameter(torch.zeros(n_embd))
+        # --- CRITICAL FIX: Time Decay Initialization ---
+        # Cannot be 0. If 0, exp(0)=1, meaning history never decays and state explodes.
+        # We initialize from -6 to -1 across channels.
+        # This creates a range of retention windows (short-term vs long-term).
+        decay_speed = torch.arange(0, n_embd) / n_embd
+        self.time_decay = nn.Parameter(-5 + 4 * decay_speed) # Range: [-5, -1]
+
+        # --- Time First (Bonus) ---
+        # This acts as a bias for the current token's key against the history.
+        self.time_first = nn.Parameter(torch.ones(n_embd) * 0.5)
         
-        # Init as (1, 1, n_embd) to match your existing checkpoints/setup
-        self.time_mix_k = nn.Parameter(torch.zeros(1, 1, n_embd))
-        self.time_mix_v = nn.Parameter(torch.zeros(1, 1, n_embd))
-        self.time_mix_r = nn.Parameter(torch.zeros(1, 1, n_embd))
+        # --- CRITICAL FIX: Time Mixing Initialization ---
+        # Previous zero-init meant xk = sx (100% history, 0% input).
+        # We use a curve so some channels focus on input (1.0) and others on history (0.0).
+        curve = torch.arange(0, n_embd) / n_embd
+        curve = torch.pow(curve, 0.5) # Simple power curve
+
+        # Init as (1, 1, n_embd) for broadcasting
+        self.time_mix_k = nn.Parameter(curve.view(1, 1, n_embd))
+        self.time_mix_v = nn.Parameter(curve.view(1, 1, n_embd) + 0.1 * torch.randn(1, 1, n_embd)) # Slight variance for V
+        self.time_mix_r = nn.Parameter(0.5 * curve.view(1, 1, n_embd)) # Receptance usually mixes more history
 
         self.key = nn.Linear(n_embd, n_embd, bias=False)
         self.value = nn.Linear(n_embd, n_embd, bias=False)
         self.receptance = nn.Linear(n_embd, n_embd, bias=False)
         self.output = nn.Linear(n_embd, n_embd, bias=False)
 
-        # Channel mixing
-        self.time_mix_k_cm = nn.Parameter(torch.zeros(1, 1, n_embd))
-        self.time_mix_r_cm = nn.Parameter(torch.zeros(1, 1, n_embd))
+        # --- Channel Mixing ---
+        # Channel mixing usually benefits from starting with a small bias towards history 
+        # but not purely dead (0). We init small positive values.
+        self.time_mix_k_cm = nn.Parameter(torch.ones(1, 1, n_embd) * 0.05)
+        self.time_mix_r_cm = nn.Parameter(torch.ones(1, 1, n_embd) * 0.05)
 
         self.key_cm = nn.Linear(n_embd, n_embd * 4, bias=False)
         self.receptance_cm = nn.Linear(n_embd, n_embd, bias=False)
@@ -1299,6 +1314,7 @@ class RWKVCell(nn.Module):
         k = self.key(xk)
         v = self.value(xv)
 
+        # WKV Computation (RWKV-4 style)
         ww = self.time_first + k
         p = torch.maximum(pp, ww)
         e1 = torch.exp(pp - p)

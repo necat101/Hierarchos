@@ -298,4 +298,3 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
 © 2025 Makhi Burroughs
 
 ```
-```

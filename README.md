@@ -1,6 +1,6 @@
-
 -----
-# Hierarchos v0.9.5 (alpha): A Hybrid Memory-Reasoning Architecture
+
+# Hierarchos v0.10.0 (alpha): A Hybrid Memory-Reasoning Architecture
 
 A novel AI architecture that synergistically integrates Google's Titans memory system with a Hierarchical Reasoning Model (HRM) to move beyond the limitations of scale and take a decisive step on the path to AGI.
 
@@ -8,13 +8,13 @@ Due to Amazon's "Chronos" forecasting models (still based on transformers BTW) I
 
 -----
 
-### 🚀 **New in v0.9.5: Context Drift & Enforced Symmetry**
+### 🚀 **New in v0.10.0: The "Free Will" Update (Hinge Loss & Stability)**
 
-> This update focuses on architectural stability and dynamic adaptability.
+> This update addresses the "Posterior Collapse" phenomenon where the Worker module would become "lazy" and ignore its internal context.
 >
-> 1.  **Enforced Size Symmetry:** ⚖️ To ensure numerical stability during the "pondering" phases, the High-Level Manager (H-RNN) and Low-Level Worker (L-RNN) hidden sizes are now **strictly locked** to the `context_dim`. The `--h_hidden` and `--l_hidden` flags have been deprecated/removed in favor of a single `--context_dim` argument that scales the entire hierarchy uniformly.
-> 2.  **Context Drift (Sliding Context):** 🌊 The connection between the Manager and Worker is no longer static. A new `context_drift_proj` layer allows the Worker to slightly "slide" or evolve its instruction context *during* its execution loop, enabling fluid reasoning without full interrupts.
-> 3.  **Anti-Echo Chamber Learning:** 🛡️ The chat interface now supports **Negative Reinforcement**. Telling the model "No" or "Bad" triggers an update with *inverted gradients*, penalizing the specific memory pathways used in the error.
+> 1.  **Hinge Loss (Free Bit Budget):** 🔓 To fix posterior collapse, we've implemented a Hinge Loss mechanism. The Worker is now given a "free budget" of drift (defined by `--commitment-threshold`). As long as the Worker's modifications to the plan stay within this threshold (e.g., for syntax or immediate context), **no penalty is applied**. This encourages the model to actually use its hierarchical features rather than collapsing into a standard RNN.
+> 2.  **Commitment Control:** 🔗 If the Worker drifts *beyond* the threshold, a penalty is applied. This prevents the "Rogue Worker" problem, ensuring the Low-Level module doesn't stray so far that it ignores the High-Level Manager's plan.
+> 3.  **Robust Training Loop:** 🛡️ Fixed a critical "Last Batch Mismatch" bug that caused training crashes on datasets that didn't divide evenly by the batch size. The model now dynamically slices internal states to handle variable batch sizes at the end of epochs.
 
 ### 🚀 **Major Paradigm Shift (v0.9.0): The RWKV Backbone**
 
@@ -34,23 +34,24 @@ A sophisticated, multi-tiered memory workspace that enables dynamic, lifelong le
 
 ⚙️ **Hierarchical Reasoning Model (The Cognitive Process)**
 A powerful, data-efficient, and deep reasoning engine powered by **RWKV Recurrence**.
-* **The Manager (H-RNN):** Sets the high-level plan.
-* **The Worker (L-RNN):** Executes the plan via iterative convergence.
-* **Context Drift:** The Worker can now subtly adjust the Manager's plan in real-time as it generates tokens, allowing for fluid adaptation.
+
+  * **The Manager (H-RNN):** Sets the high-level plan (Static Context).
+  * **The Worker (L-RNN):** Executes the plan. It operates under a "Commitment Contract"—it can drift from the plan to handle syntax (Hinge Loss), but is penalized if it drifts too far (Commitment Loss).
+  * **Context Drift:** The projection layer allows the Worker to evolve the context vector dynamically during generation.
 
 ## Features ✨
 
-* 🧠 **RWKV-Based Recurrence**: Replaces legacy GRU cells with RWKV for linear scaling.
-* ⚖️ **Symmetric Architecture**: Enforces dimension matching between hierarchy levels for improved gradient flow.
-* 🌐 **Hugging Face `datasets` Integration**: Stream datasets directly from the HF Hub (e.g., Wikitext, C4, Alpaca).
-* 🌊 **Sliding Context Mechanism**: New projection layer allowing the Worker to evolve the context vector dynamically.
-* 🛡️ **Negative Reinforcement Learning**: In-chat capability to penalize specific memory recalls via gradient inversion.
-* 🔥 **PyTorch 2.0+ Compiled Training**: Automatically uses `torch.compile` for massive speedups on NVIDIA GPUs.
-* 💾 **Optimized Consolidated Chunk Loading**: Support for instant loading of massive pre-tokenized datasets via `.pt` files.
-* 📉 **Gradient Checkpointing**: Reduce VRAM usage during training (`--gradient-checkpointing`).
-* 🕰️ **Structured & Queryable Memory**: LTM slots include timestamps and source IDs, allowing temporal filtering.
-* ⚡ **High-Performance Quantized Inference**: Custom C++ kernel (AVX2/AVX512/NEON) for `INT4`, `Q4_0`, `Q8_0`, and `Q2_K`.
-* 🎮 **Vulkan Acceleration**: Optional GPU backend for quantized inference via `setup.bat --vulkan` / `setup.sh --vulkan`.
+  * 🧠 **RWKV-Based Recurrence**: Replaces legacy GRU cells with RWKV for linear scaling.
+  * ⚖️ **Hinge Loss Regularization**: Solves posterior collapse by allowing "free" state manipulation within a threshold.
+  * 🌐 **Hugging Face `datasets` Integration**: Stream datasets directly from the HF Hub (e.g., Wikitext, C4, Alpaca).
+  * 🌊 **Sliding Context Mechanism**: New projection layer allowing the Worker to evolve the context vector dynamically.
+  * 🛡️ **Negative Reinforcement Learning**: In-chat capability to penalize specific memory recalls via gradient inversion.
+  * 🔥 **PyTorch 2.0+ Compiled Training**: Automatically uses `torch.compile` for massive speedups on NVIDIA GPUs.
+  * 💾 **Optimized Consolidated Chunk Loading**: Support for instant loading of massive pre-tokenized datasets via `.pt` files.
+  * 📉 **Gradient Checkpointing**: Reduce VRAM usage during training (`--gradient-checkpointing`).
+  * 🕰️ **Structured & Queryable Memory**: LTM slots include timestamps and source IDs, allowing temporal filtering.
+  * ⚡ **High-Performance Quantized Inference**: Custom C++ kernel (AVX2/AVX512/NEON) for `INT4`, `Q4_0`, `Q8_0`, and `Q2_K`.
+  * 🎮 **Vulkan Acceleration**: Optional GPU backend for quantized inference via `setup.bat --vulkan` / `setup.sh --vulkan`.
 
 -----
 
@@ -60,23 +61,25 @@ Follow these steps to get a local copy up and running.
 
 ### Prerequisites
 
-* Python 3.8+
-* **PyTorch 2.0+ (Required for `torch.compile`)**
-* `pip install datasets`
-* **Optional:** C++ compiler (MSVC/GCC/Clang), CMake, Vulkan SDK.
+  * Python 3.8+
+  * **PyTorch 2.0+ (Required for `torch.compile`)**
+  * `pip install datasets`
+  * **Optional:** C++ compiler (MSVC/GCC/Clang), CMake, Vulkan SDK.
 
 ### Installation
 
 1.  **Clone the repository:**
+
     ```bash
-    git clone [https://github.com/necat101/Hierarchos.git](https://github.com/necat101/Hierarchos.git)
+    git clone https://github.com/necat101/Hierarchos.git
     cd Hierarchos
     ```
 
 2.  **Run the Setup Script:**
     This script builds the C++ kernel required for quantization and optimized inference.
-    * **Default (CPU):** `setup.bat` (Windows) or `bash setup.sh` (Linux/macOS)
-    * **Vulkan (GPU):** `setup.bat --vulkan` or `bash setup.sh --vulkan`
+
+      * **Default (CPU):** `setup.bat` (Windows) or `bash setup.sh` (Linux/macOS)
+      * **Vulkan (GPU):** `setup.bat --vulkan` or `bash setup.sh --vulkan`
 
 -----
 
@@ -89,6 +92,7 @@ Follow these steps to get a local copy up and running.
 #### **(A) Hugging Face Datasets (Recommended)**
 
 **Example: Pre-training on Wikitext-103**
+
 ```bash
 python hierarchos.py train \
     --hf_dataset "wikitext" \
@@ -102,7 +106,7 @@ python hierarchos.py train \
     --batch_size 4 \
     --gradient-checkpointing \
     --amp
-````
+```
 
 #### **(B) Local JSON/JSONL File**
 
@@ -203,6 +207,8 @@ python expand_model.py \
 | `--gradient-checkpointing` | `train`, `finetune` | Enable gradient checkpointing to save VRAM (trades compute for memory). | `False` |
 | `--grad-clip` | `train`, `finetune` | Gradient clipping value. Prevents gradient explosion (0 to disable). | `1.0` |
 | `--ponder-loss-weight` | `train`, `finetune` | Weight for the Ponder Cost auxiliary loss. | `0.01` |
+| `--commitment-loss-weight` | `train`, `finetune` | **[NEW]** Weight for the Commitment auxiliary loss (drifting too far from plan). | `0.1` |
+| `--commitment-threshold` | `train`, `finetune` | **[NEW]** Hinge loss threshold ("Free Bit Budget"). Drift below this value is ignored. | `0.05` |
 | `--override-scheduling` | `train` | [If resuming] Ignore checkpoint's schedule state and use new LR args. | `False` |
 | `--starting-lr` | `train`, `finetune` | Max Learning Rate for the schedule, or fixed LR if schedule disabled. | `1e-4` |
 | `--min-lr` | `train`, `finetune` | Minimum Learning Rate for cosine annealing schedule. | `1e-6` |
@@ -285,6 +291,13 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
   * **PyTorch Team** for `torch.compile` and gradient checkpointing functionality.
 
 ## Changelog
+
+### v0.10.0 (alpha)
+
+  * **Hinge Loss (Free Bit Budget):** Implemented `ReLU(drift - threshold)` to prevent Posterior Collapse in the Worker module.
+  * **Last Batch Fix:** Fixed crash when dataset size isn't perfectly divisible by batch size.
+  * **Commitment Control:** Added tunable threshold and weights for drift regularization.
+  * **Robustness:** Improved state slicing and shadow state management during training.
 
 ### v0.9.5 (alpha)
 

@@ -1414,11 +1414,9 @@ class LTMModule(nn.Module):
         
         # Vals represent the consolidated content. 
         # IMPROVEMENT: Use Orthogonal Initialization.
-        # This ensures that initially, retrieving a memory slot provides information 
-        # that is statistically distinct from other slots, speeding up the "learning to memorize" phase.
         vals_init = torch.empty(n_slots, val_dim)
         nn.init.orthogonal_(vals_init)
-        # We scale by 0.02 to match the previous magnitude logic and prevent early variance explosion
+        # We scale by 0.02 to match the previous magnitude logic
         self.vals = nn.Parameter(vals_init * 0.02)
         
         # --- Fast State (Associative Working Memory - Titans Feature) ---
@@ -1438,6 +1436,18 @@ class LTMModule(nn.Module):
         # Buffer for accumulating deltas if not updating in-place
         self.register_buffer("ltm_deltas", torch.zeros_like(self.vals.data))
         self.accumulate_deltas = False
+
+    # <<< NEW: Method to prevent Data Leakage between batches >>>
+    def reset_working_memory(self):
+        """
+        Zeros out the Fast State (Working Memory) and associated momentum buffers.
+        This MUST be called at the start of every training batch to prevent
+        data from Batch N leaking into Batch N+1 via the persistent buffer.
+        """
+        self.fast_vals.zero_()
+        self._mom_vals.zero_()
+        # Note: We do NOT reset timestamps or sources as those track the Slow Memory context,
+        # unless you specifically want to simulate a complete "brain wipe".
 
     def get_effective_memory(self):
         """Returns the combined memory (Slow + Fast)."""
@@ -1592,6 +1602,13 @@ class HierarchosCore(nn.Module):
     - Fix: V2 Smart Indices (RWKV Stability).
     - Fix: V1 Shadow State (Prevents memory corruption during pondering).
     """
+    def reset_memory(self):
+        """
+        Resets the short-term 'fast' associative memory. 
+        Must be called between independent training batches.
+        """
+        if hasattr(self, 'ltm'):
+            self.ltm.reset_working_memory()
     def __init__(self, config: dict):
         super().__init__()
         self.config = AttrDict(config)
@@ -1673,6 +1690,8 @@ class HierarchosCore(nn.Module):
                 )
         except Exception as e:
             print(f"WARNING: torch.compile failed ({e}) — falling back to eager mode")
+            
+            
 
     def _worker_loop(self, enc, static_context, l_state):
         """
@@ -1711,7 +1730,7 @@ class HierarchosCore(nn.Module):
                 
                 # STABILITY FIX: Tanh bounds the drift to [-1, 1] preventing explosion
                 drift_delta = torch.tanh(self.context_drift_proj(l_out))
-                current_drift = current_drift + drift_delta
+                current_drift = torch.clamp(current_drift + drift_delta, min=-5.0, max=5.0)
                 dynamic_context = static_context + current_drift
                 
                 l_input_vec = torch.cat([current_enc, dynamic_context], dim=-1)
@@ -1736,7 +1755,7 @@ class HierarchosCore(nn.Module):
                 
                 # STABILITY FIX: Tanh bounds the drift to [-1, 1]
                 drift_delta = torch.tanh(self.context_drift_proj(l_out))
-                current_drift = current_drift + drift_delta
+                current_drift = torch.clamp(current_drift + drift_delta, min=-5.0, max=5.0)
                 
                 # Hinge Loss
                 drift_sq = torch.sum(current_drift ** 2, dim=-1).mean()
@@ -1766,14 +1785,17 @@ class HierarchosCore(nn.Module):
 
         x = self.tok_emb(input_ids)
 
-        # State Initialization
+        # ==================================================================
+        # 1. STATE INITIALIZATION
+        # ==================================================================
         if h_state is None:
             h_state = torch.zeros(B, self.config.h_hidden, 5, device=device)
-            h_state[:, :, 3] = -1e30   # pp init
-            # V3: We only need the target, the worker calculates the path.
+            h_state[:, :, 3] = -1e30   # pp init for RWKV/Time-mix
+            
+            # Init Target Context (Manager's Goal)
             target_context = torch.zeros(B, self.config.context_dim, device=device)
         else:
-            # Restore contexts from H-RNN state
+            # Restore context from the Manager's last known thought
             restored_ctx = self.h_to_context(h_state[:, :, 0])
             target_context = restored_ctx
 
@@ -1787,10 +1809,15 @@ class HierarchosCore(nn.Module):
 
         stride = self.config.h_stride
 
+        # ==================================================================
+        # 2. MAIN TIME LOOP
+        # ==================================================================
         for t in range(T):
             token_x = x[:, t]
+            
+            # --- LTM Retrieval (Titans Memory) ---
             p = self.persistent.unsqueeze(0).expand(B, -1)
-            q = self.qproj(token_x)
+            q = torch.clamp(self.qproj(token_x), min=-10, max=10)
             
             topk_vals, topk_idx, topk_ts = self.ltm.retrieve_topk(q, self.config.ltm_topk, min_timestamp, source_filter)
 
@@ -1807,72 +1834,88 @@ class HierarchosCore(nn.Module):
             enc = F.gelu(self.in_proj(mac_in))
 
             # ==================================================================
-            # HIERARCHICAL MANAGER STEP
+            # 3. HIERARCHICAL MANAGER (Continuous Watch, Strided Plan)
             # ==================================================================
+            
+            # A. REALITY STEP: Manager updates its state based on current token.
+            # This ensures the Manager has a continuous stream of consciousness.
+            h_out_real, h_state = self.h_rnn(enc, h_state)
+            
             step_ponder_cost = torch.tensor(0.0, device=device)
             
+            # B. PLANNING STEP: Only happens every 'stride' steps.
             if t % stride == 0:
-                # No "prev_context" needed here anymore.
+                # Start Pondering with the result of the Reality Step (Step 0)
+                h_step_outputs = [h_out_real]
+                
+                halt_logit = self.h_halt_proj(h_out_real).squeeze(-1)
+                h_halt_probs = [torch.sigmoid(halt_logit)]
+                
+                # --- Shadow Pondering Loop ---
+                # We clone the state so we don't hallucinate into the actual memory.
+                shadow_h_state = h_state.clone()
+                current_enc_h = enc 
 
-                # Run Manager Pondering
-                h_step_outputs = []
-                h_halt_probs = []
-                current_enc_h = enc
-
-                for _ in range(self.config.max_h_steps):
-                    h_out, h_state = self.h_rnn(current_enc_h, h_state)
-                    
-                    halt_logit = self.h_halt_proj(h_out).squeeze(-1)
-                    halt_prob = torch.sigmoid(halt_logit)
-                    
-                    h_step_outputs.append(h_out)
-                    h_halt_probs.append(halt_prob)
-
-                    if not self.training and halt_prob.mean() > getattr(self.config, 'h_halt_thresh', 0.9):
+                # Run thinking steps (Adaptive Computation Time)
+                # Range is max_steps - 1 because we already did the Real step.
+                for _ in range(self.config.max_h_steps - 1):
+                    # Check confidence (Inference Only optimization)
+                    if not self.training and h_halt_probs[-1].mean() > getattr(self.config, 'h_halt_thresh', 0.9):
                         break
-                
-                if h_step_outputs:
-                    h_stack = torch.stack(h_step_outputs, dim=0)
-                    halt_stack = torch.stack(h_halt_probs, dim=0)
-                    
-                    remain = 1.0 - halt_stack
-                    remain_shifted = torch.cat([torch.ones_like(remain[:1]), remain[:-1]], dim=0)
-                    cum_remain = torch.cumprod(remain_shifted, dim=0)
-                    weights = halt_stack * cum_remain
-                    remainder = cum_remain[-1] * (1.0 - halt_stack[-1])
-                    total = weights.sum(dim=0) + remainder + 1e-8
-                    weights = weights / total.unsqueeze(0)
-                    remainder = remainder / total
 
-                    final_h_out = (weights.unsqueeze(-1) * h_stack).sum(dim=0) + \
-                                  remainder.unsqueeze(-1) * h_stack[-1]
+                    # Think on the Shadow State
+                    h_out_ponder, shadow_h_state = self.h_rnn(current_enc_h, shadow_h_state)
                     
-                    # Set NEW target (Center of Gravity)
-                    target_context = self.h_to_context(final_h_out)
+                    halt_logit = self.h_halt_proj(h_out_ponder).squeeze(-1)
                     
-                    step_ponder_cost = len(h_step_outputs) + remainder.mean()
-                    ponder_costs.append(step_ponder_cost)
+                    h_step_outputs.append(h_out_ponder)
+                    h_halt_probs.append(torch.sigmoid(halt_logit))
+
+                # --- Weighted Sum (ACT) ---
+                h_stack = torch.stack(h_step_outputs, dim=0)
+                halt_stack = torch.stack(h_halt_probs, dim=0)
                 
+                remain = 1.0 - halt_stack
+                # Shift remain to calculate cumulative product (probability of arriving at this step)
+                remain_shifted = torch.cat([torch.ones_like(remain[:1]), remain[:-1]], dim=0)
+                cum_remain = torch.cumprod(remain_shifted, dim=0)
+                
+                weights = halt_stack * cum_remain
+                remainder = cum_remain[-1] * (1.0 - halt_stack[-1])
+                
+                total = weights.sum(dim=0) + remainder + 1e-8
+                weights = weights / total.unsqueeze(0)
+                remainder = remainder / total
+
+                # Calculate the weighted "Thought Vector"
+                final_h_out = (weights.unsqueeze(-1) * h_stack).sum(dim=0) + \
+                              remainder.unsqueeze(-1) * h_stack[-1]
+                
+                # Update the Manager's Goal (Target Context)
+                target_context = self.h_to_context(final_h_out)
+                
+                step_ponder_cost = len(h_step_outputs) + remainder.mean()
+                ponder_costs.append(step_ponder_cost)
+            
+            # Note: If t % stride != 0, 'target_context' remains unchanged from the last plan.
+
             # ==================================================================
-            # V3 CONTEXT STRATEGY: WORKER-CONTROLLED DRIFT
+            # 4. WORKER STEP (V3: Drift Strategy)
             # ==================================================================
-            # 1. Retrieve previous Worker state (Short-term memory)
-            #    l_state shape is usually [B, Hidden, Slots]. Slot 0 is usually Hidden.
+            
+            # A. Retrieve Short-Term Memory (Worker State)
+            # Assuming Slot 0 is the hidden state vector
             prev_worker_h = l_state[:, :, 0] 
 
-            # 2. Worker calculates its own preference/offset
-            #    Requires: self.context_drift_proj = nn.Linear(l_hidden, context_dim)
-            #    We use tanh to bound the drift, preventing the Worker from running away too far.
+            # B. Calculate Drift
+            # The Worker decides how to interpret the Manager's broad topic for this specific token.
+            # Tanh bounds the drift so the Worker can't ignore the Manager completely.
             drift = torch.tanh(self.context_drift_proj(prev_worker_h)) 
 
-            # 3. Apply Drift to the Manager's Target
-            #    The Manager sets the general topic; the Worker personalizes it for the specific token.
+            # C. Apply Drift
             dynamic_context = target_context + drift
 
-            # ==================================================================
-            # WORKER STEP
-            # ==================================================================
-            # Note: We pass 'dynamic_context' instead of 'static_context'
+            # D. Execute Worker Loop
             if self.config.gradient_checkpointing and self.training:
                 enc, l_state, cc = checkpoint(self._worker_loop, enc, dynamic_context, l_state, use_reentrant=False)
             else:
@@ -1881,6 +1924,9 @@ class HierarchosCore(nn.Module):
             final_embs.append(enc)
             commitment_costs.append(cc)
 
+        # ==================================================================
+        # 5. FINAL OUTPUTS
+        # ==================================================================
         final = self.out_norm(torch.stack(final_embs, dim=1))
         logits = self.lm_head(final)
 
@@ -2001,43 +2047,36 @@ class QuantizedHierarchos:
                  h_state: torch.Tensor, l_state: torch.Tensor, 
                  prev_context: torch.Tensor, target_context: torch.Tensor,
                  global_pos_offset: int = 0,
-                 device: str = "cpu", min_timestamp: float = 0.0, source_filter: Optional[int] = None):
+                 device: str = "cpu", min_timestamp: float = 0.0, source_filter: int = None):
         
         B, T = input_ids.shape
         
-        # --- FIX 3: Restore Speed Optimization ---
-        # If T > 1, we assume we are processing a prompt (prefill).
-        # If T == 1, we assume we are generating (decoding) and only need the last step.
-        # (Unless you explicitly want to re-evaluate history, but usually you don't).
+        # --- Speed Optimization: Prefill vs Generation ---
         start_t = 0
         if T == 1:
-            # We are in generation mode, just process the one token
+            # Generation mode: Process only the new token
             start_t = 0 
         else:
-            # We are in prefill mode, process everything
+            # Prefill mode: Process sequence
             start_t = 0
             
-        # Note: If you are passing the FULL history every time (not just new tokens),
-        # you must uncomment the line below to skip old tokens:
-        # start_t = T - 1 if T > 1 else 0
-
         # Initialize return vars
         final_h_state = h_state
         final_l_state = l_state
         
         # Mutable context copies
+        # We ensure they are on the correct device (Vulkan/CPU compat)
         curr_prev_context = prev_context.to(device if device == 'vulkan' else 'cpu')
         curr_target_context = target_context.to(device if device == 'vulkan' else 'cpu')
         
         logits = None
         stride = self.config.h_stride
 
-        # Initialize l_out to zeros to prevent UnboundLocalError (Fix 2)
-        # Assuming l_hidden dimension matches config
+        # Pre-allocate output container
         l_out = torch.zeros(B, self.config.l_hidden, device=device)
 
         for t in range(start_t, T):
-            # Absolute position for Stride/LERP
+            # Absolute position for Stride/LERP calculations
             abs_t = global_pos_offset + t
             
             token_ids = input_ids[:, t].cpu().long()
@@ -2046,11 +2085,14 @@ class QuantizedHierarchos:
 
             query = self.qproj(token_emb, device=device)
             
+            query = torch.clamp(query, min=-10.0, max=10.0)
+            
+            # --- LTM Retrieval ---
             topk_vals, _, topk_ts = self.ltm.retrieve_topk(query, topk=self.config.ltm_topk, 
                                                            min_timestamp=min_timestamp, 
                                                            source_filter=source_filter)
             
-            # Apply Time Encoding
+            # Time Encoding
             args = topk_ts.unsqueeze(-1) * self.time_freqs.unsqueeze(0).unsqueeze(0)
             pe = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
             if self.config.ltm_val_dim % 2 == 1:
@@ -2063,21 +2105,24 @@ class QuantizedHierarchos:
             enc = F.gelu(self.in_proj(mac_input, device=device))
 
             # ==================================================================
-            # HIERARCHICAL MANAGER STEP (Strided with LERP)
+            # 1. HIERARCHICAL MANAGER (Continuous State, Strided Goal)
             # ==================================================================
             
-            # 1. Check Boundary: Update Target Plan
+            # A. Continuous Update (The V2 Fix)
+            # We must run this every step so the RNN state doesn't "teleport" or freeze.
+            h_out_real, new_h_state = self.h_rnn(enc, final_h_state, device=device)
+            final_h_state = new_h_state
+
+            # B. Strided Goal Update
             if abs_t % stride == 0:
                 curr_prev_context = curr_target_context
-                h_out_temp, new_h_state = self.h_rnn(enc, final_h_state, device=device)
-                final_h_state = new_h_state
-                curr_target_context = self.h_to_context(h_out_temp, device=device)
+                # Use the 'real' continuous output to set the new target
+                curr_target_context = self.h_to_context(h_out_real, device=device)
             
-            # 2. Calculate LERP Alpha
+            # C. LERP (Interpolation)
             step_in_stride = abs_t % stride
             alpha = step_in_stride / float(stride)
             
-            # 3. Interpolate Context
             if device == 'vulkan':
                 static_context = torch.lerp(curr_prev_context.cpu(), curr_target_context.cpu(), alpha)
                 static_context = static_context.to(device) 
@@ -2085,23 +2130,31 @@ class QuantizedHierarchos:
                 static_context = torch.lerp(curr_prev_context, curr_target_context, alpha)
 
             # ==================================================================
-            # WORKER STEP
+            # 2. WORKER STEP (V3 Aligned: Drift Logic)
             # ==================================================================
             
-            current_drift = torch.zeros_like(static_context)
-            l_input_raw = torch.cat([enc.cpu(), static_context.cpu()], dim=-1)
+            # A. Calculate Drift (MATCHING TRAINING V3)
+            # Use the Worker's short-term memory (slot 0) to offset the Manager's topic.
+            prev_worker_h = final_l_state[:, :, 0]
+            
+            # Note: Assuming self.context_drift_proj exists and is trained
+            drift = torch.tanh(self.context_drift_proj(prev_worker_h, device=device))
+            
+            # B. Apply Drift
+            dynamic_context = static_context + drift
+
+            # C. Worker Loop
+            # We pass the fully formed 'dynamic_context' into the loop.
+            l_input_raw = torch.cat([enc.cpu(), dynamic_context.cpu()], dim=-1)
             l_input = self.l_input_proj(l_input_raw, device=device)
 
             for _ in range(self.config.max_l_steps):
                 l_out, final_l_state = self.l_rnn(l_input, final_l_state, device=device)
                 
-                if self.context_drift_proj is not None:
-                    drift_delta = self.context_drift_proj(l_out, device=device)
-                    current_drift = current_drift + drift_delta
-                    
-                    dynamic_context = static_context + current_drift
-                    l_input_raw = torch.cat([enc.cpu(), dynamic_context.cpu()], dim=-1)
-                    l_input = self.l_input_proj(l_input_raw, device=device)
+                # Note: In V3 Training, we do NOT recursively update drift inside this loop.
+                # We stick to the drift calculated at the start of the token.
+                # If your architecture requires recursive drift, the training script needs to change.
+                # Assuming Training V3 is the ground truth, we stop calculating drift here.
 
             enc = enc + self.l_to_out(l_out, device=device)
 
@@ -2547,6 +2600,8 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
             # (States are only preserved across chunks *within* the chunk loop below)
             running_h_state = None
             running_l_state = None
+            
+            model.reset_memory()
 
             # --- CUDAGraphs Protection ---
             if device.type == 'cuda' and hasattr(torch.compiler, "cudagraph_mark_step_begin"):

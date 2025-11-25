@@ -1275,22 +1275,16 @@ class RWKVCell(nn.Module):
         super().__init__()
         self.n_embd = n_embd
 
-        # <<< FIX: Define LayerNorms >>>
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
 
-        # --- CRITICAL FIX: Time Decay Initialization ---
         decay_speed = torch.arange(0, n_embd) / n_embd
-        self.time_decay = nn.Parameter(-5 + 4 * decay_speed) # Range: [-5, -1]
-
-        # --- Time First (Bonus) ---
+        self.time_decay = nn.Parameter(-5 + 4 * decay_speed) 
         self.time_first = nn.Parameter(torch.ones(n_embd) * 0.5)
         
-        # --- CRITICAL FIX: Time Mixing Initialization ---
         curve = torch.arange(0, n_embd) / n_embd
-        curve = torch.pow(curve, 0.5) # Simple power curve
+        curve = torch.pow(curve, 0.5) 
 
-        # Init as (1, 1, n_embd) for broadcasting
         self.time_mix_k = nn.Parameter(curve.view(1, 1, n_embd))
         self.time_mix_v = nn.Parameter(curve.view(1, 1, n_embd) + 0.1 * torch.randn(1, 1, n_embd)) 
         self.time_mix_r = nn.Parameter(0.5 * curve.view(1, 1, n_embd)) 
@@ -1300,7 +1294,6 @@ class RWKVCell(nn.Module):
         self.receptance = nn.Linear(n_embd, n_embd, bias=False)
         self.output = nn.Linear(n_embd, n_embd, bias=False)
 
-        # --- Channel Mixing ---
         self.time_mix_k_cm = nn.Parameter(torch.ones(1, 1, n_embd) * 0.05)
         self.time_mix_r_cm = nn.Parameter(torch.ones(1, 1, n_embd) * 0.05)
 
@@ -1309,46 +1302,46 @@ class RWKVCell(nn.Module):
         self.value_cm = nn.Linear(n_embd * 4, n_embd, bias=False)
 
     def forward(self, x, state):
-        # --- FIX: Handle torch.compile artifacts (fake extra batch dim) ---
-        if x.dim() == 3 and x.shape[0] == 1:
-            x = x.squeeze(0)
-        if state.dim() == 4 and state.shape[0] == 1:
-            state = state.squeeze(0)
-        # ------------------------------------------------------------------
+        # Handle torch.compile artifacts
+        if x.dim() == 3 and x.shape[0] == 1: x = x.squeeze(0)
+        if state.dim() == 4 and state.shape[0] == 1: state = state.squeeze(0)
 
-        # Capture input for next Time Mixing shift
-        x_in = x
+        # --- FIX: Explicit Residual Structure x = x + Block(LN(x)) ---
+        # We save the incoming 'x' (residual) and use normalized 'x_norm' for mixing
+        x_resid_tm = x 
+        x_norm = self.ln1(x)
 
-        # Flatten mixing parameters
+        # Capture input for state update (Token Shift uses the normalized input in std RWKV)
+        # Note: Some variants use raw x, standard uses x_norm. Keeping consistent with v4/5/6 logic.
+        x_in = x_norm 
+
         tm_k = self.time_mix_k.view(-1)
         tm_v = self.time_mix_v.view(-1)
         tm_r = self.time_mix_r.view(-1)
         tm_k_cm = self.time_mix_k_cm.view(-1)
         tm_r_cm = self.time_mix_r_cm.view(-1)
 
+        # Unbind state. 
+        # Slot 0 (sx) is the previous timestep's input
         sx, aa, bb, pp, sx_cm = state.unbind(dim=-1)
 
         # --- Time mixing ---
-        x_norm = self.ln1(x)
-
         xk = x_norm * tm_k + sx * (1 - tm_k)
         xv = x_norm * tm_v + sx * (1 - tm_v)
         xr = x_norm * tm_r + sx * (1 - tm_r)
 
         r = torch.sigmoid(self.receptance(xr))
         k = self.key(xk)
-        k = torch.clamp(k, max=60)
+        
+        # --- FIX APPLIED HERE ---
+        # Reduced clamp max from 60 to 30 to prevent activation explosion (NaNs)
+        k = torch.clamp(k, max=30) 
+        
         v = self.value(xv)
 
-        # --- CRITICAL STABILITY FIX: Perform WKV in float32 ---
-        # Even if using AMP, we cast to float32 for the exponentials to prevent
-        # underflow/overflow that leads to NaNs.
+        # WKV Calculation (Float32 Stability)
         with torch.amp.autocast(device_type=x.device.type, enabled=False):
-            k_f = k.float()
-            v_f = v.float()
-            pp_f = pp.float()
-            aa_f = aa.float()
-            bb_f = bb.float()
+            k_f, v_f, pp_f, aa_f, bb_f = k.float(), v.float(), pp.float(), aa.float(), bb.float()
             time_first_f = self.time_first.float()
             time_decay_f = self.time_decay.float()
 
@@ -1357,11 +1350,10 @@ class RWKVCell(nn.Module):
             e1 = torch.exp(pp_f - p)
             e2 = torch.exp(ww - p)
             
-            # wkv calculation in full precision
             wkv = (e1 * aa_f + e2 * v_f) / (e1 * bb_f + e2 + 1e-8)
-            wkv = wkv.to(dtype=x.dtype) # Cast back to original dtype
+            wkv = wkv.to(dtype=x.dtype)
 
-            # Update State (in float32 then cast back)
+            # Update State
             ww = pp_f + time_decay_f
             p = torch.maximum(ww, k_f)
             e1 = torch.exp(ww - p)
@@ -1370,24 +1362,26 @@ class RWKVCell(nn.Module):
             bb = (e1 * bb_f + e2).to(dtype=x.dtype)
             pp = p.to(dtype=x.dtype)
 
-        # Time Mixing Output / Channel Mixing Input
-        x = x + self.output(r * wkv)
+        # Residual Connection 1 (Time Mixing)
+        x = x_resid_tm + self.output(r * wkv)
         
-        # Capture input for next Channel Mixing shift
-        x_tm = x
-
         # --- Channel mixing ---
-        x_norm2 = self.ln2(x)
+        x_resid_cm = x
+        x_norm2 = self.ln2(x) # Pre-LN for channel mix
 
+        # Use previous x_norm2 (stored in state slot 4) for mixing
+        # Slot 4 is sx_cm
         xk = x_norm2 * tm_k_cm + sx_cm * (1 - tm_k_cm)
         xr = x_norm2 * tm_r_cm + sx_cm * (1 - tm_r_cm)
         
         r = torch.sigmoid(self.receptance_cm(xr))
         k = torch.square(torch.relu(self.key_cm(xk)))
-        x = x + r * self.value_cm(k)
+        
+        # Residual Connection 2 (Channel Mixing)
+        x = x_resid_cm + r * self.value_cm(k)
 
-        # NEW STATE: Save x_in (Slot 0) and x_tm (Slot 4)
-        new_state = torch.stack([x_in, aa, bb, pp, x_tm], dim=-1)
+        # Save x_norm (Slot 0) and x_norm2 (Slot 4) for next step
+        new_state = torch.stack([x_in, aa, bb, pp, x_norm2], dim=-1)
 
         return x, new_state
 class LTMModule(nn.Module):
@@ -1443,7 +1437,6 @@ class LTMModule(nn.Module):
         """Returns the combined memory (Slow + Fast)."""
         return self.vals + self.fast_vals
 
-    # ... [retrieve_topk method remains unchanged] ...
     def retrieve_topk(self, queries: torch.Tensor, topk: int = 4, min_timestamp: float = 0.0, source_filter: Optional[int] = None) -> Tuple[torch.Tensor, torch.LongTensor, torch.Tensor]:
         scale_factor = self.keys.shape[1] ** -0.5
         sim = (queries @ self.keys.t()) * scale_factor
@@ -1536,6 +1529,7 @@ class LTMModule(nn.Module):
             if not valid_mask.any(): return 
 
             idx_flat = topk_idx[valid_mask].view(-1)
+            # This safety check was removed in V2, restored here:
             if grads_tensor.shape[:-1] != topk_idx.shape: 
                 print(f"Warning: grads_tensor shape {grads_tensor.shape[:-1]} mismatch with topk_idx shape {topk_idx.shape}. Skipping LTM update.")
                 return
@@ -1586,20 +1580,35 @@ class LTMModule(nn.Module):
             
             self.fast_vals.data.add_(final_update)
 
+            # --- FIX: Clamp fast_vals to prevent accumulation explosion ---
+            # Added from V2 but applied to V1 logic
+            self.fast_vals.data.clamp_(min=-20.0, max=20.0)
+
             # --- UPDATE METADATA ---
             current_time = time.time()
             self.timestamps.data[nonzero_mask] = current_time
             self.sources.data[nonzero_mask] = source
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+from torch.utils.checkpoint import checkpoint
+
+# Assuming AttrDict and LTMModule are imported or defined elsewhere
+# from your_utils import AttrDict, LTMModule
 
 class HierarchosCore(nn.Module):
     """
-    FINAL FIXED VERSION (V3.1):
+    FINAL MERGED VERSION (V3):
     - Base: V1 Architecture (Keeps LERP to fix Jitter).
     - Fix: V2 Hinge Loss (Fixes Posterior Collapse/Laziness).
     - Fix: V2 Smart Indices (RWKV Stability).
     - Fix: V1 Shadow State (Prevents memory corruption during pondering).
     - Fix: V3.1 Symmetric LERP (Matches Training to Inference Context Dynamics).
+    - Fix: AMP Stability (Force float32 loss)
+    - Fix: Restored prepare_inputs_for_generation & QuantizedHierarchos
+    - Fix: Encoder Clamping (Prevent Gelu spikes)
     """
     def reset_memory(self):
         """
@@ -1655,6 +1664,11 @@ class HierarchosCore(nn.Module):
         self.qproj = nn.Linear(self.config.context_dim, self.config.ltm_key_dim, bias=False)
         in_dim = self.config.context_dim + self.config.persistent_dim + (self.config.ltm_val_dim * self.config.ltm_topk)
         self.in_proj = nn.Linear(in_dim, self.config.context_dim)
+        
+        # Project the Worker's state (hidden) back to the Manager's dimensionality
+        self.l_feedback_proj = nn.Linear(self.config.l_hidden, self.config.h_hidden, bias=False)
+        # Initialize with small weights to introduce feedback gradually
+        nn.init.normal_(self.l_feedback_proj.weight, mean=0.0, std=0.01)
 
         # RWKV cells
         self.h_rnn = RWKVCell(self.config.h_hidden)
@@ -1690,7 +1704,6 @@ class HierarchosCore(nn.Module):
             print("INFO: torch.compile is DISABLED (Eager Mode).")
 
     def _worker_loop(self, enc, static_context, l_state):
-        # ... (Same as before) ...
         if enc.dim() == 3 and enc.shape[0] == 1: enc = enc.squeeze(0)
         if static_context.dim() == 3 and static_context.shape[0] == 1: static_context = static_context.squeeze(0)
         if l_state.dim() == 4 and l_state.shape[0] == 1: l_state = l_state.squeeze(0)
@@ -1716,6 +1729,8 @@ class HierarchosCore(nn.Module):
                 dynamic_context = static_context + current_drift
                 l_input_vec = torch.cat([current_enc, dynamic_context], dim=-1)
                 l_input = self.l_input_proj(l_input_vec)
+                
+                # RESTORED LOGIC: V2 removed 'state_converged'. We keep it.
                 drift_converged = torch.mean(torch.abs(drift_delta)) < self.config.l_conv_atol
                 state_converged = torch.allclose(shadow_l_state[..., check_idx], prev_shadow[..., check_idx], atol=self.config.l_conv_atol)
                 if drift_converged or state_converged: break
@@ -1742,7 +1757,7 @@ class HierarchosCore(nn.Module):
 
     def forward(self, input_ids, attention_mask=None, labels=None, 
                 h_state=None, l_state=None, 
-                prev_context=None, target_context=None, # <<< NEW ARGS for State Persistence
+                prev_context=None, target_context=None, # State Persistence
                 min_timestamp=0.0, source_filter=None, **kwargs):
         B, T = input_ids.shape
         device = input_ids.device
@@ -1797,7 +1812,12 @@ class HierarchosCore(nn.Module):
             gate = torch.sigmoid(self.ltm_gate_logit)
             gated_vals = topk_vals * gate
             mac_in = torch.cat([token_x, p, gated_vals.view(B, -1)], dim=-1)
+            
             enc = F.gelu(self.in_proj(mac_in))
+            
+            # <<< STABILITY FIX from V2: Clamp encoder input >>>
+            # This prevents spikes in embeddings from destabilizing the RWKV cells
+            enc = torch.clamp(enc, min=-30.0, max=30.0)
 
             # ==================================================================
             # 3. HIERARCHICAL MANAGER (Continuous Watch, Strided Plan)
@@ -1810,7 +1830,6 @@ class HierarchosCore(nn.Module):
             
             # B. PLANNING STEP (Strided)
             if t % stride == 0:
-                # <<< KEY CHANGE: Shift contexts >>>
                 # The old target becomes the new starting point for interpolation
                 prev_context = target_context
 
@@ -1841,7 +1860,7 @@ class HierarchosCore(nn.Module):
                 remainder = remainder / total
                 final_h_out = (weights.unsqueeze(-1) * h_stack).sum(dim=0) + remainder.unsqueeze(-1) * h_stack[-1]
                 
-                # <<< KEY CHANGE: Update Target Context >>>
+                # Update Target Context
                 target_context = self.h_to_context(final_h_out)
                 
                 step_ponder_cost = len(h_step_outputs) + remainder.mean()
@@ -1884,7 +1903,14 @@ class HierarchosCore(nn.Module):
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            loss = F.cross_entropy(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
+            
+            # ==============================================================
+            # AMP STABILITY FIX: Force Float32 for Loss Calculation
+            # ==============================================================
+            loss = F.cross_entropy(
+                shift_logits.view(-1, self.config.vocab_size).float(), 
+                shift_labels.view(-1)
+            )
             
             if ponder_costs: ponder_cost_out = torch.stack(ponder_costs).mean()
             if commitment_costs: commitment_cost_out = torch.stack(commitment_costs).mean()
@@ -1898,17 +1924,23 @@ class HierarchosCore(nn.Module):
             "topk_idx": topk_idx,
             "h_state": h_state,
             "l_state": l_state,
-            # <<< RETURN CONTEXT STATES FOR TBPTT >>>
+            # RETURN CONTEXT STATES FOR TBPTT
             "prev_context": prev_context,
             "target_context": target_context
         }
 
+    # ==================================================================
+    # RESTORED METHOD: Needed for Hugging Face Generate
+    # ==================================================================
     def prepare_inputs_for_generation(self, input_ids, **kwargs):
         model_inputs = {"input_ids": input_ids}
         if "attention_mask" in kwargs:
             model_inputs["attention_mask"] = kwargs["attention_mask"]
         return model_inputs
 
+# ==================================================================
+# <<< RESTORED CLASS: QuantizedHierarchos for Inference >>>
+# ==================================================================
 class QuantizedHierarchos:
     """The quantized hierarchos model for CPU/Vulkan inference (now using RWKV cells)."""
     def __init__(self, config: dict, q_data: dict):
@@ -2239,9 +2271,6 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     # --- Determine vocab_size (already handled during tokenizer load) ---
     current_vocab_size = len(tokenizer) if tokenizer else None
 
-    # <<< MERGED: Set Chunk Size for Titans Training >>>
-    
-
     model = None 
     optimizer = None 
     start_epoch = 0
@@ -2560,8 +2589,6 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         for i, batch in enumerate(pbar):
 
             # --- CRITICAL FIX: STATE RESET PER BATCH ---
-            # We explicitly reset states to None every single batch because they are independent.
-            # (States are only preserved across chunks *within* the chunk loop below)
             running_h_state = None
             running_l_state = None
             running_prev_context = None
@@ -2585,14 +2612,22 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
             B, T = full_input_ids.shape
 
            # ==========================================================
-            # --- 4. TITANS CHUNKING LOOP (CORRECTED) ---
+            # --- 4. TITANS CHUNKING LOOP ---
             # ==========================================================
             chunk_size = training_chunk_size
             if chunk_size <= 0 or chunk_size > T: chunk_size = T
             
             num_chunks = math.ceil(T / chunk_size)
             
+            # --- FIX (From V2): Track Sequence Poisoning ---
+            sequence_valid = True 
+
             for chunk_idx in range(num_chunks):
+                
+                # --- FIX (From V2): Stop processing if previous chunk was NaN ---
+                if not sequence_valid: 
+                    break 
+
                 start_t = chunk_idx * chunk_size
                 end_t = min((chunk_idx + 1) * chunk_size, T)
                 
@@ -2614,8 +2649,6 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                         target_context=running_target_context
                     )
 
-                    # <<< CRITICAL FIX: RETAIN GRAD >>> 
-                    # We MUST call this immediately after forward pass, BEFORE backward()
                     if outputs.get("topk_vals") is not None and outputs["topk_vals"].requires_grad:
                         outputs["topk_vals"].retain_grad()
                     
@@ -2624,6 +2657,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                     commitment_cost = outputs["commitment_cost"]
 
                     # --- Extract States & DETACH (TBPTT) ---
+                    # Added clamping from V1/V2 for stability
                     if outputs.get("h_state") is not None:
                         running_h_state = outputs["h_state"].detach()
                         running_h_state = torch.clamp(running_h_state, min=-50.0, max=50.0)
@@ -2634,7 +2668,6 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                         running_l_state = torch.clamp(running_l_state, min=-50.0, max=50.0)
                     else: running_l_state = None
 
-                    # <<< SAVE AND DETACH CONTEXTS FOR NEXT CHUNK >>>
                     if outputs.get("prev_context") is not None:
                         running_prev_context = outputs["prev_context"].detach()
                         running_prev_context = torch.clamp(running_prev_context, min=-50.0, max=50.0)
@@ -2651,21 +2684,23 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                     pc_valid = ponder_cost is not None and not torch.isnan(ponder_cost) and not torch.isinf(ponder_cost)
                     cc_valid = commitment_cost is not None and not torch.isnan(commitment_cost) and not torch.isinf(commitment_cost)
 
-                    loss_accum = 0.0
-                    
-                    if ce_valid:
-                        loss_accum = loss_accum + cross_entropy_loss
-                    elif i % args.accumulation_steps == 0:
-                        print(f"\nWarning: CrossEntropy loss is NaN/Inf at step {i+1} chunk {chunk_idx}. Skipping backward.")
+                    # --- FIX (From V2): Aggressive NaN Handling ---
+                    if not ce_valid:
+                        print(f"\nWarning: CrossEntropy loss is NaN/Inf at step {i+1} chunk {chunk_idx}. Marking sequence as poisoned.")
+                        sequence_valid = False
+                        # Reset states so we don't accidentally carry garbage if we were to continue (though we break)
+                        running_h_state = None
+                        running_l_state = None
+                        continue 
 
+                    loss_accum = 0.0
+                    loss_accum = loss_accum + cross_entropy_loss
                     if pc_valid:
                         loss_accum = loss_accum + (args.ponder_loss_weight * ponder_cost)
-                    
                     if cc_valid:
                         loss_accum = loss_accum + (args.commitment_loss_weight * commitment_cost)
 
-                    if ce_valid:
-                        combined_loss = loss_accum
+                    combined_loss = loss_accum
 
                 # --- Backward Pass (Per Chunk) ---
                 if combined_loss is not None:
@@ -2683,35 +2718,26 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                     # ==========================================================
                     ltm_grads = None
                     
-                    # Now we can safely access .grad because we called retain_grad() earlier
                     if outputs.get("topk_vals") is not None and outputs["topk_vals"].grad is not None:
                         ltm_grads = outputs["topk_vals"].grad
 
                     if ltm_grads is not None:
                         ltm_grads_copy = ltm_grads.detach().clone()
                         
-                        # --- CRITICAL FIX: ROBUST AMP UNSCALING AND NAN CHECK ---
                         valid_update = True
 
-                        # 1. AMP Unscale
                         if use_amp:
                             current_scale = scaler.get_scale()
-                            # Protect against division by zero or extremely small scales
                             if current_scale > 1e-6:
                                 ltm_grads_copy = ltm_grads_copy / current_scale
                             else:
-                                # Scale is too small/invalid; skip update to prevent explosion
                                 valid_update = False 
 
-                        # 2. Finiteness Check (The "Lobotomy" Prevention)
-                        # If the gradient contains NaNs or Infs, we MUST NOT update the memory.
                         if valid_update and torch.isfinite(ltm_grads_copy).all():
-                            # 3. Manual Gradient Clipping for LTM
                             if args.grad_clip > 0:
                                 torch.nn.utils.clip_grad_norm_([ltm_grads_copy], args.grad_clip)
                                 current_chunk_len = end_t - start_t
 
-                            # 4. Perform Update
                             model.ltm.inner_update(
                                 outputs["topk_idx"], 
                                 ltm_grads_copy, 
@@ -2719,8 +2745,6 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                                 source=LTMModule.SRC_TRAINING_DATA
                             )
                         else:
-                            # Silent skip or verbose warning (comment out print for speed)
-                            # print(f"\nWarning: Skipped LTM update at step {global_step} chunk {chunk_idx} due to NaN/Inf gradients.")
                             pass
 
                     # --- Accumulate Stats ---
@@ -2737,41 +2761,29 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
 
             # --- Optimizer Step (End of Accumulation Cycle) ---
             if (i + 1) % args.accumulation_steps == 0:
-                # Only proceed if backward was called at least once in this cycle
                 if backward_called_in_cycle:
                     if use_amp:
-                        # Unscale gradients - performs inf/NaN checks
                         scaler.unscale_(optimizer)
-
                         if args.grad_clip > 0:
-                            # Clip gradients *after* unscaling
                             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-
-                        # Step the optimizer
                         scaler.step(optimizer)
-
-                        # Update the scale factor for the next iteration
                         scaler.update()
-                    else: # Not using AMP
+                    else:
                         if args.grad_clip > 0:
                             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                         optimizer.step()
 
-                    # Step the learning rate scheduler *after* the optimizer step
                     if scheduler:
                         scheduler.step()
 
-                    # Zero gradients for the next accumulation cycle
                     optimizer.zero_grad(set_to_none=True)
-
-                    # Reset flag for the next cycle
                     backward_called_in_cycle = False
-                    global_step += 1 # Increment global step after optimizer step
+                    global_step += 1 
 
-                else: # Backward was not called in this cycle (all losses were NaN/Inf)
+                else:
                     print(f"\nWarning: Skipping optimizer step at batch {i+1} due to invalid loss(es) in accumulation cycle.")
                     optimizer.zero_grad(set_to_none=True)
-                    backward_called_in_cycle = False # Reset flag
+                    backward_called_in_cycle = False 
 
             # --- Update Progress Bar ---
             avg_loss = total_loss / steps_in_epoch if steps_in_epoch > 0 else 0.0
@@ -2870,7 +2882,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     except Exception as e:
         print(f"Warning: Failed to save tokenizer files on completion. Error: {e}")
 
-
+    # <<< THIS WAS RESTORED >>>
     if args.quantize_on_complete:
         print("\n--- Training Complete: Starting On-the-Fly Quantization ---")
         # Quantize to a new directory for clarity, e.g., './my_model-INT4'
@@ -3656,12 +3668,26 @@ def chat(args, device, tokenizer):
                             LTMModule.SRC_USER_INTERACTION,
                             penalty=True  # <--- Triggers Unlikelihood Loss
                         )
-                        pending_training_data = None
-                        continue # Skip generation
-                    else:
-                        print("[No previous interaction to penalize.]")
-                        continue
 
+                # 3. Passive Update on CURRENT Input (The "Titans" Memory Logic)
+                # Using 'elif' ensures we don't passively memorize the prompt if it was a feedback trigger above.
+                elif not is_correction_or_instruction(prompt) and not prompt.startswith("/"):
+                    # Encode just the user prompt
+                    curr_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)[0]
+                    
+                    # We perform a "light" update. 
+                    # Concept: Predict the user prompt (auto-encoding/next-token prediction on input).
+                    print("[Passive memory update...]", end="", flush=True)
+                    perform_ltm_update(
+                        curr_ids, 
+                        curr_ids, # Self-target
+                        LTMModule.SRC_USER_INTERACTION,
+                        penalty=False
+                    )
+                    print("\r", end="")
+                    pending_training_data = None
+                    continue # Skip generation
+                
                 # 3. Correction/Instruction: Learn from the CURRENT prompt immediately
                 elif is_correction_or_instruction(prompt):
                     print("[Correction/Instruction detected. Memorizing inputs...]", end="", flush=True)

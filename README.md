@@ -56,6 +56,7 @@ A powerful, data-efficient, and deep reasoning engine. Its dual-module design (a
   * 🤔 **Adaptive "Ponder" Time**: Dynamically adjusts its reasoning depth, "thinking" longer for complex problems and saving computation on simpler ones.
   * 🕰️ **Structured & Queryable Memory**: LTM slots are augmented with timestamps and source data, enabling powerful temporal and contextual queries during chat.
   * 🧠 **Dynamic "Online" Learning**: Learns from experience during chat with a Cosine Annealing LR schedule by default for more stable knowledge consolidation.
+  * 🚀 **PyTorch 2.0+ torch.compile Support**: Optional compilation of the Worker loop with `--compile` for potential training speedups on NVIDIA GPUs (experimental, not recommended for Windows CPU).
   * ⚡ **Accelerated Training with AMP**: Supports Automatic Mixed Precision (`--amp`) for faster training and reduced memory usage on compatible NVIDIA GPUs.
   * 🛡️ **Stable Training**: Built-in gradient clipping (`--grad-clip`) to prevent model instability and ensure smoother convergence.
   * 📦 **Self-Contained & Portable Models**: Models are saved as directories containing weights, tokenizer, and architecture config for easy sharing and use.
@@ -384,11 +385,12 @@ python hierarchos.py train \
 | `--min-lr`                     | `train`, `finetune`                 | Minimum Learning Rate for cosine annealing schedule.                                                                                     | `1e-6`                  |
 | `--disable-lr-schedule`        | `train`, `finetune`                 | Use a fixed Learning Rate (`--starting-lr`) instead of cosine annealing.                                                                 | `False`                 |
 | `--ltm_lr`                     | `train`, `finetune`, `chat`         | Learning Rate for LTM "surprise" updates (or max LR for LTM schedule in chat).                                                         | `0.01`                  |
+| `--compile`                    | `train`, `finetune`                 | **Enable torch.compile for faster training (experimental).** Compiles the Worker (L-RNN) loop for potential speedups on NVIDIA GPUs. **WARNING:** Known to hang on Windows CPU. | `False`                 |
+| `--force-compile`              | `train`, `finetune`                 | Force torch.compile even on Windows CPU (overrides safety check). **Use with caution - may cause system hangs.** Requires `--compile`. | `False`                 |
 | `--amp`                        | `train`, `finetune`, `chat`         | **Enable Automatic Mixed Precision (requires CUDA).** | `False`                 |
 | `--num_workers`                | `train`, `finetune`                 | Number of CPU workers for data loading (and HF dataset mapping if applicable).                                                         | `0`                     |
 | `--lora_r`                     | `finetune`                          | LoRA rank 'r'.                                                                                                                           | `8`                     |
-| `--lora_alpha`                 | `finetune`                          | LoRA alpha scaling factor.                                                                                                               | `16`                    |
-| `--finetune-unlock-percent`    | `finetune`                          | Target % of params to train (approx.). Overrides `--lora_r` if set.                                                                     | `None`                  |
+| `--lora_alpha`                 | `finetune`                          | LoRA alpha scaling factor.                                                                                                               | `16`                    |\n| `--finetune-unlock-percent`    | `finetune`                          | Target % of params to train (approx.). Overrides `--lora_r` if set.                                                                     | `None`                  |
 | `--kayla`                      | `train`, `finetune`                 | Enable Kayla-style instruction tuning format (with thought-process). **Ignored if using pre-chunked formats or --text\_column.** | `False`                 |
 | **Quantization/Inference** |                                     |                                                                                                                                          |                         |
 | `--qtype`                      | `quantize`, `train`                 | Quantization format (`INT4`, `Q4_0`, `Q8_0`, `Q2_K`). Used by `quantize` or `--quantize-on-complete`. **Requires compiled kernel.** | `INT4`                  |
@@ -486,7 +488,8 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
       * RWKV cells now accept `timestep` parameter for proper BPTT control.
       * Negative timesteps used for pondering loops to prevent detachment during exploration.
       * Removed redundant state clamping operations in Manager flow.
-  * **Updated Documentation**: Added comprehensive walkthrough of fixes, added new features to README, updated command-line reference with `--detach-every-n-steps`.
+      * Improved torch.compile compatibility with better handling of dynamic control flow.
+  * **Updated Documentation**: Added comprehensive walkthrough of fixes, added new features to README, updated command-line reference with `--detach-every-n-steps`, `--compile`, and `--force-compile` flags.
 
 ### v0.10.0 (alpha)
 

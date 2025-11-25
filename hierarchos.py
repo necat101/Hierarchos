@@ -209,9 +209,9 @@ if os.name == 'nt':
                         # --- ❗️❗️❗️ END KEY FIX ❗️❗️❗️ ---
                         # ==========================================================
 
-                        print("✅ INFO: 64-bit MSVC environment loaded successfully.")
+                        print("INFO: 64-bit MSVC environment loaded successfully.")
                     except json.JSONDecodeError as json_e:
-                        print(f"❌ ERROR: Failed to parse the environment JSON. {json_e}")
+                        print(f"ERROR: Failed to parse the environment JSON. {json_e}")
                         print("     --- Raw JSON String (cleaned) ---")
                         print(json_str[:500] + "...") # Print start of what was parsed
                         print("     --- Full stdout after marker ---")
@@ -225,7 +225,7 @@ if os.name == 'nt':
                 print("STDERR:", result.stderr)
 
         except subprocess.CalledProcessError as e:
-            print(f"❌ ERROR: Failed to run vcvarsall.bat. torch.compile may fail.")
+            print(f"ERROR: Failed to run vcvarsall.bat. torch.compile may fail.")
             print(f"   Return Code: {e.returncode}")
             print("   --- STDOUT ---")
             print(e.stdout if e.stdout else "<No stdout>")
@@ -243,7 +243,7 @@ if os.name == 'nt':
                     
         except Exception as e:
             # Catch other errors like file-not-found for subprocess itself or JSONDecodeError
-            print(f"❌ ERROR: An unexpected error occurred while trying to run vcvarsall.bat.")
+            print(f"ERROR: An unexpected error occurred while trying to run vcvarsall.bat.")
             print(f"   Error: {e}")
             print(f"   Error Type: {type(e)}") # Added type for debugging
             traceback.print_exc(limit=2) # Print traceback for this
@@ -1301,10 +1301,19 @@ class RWKVCell(nn.Module):
         self.receptance_cm = nn.Linear(n_embd, n_embd, bias=False)
         self.value_cm = nn.Linear(n_embd * 4, n_embd, bias=False)
 
-    def forward(self, x, state):
+    def forward(self, x, state, timestep=None):
         # Handle torch.compile artifacts
         if x.dim() == 3 and x.shape[0] == 1: x = x.squeeze(0)
         if state.dim() == 4 and state.shape[0] == 1: state = state.squeeze(0)
+
+        # <<< FIX: Conditional truncated BPTT instead of unconditional detachment >>>
+        # Only detach at designated truncation boundaries to enable proper temporal learning
+        # Detachment frequency is controlled by detach_every_n_steps (default: None means no detachment)
+        # This allows gradients to flow through multiple timesteps while preventing infinite accumulation
+        detach_every_n_steps = getattr(self, 'detach_every_n_steps', None)
+        if self.training and detach_every_n_steps is not None and timestep is not None:
+            if timestep % detach_every_n_steps == 0:
+                state = state.detach()
 
         # --- FIX: Explicit Residual Structure x = x + Block(LN(x)) ---
         # We save the incoming 'x' (residual) and use normalized 'x_norm' for mixing
@@ -1334,8 +1343,8 @@ class RWKVCell(nn.Module):
         k = self.key(xk)
         
         # --- FIX APPLIED HERE ---
-        # Reduced clamp max from 60 to 30 to prevent activation explosion (NaNs)
-        k = torch.clamp(k, max=30) 
+        # Increased clamp max from 30 to 60 (Standard RWKV) to improve dynamic range
+        k = torch.clamp(k, max=60) 
         
         v = self.value(xv)
 
@@ -1346,6 +1355,10 @@ class RWKVCell(nn.Module):
             time_decay_f = self.time_decay.float()
 
             ww = time_first_f + k_f
+            # Clamp ww and pp_f to prevent exp overflow/underflow issues
+            ww = torch.clamp(ww, max=30.0)
+            pp_f = torch.clamp(pp_f, max=30.0)
+            
             p = torch.maximum(pp_f, ww)
             e1 = torch.exp(pp_f - p)
             e2 = torch.exp(ww - p)
@@ -1355,6 +1368,9 @@ class RWKVCell(nn.Module):
 
             # Update State
             ww = pp_f + time_decay_f
+            # Clamp ww again
+            ww = torch.clamp(ww, max=30.0)
+            
             p = torch.maximum(ww, k_f)
             e1 = torch.exp(ww - p)
             e2 = torch.exp(k_f - p)
@@ -1382,6 +1398,9 @@ class RWKVCell(nn.Module):
 
         # Save x_norm (Slot 0) and x_norm2 (Slot 4) for next step
         new_state = torch.stack([x_in, aa, bb, pp, x_norm2], dim=-1)
+        
+        # <<< FIX: Clamp state values to ensure numerical stability >>>
+        new_state = torch.clamp(new_state, min=-50.0, max=50.0)
 
         return x, new_state
 class LTMModule(nn.Module):
@@ -1465,47 +1484,56 @@ class LTMModule(nn.Module):
                     torch.full(idx_shape, -1, device=queries.device, dtype=torch.long), 
                     torch.zeros(idx_shape, device=queries.device, dtype=torch.float32))
 
-        _, idx = torch.topk(sim, k=effective_topk, dim=-1)
+        # Get top-k indices and values (sim scores)
+        sim_topk, idx = torch.topk(sim, k=effective_topk, dim=-1)
 
+        # <<< FIX: Proper Gradient Flow through Attention-Weighted Retrieval >>>
+        # Old implementation multiplied weights AFTER indexing, breaking gradient flow.
+        # New implementation uses differentiable gather + weighted aggregation.
+        
+        effective_memory = self.get_effective_memory()  # [n_slots, val_dim]
+        
+        # Gather values using indices: [..., effective_topk, val_dim]
+        # Use advanced indexing which maintains gradients
+        batch_shape = list(idx.shape[:-1])
+        idx_clamped = idx.clamp(min=0, max=effective_memory.shape[0]-1)
+        gathered_vals = effective_memory[idx_clamped]  # This creates a differentiable path
+        
+        # Compute attention weights from similarity scores
+        attn_weights = F.softmax(sim_topk, dim=-1)  # [..., effective_topk]
+        
+        if torch.isnan(attn_weights).any():
+            print("WARNING: NaN detected in LTM attention weights!")
+            attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
+        
+        # Weighted values: [..., effective_topk, val_dim]
+        # Gradients flow through BOTH gathered_vals (to memory) AND attn_weights (to keys/queries)
+        weighted_vals = gathered_vals * attn_weights.unsqueeze(-1)
+        
+        # Gather timestamps
+        ts_retrieved = self.timestamps[idx_clamped]
+
+        # Handle padding if needed
         if effective_topk < topk:
             pad_size = topk - effective_topk
-            idx_pad_shape = list(idx.shape[:-1]) + [pad_size]
-            idx_pad = torch.full(idx_pad_shape, -1, device=idx.device, dtype=idx.dtype)
-            idx = torch.cat([idx, idx_pad], dim=-1)
-
-            effective_memory = self.get_effective_memory()
-            valid_idx_mask = idx[..., :effective_topk] >= 0
             
-            vals_retrieved = torch.zeros(list(idx.shape[:-1]) + [effective_topk, self.vals.shape[-1]], device=self.vals.device, dtype=self.vals.dtype)
-            ts_retrieved = torch.zeros(list(idx.shape[:-1]) + [effective_topk], device=self.timestamps.device, dtype=self.timestamps.dtype)
-
-            if valid_idx_mask.any():
-                actual_indices = idx[..., :effective_topk][valid_idx_mask]
-                vals_retrieved[valid_idx_mask] = effective_memory[actual_indices]
-                ts_retrieved[valid_idx_mask] = self.timestamps[actual_indices]
-
-            vals_pad_shape = list(vals_retrieved.shape[:-2]) + [pad_size, vals_retrieved.shape[-1]]
-            vals_pad = torch.zeros(vals_pad_shape, device=vals_retrieved.device, dtype=vals_retrieved.dtype)
-            vals_ret = torch.cat([vals_retrieved, vals_pad], dim=-2)
+            # Pad indices
+            idx_pad = torch.full(batch_shape + [pad_size], -1, device=idx.device, dtype=idx.dtype)
+            idx_ret = torch.cat([idx, idx_pad], dim=-1)
             
-            ts_pad_shape = list(ts_retrieved.shape[:-1]) + [pad_size]
-            ts_pad = torch.zeros(ts_pad_shape, device=ts_retrieved.device, dtype=ts_retrieved.dtype)
+            # Pad weighted values
+            vals_pad = torch.zeros(batch_shape + [pad_size, weighted_vals.shape[-1]], 
+                                  device=weighted_vals.device, dtype=weighted_vals.dtype)
+            vals_ret = torch.cat([weighted_vals, vals_pad], dim=-2)
+            
+            # Pad timestamps
+            ts_pad = torch.zeros(batch_shape + [pad_size], 
+                               device=ts_retrieved.device, dtype=ts_retrieved.dtype)
             ts_ret = torch.cat([ts_retrieved, ts_pad], dim=-1)
-
-            return vals_ret, idx, ts_ret
+            
+            return vals_ret, idx_ret, ts_ret
         else:
-            valid_idx_mask = idx >= 0
-            effective_memory = self.get_effective_memory()
-            
-            ret_vals = torch.zeros(list(idx.shape) + [self.vals.shape[-1]], device=self.vals.device, dtype=self.vals.dtype)
-            ret_ts = torch.zeros(list(idx.shape), device=self.timestamps.device, dtype=self.timestamps.dtype)
-            
-            if valid_idx_mask.any():
-                actual_indices = idx[valid_idx_mask].clamp(min=0, max=self.vals.shape[0]-1)
-                ret_vals[valid_idx_mask] = effective_memory[actual_indices]
-                ret_ts[valid_idx_mask] = self.timestamps[actual_indices]
-                
-            return ret_vals, idx, ret_ts
+            return weighted_vals, idx, ts_retrieved
 
     def inner_update(self, topk_idx: torch.LongTensor, grads_tensor: torch.Tensor, current_lr: float, source: int = SRC_USER_INTERACTION, tokens_covered: int = None):
         """
@@ -1550,6 +1578,8 @@ class LTMModule(nn.Module):
             # --- TITANS UPDATE LOGIC ---
             # 1. Momentum
             self._mom_vals.data.mul_(self.momentum).add_(slot_grads)
+            # --- FIX: Clamp Momentum to prevent explosion ---
+            self._mom_vals.data.clamp_(min=-50.0, max=50.0)
             
             # 2. Compute Update
             update_delta = (self._mom_vals.data + self.weight_decay * self.fast_vals.data)
@@ -1563,13 +1593,11 @@ class LTMModule(nn.Module):
             
             decay_scaler = tokens_covered / float(self.reference_chunk_len)
             
-            # Linear approximation for small rates (typical case)
-            effective_forget_rate = self.forget_rate * decay_scaler
-            
-            # Clamp to be safe (0 to 1)
-            effective_forget_rate = max(0.0, min(1.0, effective_forget_rate))
-
-            self.fast_vals.data.mul_(1.0 - effective_forget_rate)
+            # --- FIX: Use Exponential Decay instead of Linear Approximation ---
+            # Linear: 1 - (rate * scaler) -> Can go negative if scaler is large!
+            # Exponential: (1 - rate) ^ scaler -> Always safe, consistent over time.
+            retention_rate = (1.0 - self.forget_rate) ** decay_scaler
+            self.fast_vals.data.mul_(retention_rate)
 
             # 4. Apply update
             final_update = torch.zeros_like(self.vals.data)
@@ -1585,6 +1613,45 @@ class LTMModule(nn.Module):
             self.fast_vals.data.clamp_(min=-20.0, max=20.0)
 
             # --- UPDATE METADATA ---
+            current_time = time.time()
+            self.timestamps.data[nonzero_mask] = current_time
+            self.timestamps.data[nonzero_mask] = current_time
+            self.sources.data[nonzero_mask] = source
+
+    def update_memory_hebbian(self, topk_idx: torch.LongTensor, keys: torch.Tensor, vals: torch.Tensor, current_lr: float, source: int = SRC_USER_INTERACTION):
+        """
+        Performs a Hebbian-style associative update for Inference (when gradients are unavailable).
+        Rule: FastVals += lr * (Key^T * Val)  (Conceptually)
+        Here we simply reinforce the retrieved slots with the current input/output association.
+        """
+        with torch.no_grad():
+            valid_mask = topk_idx >= 0
+            if not valid_mask.any(): return
+
+            idx_flat = topk_idx[valid_mask].view(-1)
+            
+            # For Hebbian update, we assume 'vals' is the "desired" value to store.
+            # In inference, this might be the 'enc' or 'context'.
+            # We add this value to the selected slots.
+            
+            vals_flat = vals[valid_mask].view(-1, self.vals.size(1))
+            
+            # Aggregate updates
+            counts = torch.zeros(self.vals.size(0), device=self.vals.device)
+            counts.index_add_(0, idx_flat, torch.ones_like(idx_flat, dtype=torch.float))
+            
+            slot_updates = torch.zeros_like(self.vals.data)
+            slot_updates.index_add_(0, idx_flat, vals_flat)
+            
+            nonzero_mask = counts > 0
+            if nonzero_mask.any():
+                slot_updates[nonzero_mask] /= counts[nonzero_mask].unsqueeze(-1)
+            
+            # Apply update
+            self.fast_vals.data.add_(slot_updates * current_lr)
+            self.fast_vals.data.clamp_(min=-20.0, max=20.0)
+            
+            # Update metadata
             current_time = time.time()
             self.timestamps.data[nonzero_mask] = current_time
             self.sources.data[nonzero_mask] = source
@@ -1678,6 +1745,13 @@ class HierarchosCore(nn.Module):
         self.l_rnn = RWKVCell(self.config.l_hidden)
         self.l_to_out = nn.Linear(self.config.l_hidden, self.config.context_dim)
 
+        # Configure truncated BPTT for RWKV cells
+        # Detach state every N steps during training to prevent unbounded gradient accumulation
+        # while still allowing temporal learning across multiple steps
+        detach_freq = getattr(self.config, 'detach_every_n_steps', 32)  # Default: 32 timesteps
+        self.h_rnn.detach_every_n_steps = detach_freq
+        self.l_rnn.detach_every_n_steps = detach_freq
+
         # Context Drift Projection
         self.context_drift_proj = nn.Linear(self.config.l_hidden, self.config.context_dim, bias=False)
         nn.init.normal_(self.context_drift_proj.weight, mean=0.0, std=0.01)
@@ -1689,30 +1763,49 @@ class HierarchosCore(nn.Module):
 
         # Keep torch.compile
         if self.config.get('compile', False):
-            try:
-                if hasattr(torch, "compile"):
-                    print("INFO: --compile flag set. Applying torch.compile to Worker (L-RNN) loop...")
-                    self._worker_loop = torch.compile(
-                        self._worker_loop,
-                        dynamic=True,
-                        fullgraph=False,   
-                        options={"triton.cudagraphs": False}
-                    )
-            except Exception as e:
-                print(f"WARNING: torch.compile failed ({e}) — falling back to eager mode")
+            # Check for Windows CPU + Compile (Known Hang Issue)
+            # Allow override with --force-compile
+            if os.name == 'nt' and not torch.cuda.is_available() and not self.config.get('force_compile', False):
+                print("WARNING: torch.compile on Windows CPU is known to hang with complex RNN loops.")
+                print("         Disabling compilation for the Worker Loop to ensure stability.")
+                print("         Use --force-compile to override this safety check.")
+                self.config['compile'] = False 
+            else:
+                try:
+                    if hasattr(torch, "compile"):
+                        print("INFO: --compile flag set. Applying torch.compile to Worker (L-RNN) loop...")
+                        self._worker_loop = torch.compile(
+                            self._worker_loop,
+                            dynamic=True,
+                            fullgraph=False,   
+                            options={"triton.cudagraphs": False}
+                        )
+                except Exception as e:
+                    print(f"WARNING: torch.compile failed ({e}) -- falling back to eager mode")
         else:
             print("INFO: torch.compile is DISABLED (Eager Mode).")
 
-    def _worker_loop(self, enc, static_context, l_state):
+        # Keep a reference to the eager method for fallback
+        self._worker_loop_eager = self._worker_loop.__wrapped__ if hasattr(self._worker_loop, "__wrapped__") else self._worker_loop
+
+    def _worker_loop(self, enc, static_context, l_state, prev_drift):
         if enc.dim() == 3 and enc.shape[0] == 1: enc = enc.squeeze(0)
         if static_context.dim() == 3 and static_context.shape[0] == 1: static_context = static_context.squeeze(0)
         if l_state.dim() == 4 and l_state.shape[0] == 1: l_state = l_state.squeeze(0)
+        if prev_drift.dim() == 3 and prev_drift.shape[0] == 1: prev_drift = prev_drift.squeeze(0)
 
-        current_drift = torch.zeros_like(static_context)
+        # --- FIX: Use persisted drift state ---
+        # Instead of re-initializing from hidden state (which causes jitter),
+        # we continue from the previous drift state.
+        current_drift = prev_drift
+        
         drift_costs = [] 
         current_enc = enc
-        
-        shadow_l_state = l_state.clone() 
+
+        # --- FIX: Shadow state for exploration (pondering) - NO detachment during training ---
+        # Detachment was breaking gradient flow. Shadow state explores convergence,
+        # but gradients should flow through the exploration to learn better pondering.
+        shadow_l_state = l_state.clone()  # Clone, but don't detach
         dynamic_context = static_context # Start with static
 
         l_input_vec = torch.cat([current_enc, dynamic_context], dim=-1)
@@ -1722,8 +1815,12 @@ class HierarchosCore(nn.Module):
 
         if not self.training:
             prev_shadow = shadow_l_state.clone()
-            for _ in range(self.config.max_l_steps):
-                l_out, shadow_l_state = self.l_rnn(l_input, shadow_l_state)
+            for step_idx in range(self.config.max_l_steps):
+                # Use negative timestep for pondering (won't trigger BPTT detachment)
+                l_out, shadow_l_state = self.l_rnn(l_input, shadow_l_state, timestep=-(step_idx+1))
+                # Safety Clamp for Shadow State
+                shadow_l_state = torch.clamp(shadow_l_state, min=-50.0, max=50.0)
+                
                 drift_delta = torch.tanh(self.context_drift_proj(l_out))
                 current_drift = torch.clamp(current_drift + drift_delta, min=-5.0, max=5.0)
                 dynamic_context = static_context + current_drift
@@ -1736,28 +1833,45 @@ class HierarchosCore(nn.Module):
                 if drift_converged or state_converged: break
                 prev_shadow = shadow_l_state.clone()
         else:
-            for _ in range(self.config.max_l_steps):
-                l_out, shadow_l_state = self.l_rnn(l_input, shadow_l_state)
+            for step_idx in range(self.config.max_l_steps):
+                # Use negative timestep for pondering (won't trigger BPTT detachment)
+                l_out, shadow_l_state = self.l_rnn(l_input, shadow_l_state, timestep=-(step_idx+1))
+                # Safety Clamp for Shadow State
+                shadow_l_state = torch.clamp(shadow_l_state, min=-50.0, max=50.0)
+                
                 drift_delta = torch.tanh(self.context_drift_proj(l_out))
                 current_drift = torch.clamp(current_drift + drift_delta, min=-5.0, max=5.0)
                 drift_sq = torch.sum(current_drift ** 2, dim=-1).mean()
                 hinge_cost = torch.relu(drift_sq - self.config.commitment_threshold)
                 drift_costs.append(hinge_cost)
+                
+                # Convergence check REMOVED for torch.compile stability on Windows
+                # Dynamic control flow (break) causes issues with Inductor on CPU
+                # if torch.mean(torch.abs(drift_delta)) < self.config.l_conv_atol:
+                #    break
                 dynamic_context = static_context + current_drift
                 l_input_vec = torch.cat([current_enc, dynamic_context], dim=-1)
                 l_input = self.l_input_proj(l_input_vec)
 
-        final_l_out, next_l_state = self.l_rnn(l_input, l_state)
+        # <<< FIX: Use original l_state (not shadow) for the actual state update >>>
+        # This ensures gradients flow through the primary computation path
+        # timestep=0 indicates commitment step (vs negative timesteps for pondering)
+        final_l_out, next_l_state = self.l_rnn(l_input, l_state, timestep=0)
+        
+        # <<< FIX: Clamp next_l_state to prevent numerical instability >>>
+        next_l_state = torch.clamp(next_l_state, min=-50.0, max=50.0)
+        
         final_enc = current_enc + self.l_to_out(final_l_out)
         commitment_cost = torch.tensor(0.0, device=enc.device)
         if drift_costs:
             commitment_cost = torch.stack(drift_costs).mean()
 
-        return final_enc, next_l_state, commitment_cost
+        return final_enc, next_l_state, commitment_cost, current_drift
 
     def forward(self, input_ids, attention_mask=None, labels=None, 
                 h_state=None, l_state=None, 
                 prev_context=None, target_context=None, # State Persistence
+                drift_state=None, # <<< NEW: Persisted Drift State
                 min_timestamp=0.0, source_filter=None, **kwargs):
         B, T = input_ids.shape
         device = input_ids.device
@@ -1789,6 +1903,10 @@ class HierarchosCore(nn.Module):
             l_state = torch.zeros(B, self.config.l_hidden, 5, device=device)
             l_state[:, :, 3] = -1e30
 
+        if drift_state is None:
+            drift_state = torch.zeros(B, self.config.context_dim, device=device)
+
+
         final_embs = []
         ponder_costs = []
         commitment_costs = []
@@ -1798,6 +1916,9 @@ class HierarchosCore(nn.Module):
         # ==================================================================
         # 2. MAIN TIME LOOP (Training)
         # ==================================================================
+        all_topk_vals = []
+        all_topk_idx = []
+        
         for t in range(T):
             token_x = x[:, t]
             
@@ -1805,6 +1926,10 @@ class HierarchosCore(nn.Module):
             p = self.persistent.unsqueeze(0).expand(B, -1)
             q = torch.clamp(self.qproj(token_x), min=-10, max=10)
             topk_vals, topk_idx, topk_ts = self.ltm.retrieve_topk(q, self.config.ltm_topk, min_timestamp, source_filter)
+            
+            all_topk_vals.append(topk_vals)
+            all_topk_idx.append(topk_idx)
+            
             args = topk_ts.unsqueeze(-1) * self.time_freqs.unsqueeze(0).unsqueeze(0)
             pe = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
             if self.config.ltm_val_dim % 2 == 1: pe = torch.cat([pe, torch.zeros_like(pe[..., :1])], dim=-1)
@@ -1823,8 +1948,21 @@ class HierarchosCore(nn.Module):
             # 3. HIERARCHICAL MANAGER (Continuous Watch, Strided Plan)
             # ==================================================================
             
+            # <<< FIX: Apply Worker Feedback >>>
+            # Project the Worker's previous state to the Manager's space
+            # l_state shape: [B, l_hidden, 5]. Slot 0 is the hidden state.
+            l_feedback = self.l_feedback_proj(l_state[:, :, 0])
+            enc_with_feedback = enc + l_feedback
+            
             # A. REALITY STEP (Continuous)
-            h_out_real, h_state = self.h_rnn(enc, h_state)
+            # Pass timestep for proper truncated BPTT
+            h_out_real, h_state = self.h_rnn(enc_with_feedback, h_state, timestep=t)
+            
+            # Safety Clamp for H-Out (prevent NaN propagation)
+            h_out_real = torch.clamp(h_out_real, min=-50.0, max=50.0)
+            
+            if torch.isnan(h_out_real).any() or torch.isinf(h_out_real).any():
+                print(f"WARNING: NaN/Inf detected in h_out_real at step {t}")
             
             step_ponder_cost = torch.tensor(0.0, device=device)
             
@@ -1841,9 +1979,10 @@ class HierarchosCore(nn.Module):
                 shadow_h_state = h_state.clone()
                 current_enc_h = enc 
 
-                for _ in range(self.config.max_h_steps - 1):
+                for step_idx in range(self.config.max_h_steps - 1):
                     if not self.training and h_halt_probs[-1].mean() > getattr(self.config, 'h_halt_thresh', 0.9): break
-                    h_out_ponder, shadow_h_state = self.h_rnn(current_enc_h, shadow_h_state)
+                    # Pass timestep for pondering steps (use negative to indicate pondering, won't trigger detachment)
+                    h_out_ponder, shadow_h_state = self.h_rnn(current_enc_h, shadow_h_state, timestep=-(step_idx+1))
                     halt_logit = self.h_halt_proj(h_out_ponder).squeeze(-1)
                     h_step_outputs.append(h_out_ponder)
                     h_halt_probs.append(torch.sigmoid(halt_logit))
@@ -1877,15 +2016,41 @@ class HierarchosCore(nn.Module):
             # 4. WORKER STEP (Receives Sliding Context)
             # ==================================================================
             
-            # Use Worker's previous short-term memory to calculate drift
-            prev_worker_h = l_state[:, :, 0] 
-            drift = torch.tanh(self.context_drift_proj(prev_worker_h)) 
-            dynamic_context = sliding_context + drift # Apply drift to sliding context
+            # REMOVED: Pre-calculation of drift. Now handled inside _worker_loop.
+            # dynamic_context = sliding_context + drift 
 
+            # B. PONDER STEP (Worker Loop)
+            # ------------------------------------------------------------------
+            # The Worker iterates to find the best 'drift' (context adjustment)
+            # to satisfy the Manager's goal.
             if self.config.gradient_checkpointing and self.training:
-                enc, l_state, cc = checkpoint(self._worker_loop, enc, dynamic_context, l_state, use_reentrant=False)
+                enc, l_state, cc, drift_state = checkpoint(self._worker_loop, enc, sliding_context, l_state, drift_state, use_reentrant=False)
             else:
-                enc, l_state, cc = self._worker_loop(enc, dynamic_context, l_state)
+                # Use the compiled version if available, otherwise the eager one
+                loop_fn = self._worker_loop if hasattr(self, '_worker_loop') else self._worker_loop_eager
+                try:
+                    enc, l_state, cc, drift_state = loop_fn(enc, sliding_context, l_state, drift_state)
+                    # Robustness: If compiled loop produces NaNs or Infs, treat as failure and fallback
+                    if self.config.get('compile', False) and (
+                        torch.isnan(enc).any() or torch.isinf(enc).any() or 
+                        torch.isnan(l_state).any() or torch.isinf(l_state).any()
+                    ):
+                        raise RuntimeError("NaNs/Infs detected in compiled worker loop output")
+                except Exception as e:
+                    if self.config.get('compile', False) and hasattr(self, '_worker_loop_eager'):
+                        print(f"\nWARNING: Compiled worker loop failed ({e}). Falling back to eager mode for this step.")
+                        enc, l_state, cc, drift_state = self._worker_loop_eager(enc, sliding_context, l_state, drift_state)
+                    else:
+                        raise e
+            
+            # <<< FIX: Detach l_state after worker loop to prevent gradient accumulation >>>
+            # This ensures truncated BPTT at the worker level
+            if self.training and not self.config.gradient_checkpointing:
+                # Only detach if not using gradient checkpointing, as checkpointing already handles this
+                l_state = l_state.detach()
+            
+            # Safety Clamp for Drift State
+            drift_state = torch.clamp(drift_state, min=-5.0, max=5.0)
 
             final_embs.append(enc)
             commitment_costs.append(cc)
@@ -1895,6 +2060,14 @@ class HierarchosCore(nn.Module):
         # ==================================================================
         final = self.out_norm(torch.stack(final_embs, dim=1))
         logits = self.lm_head(final)
+        
+        # Safety Clamp for Logits to prevent NaN loss
+        # 30.0 is usually enough for softmax (exp(30) is huge)
+        if torch.isnan(logits).any() or torch.isinf(logits).any():
+             print("WARNING: NaN/Inf detected in logits. Replacing with zeros and clamping...")
+             logits = torch.nan_to_num(logits, nan=0.0, posinf=30.0, neginf=-30.0)
+        
+        logits = torch.clamp(logits, min=-30.0, max=30.0)
 
         loss = None
         ponder_cost_out = None
@@ -1920,13 +2093,14 @@ class HierarchosCore(nn.Module):
             "logits": logits, 
             "ponder_cost": ponder_cost_out, 
             "commitment_cost": commitment_cost_out,
-            "topk_vals": topk_vals, 
-            "topk_idx": topk_idx,
+            "topk_vals": torch.stack(all_topk_vals, dim=1) if all_topk_vals else None, 
+            "topk_idx": torch.stack(all_topk_idx, dim=1) if all_topk_idx else None,
             "h_state": h_state,
             "l_state": l_state,
             # RETURN CONTEXT STATES FOR TBPTT
             "prev_context": prev_context,
-            "target_context": target_context
+            "target_context": target_context,
+            "drift_state": drift_state, # Return new drift state
         }
 
     # ==================================================================
@@ -1995,7 +2169,7 @@ class QuantizedHierarchos:
         expected_quantized = [
             'qproj', 'in_proj', 'h_rnn', 'h_to_context',
             'l_input_proj', 'l_rnn', 'l_to_out', 'lm_head', 'h_halt_proj',
-            'context_drift_proj' 
+            'context_drift_proj', 'l_feedback_proj' # <<< Added l_feedback_proj
         ]
         quantized_layers = {}
         for layer_name in expected_quantized:
@@ -2023,6 +2197,7 @@ class QuantizedHierarchos:
         self.lm_head        = quantized_layers['lm_head']
         self.h_halt_proj    = quantized_layers['h_halt_proj']
         self.context_drift_proj = quantized_layers.get('context_drift_proj')
+        self.l_feedback_proj = quantized_layers.get('l_feedback_proj') # <<< Added l_feedback_proj
 
         print(f"Initialized QuantizedHierarchos ({self.qtype}) with RWKV recurrence.")
 
@@ -2053,6 +2228,9 @@ class QuantizedHierarchos:
         logits = None
         stride = self.config.h_stride
 
+        all_topk_vals = []
+        all_topk_idx = []
+
         for t in range(start_t, T):
             # Absolute position for Stride/LERP calculations
             abs_t = global_pos_offset + t
@@ -2066,9 +2244,18 @@ class QuantizedHierarchos:
             query = torch.clamp(query, min=-10.0, max=10.0)
             
             # --- LTM Retrieval ---
-            topk_vals, _, topk_ts = self.ltm.retrieve_topk(query, topk=self.config.ltm_topk, 
+            # <<< FIX: Weighted Retrieval Parity >>>
+            # We now expect retrieve_topk to return weighted values directly if we updated LTMModule correctly.
+            # Let's check LTMModule.retrieve_topk again.
+            # Yes, I updated LTMModule.retrieve_topk to return weighted values.
+            # So `topk_vals` here is ALREADY weighted.
+            
+            topk_vals, topk_idx, topk_ts = self.ltm.retrieve_topk(query, topk=self.config.ltm_topk, 
                                                            min_timestamp=min_timestamp, 
                                                            source_filter=source_filter)
+            
+            all_topk_vals.append(topk_vals)
+            all_topk_idx.append(topk_idx)
             
             # Time Encoding
             args = topk_ts.unsqueeze(-1) * self.time_freqs.unsqueeze(0).unsqueeze(0)
@@ -2086,8 +2273,20 @@ class QuantizedHierarchos:
             # 1. HIERARCHICAL MANAGER (Continuous State, Strided Goal)
             # ==================================================================
             
+            # <<< FIX: Apply Worker Feedback >>>
+            if self.l_feedback_proj is not None:
+                l_feedback = self.l_feedback_proj(final_l_state[:, :, 0].to(device), device=device)
+                # Clamp feedback to prevent explosion
+                l_feedback = torch.clamp(l_feedback, min=-10.0, max=10.0)
+                enc_with_feedback = enc + l_feedback
+            else:
+                enc_with_feedback = enc
+            
+            # Clamp encoder input to Manager
+            enc_with_feedback = torch.clamp(enc_with_feedback, min=-50.0, max=50.0)
+
             # A. Continuous Update (The V2 Fix)
-            h_out_real, new_h_state = self.h_rnn(enc, final_h_state, device=device)
+            h_out_real, new_h_state = self.h_rnn(enc_with_feedback, final_h_state, device=device)
             final_h_state = new_h_state
 
             # B. Strided Goal Update
@@ -2113,7 +2312,13 @@ class QuantizedHierarchos:
             # The model recursively updates the drift to refine the context.
             
             # Initialize drift for this token step (starts at 0)
-            current_drift = torch.zeros_like(static_context)
+            # --- FIX: Initialize drift from previous worker state ---
+            if self.context_drift_proj is not None:
+                prev_worker_h = final_l_state[:, :, 0].to(device)
+                current_drift = torch.tanh(self.context_drift_proj(prev_worker_h))
+                current_drift = torch.clamp(current_drift, min=-5.0, max=5.0)
+            else:
+                current_drift = torch.zeros_like(static_context)
             
             # Loop for max_l_steps (Pondering)
             for _ in range(self.config.max_l_steps):
@@ -2134,10 +2339,9 @@ class QuantizedHierarchos:
                     drift_delta = torch.tanh(self.context_drift_proj(l_out, device=device))
                     current_drift = torch.clamp(current_drift + drift_delta, min=-5.0, max=5.0)
                     
-                    # Optimization: Early exit if drift stabilizes (convergence)
-                    # Using mean abs difference as proxy for convergence
-                    if torch.mean(torch.abs(drift_delta)) < self.config.l_conv_atol:
-                        break
+                    # Optimization: Early exit REMOVED for consistency with training
+                    # if torch.mean(torch.abs(drift_delta)) < self.config.l_conv_atol:
+                    #     break
                 else:
                     # Fallback if drift proj missing in quantized weights
                     break
@@ -2153,8 +2357,24 @@ class QuantizedHierarchos:
             "h_state": final_h_state.cpu(),
             "l_state": final_l_state.cpu(),
             "prev_context": curr_prev_context.cpu(),
-            "target_context": curr_target_context.cpu()
+            "target_context": curr_target_context.cpu(),
+            "topk_vals": torch.stack(all_topk_vals, dim=1).cpu() if all_topk_vals else None,
+            "topk_idx": torch.stack(all_topk_idx, dim=1).cpu() if all_topk_idx else None
         }
+
+    def update_memory(self, topk_idx: torch.LongTensor, grads: torch.Tensor, lr: float = 1e-3):
+        """
+        Updates the LTM memory using gradients (Titans style).
+        Requires external gradient computation (e.g. via Shadow Model).
+        """
+        self.ltm.inner_update(topk_idx, grads, current_lr=lr, source=LTMModule.SRC_USER_INTERACTION)
+
+    def update_memory_hebbian(self, topk_idx: torch.LongTensor, vals: torch.Tensor, lr: float = 1e-3):
+        """
+        Updates the LTM memory using Hebbian rule (Fallback for Inference).
+        """
+        # We don't have 'keys' here easily, but inner_update_hebbian just needs vals to add to the slots.
+        self.ltm.update_memory_hebbian(topk_idx, None, vals, current_lr=lr, source=LTMModule.SRC_USER_INTERACTION)
 
 def load_quantized(model_path: str):
     """Loads a quantized model directory, automatically finding the .npz and tokenizer."""
@@ -2246,6 +2466,20 @@ def load_full_model_with_config(model_path: str, device):
 def train(args, device, tokenizer, dataloader, dataloader_len):
     print("Running in TRAIN mode...")
     config = vars(args) # Start with CLI args
+
+    if args.force_compile and not args.compile:
+        print("INFO: --force-compile set but --compile missing. Auto-enabling --compile.")
+        args.compile = True
+        config['compile'] = True
+
+    if args.debug_anomaly:
+        print("INFO: Enabling torch.autograd.set_detect_anomaly(True). Expect slower training.")
+        torch.autograd.set_detect_anomaly(True)
+
+    # CPU Optimization: Flush Denormals to Zero (Fixes extreme slowness/hangs on CPU)
+    if not torch.cuda.is_available():
+        print("INFO: CPU Training detected. Enabling torch.set_flush_denormal(True) to prevent performance hangs.")
+        torch.set_flush_denormal(True)
 
     # ==========================================================
     # --- 1. ROBUST CONFIGURATION & RESUME LOGIC (From Old Version) ---
@@ -2560,6 +2794,9 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     # Zero gradients *before* starting the loop, especially important when resuming
     optimizer.zero_grad(set_to_none=True)
 
+    # Zero gradients *before* starting the loop, especially important when resuming
+    optimizer.zero_grad(set_to_none=True)
+
     global_step = 0 # Track global steps for iterable datasets and scheduler
 
     # Initialize states to None outside the loop. 
@@ -2567,6 +2804,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     running_l_state = None
     running_prev_context = None
     running_target_context = None
+    running_drift_state = None
 
     for epoch in range(start_epoch, args.epochs):
         print(f"\n--- Epoch {epoch + 1} / {args.epochs} ---")
@@ -2576,6 +2814,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         running_l_state = None
         running_prev_context = None
         running_target_context = None
+        running_drift_state = None
         
         pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}")
         total_loss = 0.0
@@ -2593,6 +2832,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
             running_l_state = None
             running_prev_context = None
             running_target_context = None
+            running_drift_state = None
             
             model.reset_memory()
 
@@ -2646,7 +2886,8 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                         h_state=running_h_state, 
                         l_state=running_l_state,
                         prev_context=running_prev_context,
-                        target_context=running_target_context
+                        target_context=running_target_context,
+                        drift_state=running_drift_state
                     )
 
                     if outputs.get("topk_vals") is not None and outputs["topk_vals"].requires_grad:
@@ -2678,6 +2919,11 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                         running_target_context = torch.clamp(running_target_context, min=-50.0, max=50.0)
                     else: running_target_context = None
 
+                    if outputs.get("drift_state") is not None:
+                        running_drift_state = outputs["drift_state"].detach()
+                        running_drift_state = torch.clamp(running_drift_state, min=-5.0, max=5.0)
+                    else: running_drift_state = None
+
                     # --- Robust Loss Calculation ---
                     combined_loss = None
                     ce_valid = cross_entropy_loss is not None and not torch.isnan(cross_entropy_loss) and not torch.isinf(cross_entropy_loss)
@@ -2691,6 +2937,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                         # Reset states so we don't accidentally carry garbage if we were to continue (though we break)
                         running_h_state = None
                         running_l_state = None
+                        running_drift_state = None
                         continue 
 
                     loss_accum = 0.0
@@ -2742,7 +2989,9 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                                 outputs["topk_idx"], 
                                 ltm_grads_copy, 
                                 current_lr=args.ltm_lr, 
-                                source=LTMModule.SRC_TRAINING_DATA
+
+                                source=LTMModule.SRC_TRAINING_DATA,
+                                tokens_covered=end_t - start_t # <<< FIX: Pass actual token count for decay scaling
                             )
                         else:
                             pass
@@ -2957,8 +3206,8 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len): # <<< Pass da
             "key_cm", "receptance_cm", "value_cm",
             # Hierarchos-specific layers
             "qproj", "in_proj", "h_to_context",
-            "l_input_proj", "l_to_out", "h_halt_proj"
-            "context_drift_proj"  # <<< ADD THIS
+            "l_input_proj", "l_to_out", "h_halt_proj",
+            "context_drift_proj", "l_feedback_proj"  # <<< ADD THIS
         ],
         lora_dropout=0.05,
         bias="none",
@@ -3618,6 +3867,7 @@ def chat(args, device, tokenizer):
         # Context States (Persisted for Lerp)
         prev_context = torch.zeros(1, config.context_dim, device=rnn_device)
         target_context = torch.zeros(1, config.context_dim, device=rnn_device)
+        drift_state = torch.zeros(1, config.context_dim, device=rnn_device)
         
         # Track total token count for correct Stride/Lerp calculation across turns
         total_tokens_generated = 0
@@ -3758,6 +4008,7 @@ def chat(args, device, tokenizer):
                             l_state=l_state.cpu(), 
                             prev_context=prev_context.cpu(),
                             target_context=target_context.cpu(),
+                            drift_state=drift_state.cpu(),
                             global_pos_offset=total_tokens_generated, # Critical for Lerp continuity
                             device=inference_device, 
                             min_timestamp=min_ts_filter, 
@@ -3768,18 +4019,21 @@ def chat(args, device, tokenizer):
                         l_state = outputs['l_state']
                         prev_context = outputs['prev_context']
                         target_context = outputs['target_context']
+                        drift_state = outputs['drift_state']
                     else:
                         # Full model expects inputs on its device
                         outputs = model(
                             model_input_ids.to(device), 
                             h_state=h_state, # Pass persistent state
                             l_state=l_state, # Pass persistent state
+                            drift_state=drift_state,
                             min_timestamp=min_ts_filter, 
                             source_filter=source_id_filter
                         )
                         # Update states (assuming forward returns them in dict)
                         if outputs.get('h_state') is not None: h_state = outputs['h_state']
                         if outputs.get('l_state') is not None: l_state = outputs['l_state']
+                        if outputs.get('drift_state') is not None: drift_state = outputs['drift_state']
 
 
                     logits = outputs["logits"].to(device) # Ensure logits are on main device for sampling
@@ -3846,7 +4100,7 @@ def chat(args, device, tokenizer):
                 print(f"\nSaving LTM memory deltas to {args.ltm_lora_path}...")
                 try:
                     torch.save(updatable_model.ltm.ltm_deltas.cpu(), args.ltm_lora_path)
-                    print("✅ Deltas saved.")
+                    print("Deltas saved.")
                 except Exception as e:
                     print(f"Error saving LTM deltas: {e}")
             else:
@@ -3866,7 +4120,7 @@ def chat(args, device, tokenizer):
                                     'model_state_dict': model.state_dict(),
                                     'config': dict(model.config) # Save current config
                                 }, output_weights_path)
-                                print("✅ Save complete.")
+                                print("Save complete.")
                             except Exception as e:
                                 print(f"Error saving model: {e}")
                             break
@@ -3894,7 +4148,7 @@ def chat(args, device, tokenizer):
                                     print("Error: Cannot re-quantize without a loaded tokenizer.")
                                     break
                                 export_and_quantize_model(output_dir, shadow_model, tokenizer, model.qtype)
-                                print("✅ Re-quantization complete.")
+                                print("Re-quantization complete.")
                                 # Move shadow model back to original device if needed
                                 shadow_model.to(device)
                             except Exception as e:
@@ -3981,7 +4235,9 @@ def main():
     train_group.add_argument("--num_workers", type=int, default=0, help="Number of worker processes for data loading. Recommended: 2 or 4 for GPU training.")
     train_group.add_argument("--amp", action="store_true", help="[Train/Finetune/Chat] Enable Automatic Mixed Precision (AMP) for training/learning.")
     train_group.add_argument("--gradient-checkpointing", action="store_true", help="[Train/Finetune] Enable gradient checkpointing to save memory during training.")
-    train_group.add_argument("--compile", action="store_true", help="[Train] Enable torch.compile (Linux recommended). Default: Disabled for stability.")
+    parser.add_argument("--compile", action="store_true", help="Use torch.compile for faster training (experimental).")
+    parser.add_argument("--force-compile", action="store_true", help="Force torch.compile even on Windows CPU (risky).")
+    parser.add_argument("--debug-anomaly", action="store_true", help="Enable torch.autograd.set_detect_anomaly(True) for debugging NaNs.")
 
     # --- Inference Arguments ---
     infer_group = parser.add_argument_group('Inference (Chat)')
@@ -4224,13 +4480,13 @@ def main():
 
         if max_found_length > 0:
             target_max_length = (max_found_length + 16 + 7) & -8
-            print(f"✅ Auto-scan complete. Found max length ~{max_found_length}. Setting max_length to {target_max_length}.")
+            print(f"Auto-scan complete. Found max length ~{max_found_length}. Setting max_length to {target_max_length}.")
             args.max_length = target_max_length 
             if tokenizer and hasattr(tokenizer, 'model_max_length') and tokenizer.model_max_length < target_max_length:
                 tokenizer.model_max_length = target_max_length
                 print(f"Updated tokenizer.model_max_length to {target_max_length}")
         else:
-            print(f"⚠️ WARNING: Auto-scan did not find valid entries or failed. Using default max_length ({args.max_length}).")
+            print(f"WARNING: Auto-scan did not find valid entries or failed. Using default max_length ({args.max_length}).")
 
     elif not args.max_length and args.mode in ['train', 'finetune'] and not args.pre_chunked_dataset and not args.pre_pt_dataset:
         print(f"Warning: No --max_length specified. Using default {args.max_length}.")

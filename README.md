@@ -8,7 +8,7 @@ Due to Amazon's "Chronos" forecasting models (still based on transformers BTW) I
 
 -----
 
-### 🚀 **New in v0.11.15:###
+### 🚀 **New in v0.11.15: **
 
 > This update resolves critical architectural flaws that were causing **coherence problems** and **hallucinations** during inference.
 >
@@ -17,7 +17,7 @@ Due to Amazon's "Chronos" forecasting models (still based on transformers BTW) I
 > 3.  **Manager Pondering (ACT) in Inference:** ⚖️ Implemented the "Manager Pondering" (Adaptive Computation Time) logic in `QuantizedHierarchos` to match the training behavior. This resolves the "drift discrepancy" by ensuring the Manager's goal setting is consistent between training and inference.
 > 4.  **Verified Stability:** ✅ Validated with reproduction scripts confirming that training and inference drift dynamics are now identical. Training results show stable convergence (e.g., loss=10.6880, ponder=3.09, commit=4.30e-01).
 
-### 🚀 **New in v0.11.5:###
+### 🚀 **New in v0.11.5: **
 
 > This update resolves a critical **training-inference discrepancy** and further stabilizes the memory system.
 >

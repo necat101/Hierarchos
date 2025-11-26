@@ -2183,13 +2183,18 @@ class HierarchosCore(nn.Module):
         Updates the LTM memory using gradients (Titans style).
         Requires external gradient computation (e.g. via Shadow Model).
         """
-        self.ltm.inner_update(topk_idx, grads, current_lr=lr, timestamp=timestamp, source=LTMModule.SRC_USER_INTERACTION)
+        # <<< FIX: Persist the updated state >>>
+        new_fast, new_mom = self.ltm.inner_update(topk_idx, grads, current_lr=lr, timestamp=timestamp, source=LTMModule.SRC_USER_INTERACTION)
+        self.ltm.fast_vals.copy_(new_fast)
+        self.ltm._mom_vals.copy_(new_mom)
 
     def update_memory_hebbian(self, topk_idx: torch.LongTensor, vals: torch.Tensor, timestamp: float, lr: float = 1e-3):
         """
         Updates the LTM memory using Hebbian rule (Fallback for Inference).
         """
-        self.ltm.update_memory_hebbian(topk_idx, None, vals, current_lr=lr, timestamp=timestamp, source=LTMModule.SRC_USER_INTERACTION)
+        # <<< FIX: Persist the updated state >>>
+        new_fast = self.ltm.update_memory_hebbian(topk_idx, None, vals, current_lr=lr, timestamp=timestamp, source=LTMModule.SRC_USER_INTERACTION)
+        self.ltm.fast_vals.copy_(new_fast)
 
 # ==================================================================
 # <<< RESTORED CLASS: QuantizedHierarchos for Inference >>>
@@ -2371,8 +2376,46 @@ class QuantizedHierarchos:
             # B. Strided Goal Update
             if abs_t % stride == 0:
                 curr_prev_context = curr_target_context
-                # Use the 'real' continuous output to set the new target
-                curr_target_context = self.h_to_context(h_out_real, device=device)
+                
+                # <<< FIX: Manager Pondering (Match Training Logic) >>>
+                # Use shadow state to ponder and refine the target context
+                h_step_outputs = [h_out_real]
+                halt_logit = self.h_halt_proj(h_out_real, device=device).squeeze(-1)
+                h_halt_probs = [torch.sigmoid(halt_logit)]
+                
+                shadow_h_state = new_h_state.clone()
+                current_enc_h = enc_with_feedback
+                
+                for step_idx in range(self.config.max_h_steps - 1):
+                    # Early exit for inference
+                    if h_halt_probs[-1].mean() > getattr(self.config, 'h_halt_thresh', 0.9): 
+                        break
+                        
+                    # Run H-RNN on shadow state
+                    h_out_ponder, shadow_h_state = self.h_rnn(current_enc_h, shadow_h_state, device=device)
+                    
+                    halt_logit = self.h_halt_proj(h_out_ponder, device=device).squeeze(-1)
+                    h_step_outputs.append(h_out_ponder)
+                    h_halt_probs.append(torch.sigmoid(halt_logit))
+
+                # Compute Weighted Average (ACT)
+                h_stack = torch.stack(h_step_outputs, dim=0)
+                halt_stack = torch.stack(h_halt_probs, dim=0)
+                
+                remain = 1.0 - halt_stack
+                remain_shifted = torch.cat([torch.ones_like(remain[:1]), remain[:-1]], dim=0)
+                cum_remain = torch.cumprod(remain_shifted, dim=0)
+                weights = halt_stack * cum_remain
+                remainder = cum_remain[-1] * (1.0 - halt_stack[-1])
+                
+                total = weights.sum(dim=0) + remainder + 1e-8
+                weights = weights / total.unsqueeze(0)
+                remainder = remainder / total
+                
+                final_h_out = (weights.unsqueeze(-1) * h_stack).sum(dim=0) + remainder.unsqueeze(-1) * h_stack[-1]
+
+                # Use the pondered output to set the new target
+                curr_target_context = self.h_to_context(final_h_out, device=device)
             
             # C. LERP (Interpolation)
             step_in_stride = abs_t % stride

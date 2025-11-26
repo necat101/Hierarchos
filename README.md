@@ -1,12 +1,20 @@
 -----
 
-# Hierarchos v0.11.0 (alpha): A Hybrid Memory-Reasoning Architecture
+# Hierarchos v0.11.5 (alpha): A Hybrid Memory-Reasoning Architecture
 
 A novel AI architecture that synergistically integrates Google's Titans memory system with a Hierarchical Reasoning Model (HRM) to move beyond the limitations of scale and take a decisive step on the path to AGI.
 
 Due to Amazon's "Chronos" forecasting models (still based on transformers BTW) I've decided to rename the project to "Hierarchos" from this point forward. This should prevent any naming confusion that may occur.
 
 -----
+
+### 🚀 **New in v0.11.5: The "Coherence" Update (Drift Fix & Stability)**
+
+> This update resolves a critical **training-inference discrepancy** and further stabilizes the memory system.
+>
+> 1.  **Fixed Context Drift Discrepancy:** 🎯 Aligned the "Context Drift" logic between training and inference. Previously, training ignored the initial drift state, causing a massive discontinuity (jitter) at every token. Now, both modes calculate drift consistently from the hidden state, ensuring smooth transitions.
+> 2.  **LTM Stability Clamps:** 🔒 Added safety clamps to the Long-Term Memory (LTM) update mechanism to prevent memory saturation and numerical instability during extended training runs.
+> 3.  **Robust torch.compile Support:** 🛠️ Fixed a regression in the worker loop's robustness check that was causing `torch.compile` to fail on Windows CPU. Training with `--force-compile` is now stable.
 
 ### 🚀 **New in v0.11.0: The "Gradient Flow" Update (Coherence & Learning)**
 
@@ -380,6 +388,8 @@ python hierarchos.py train \
 | `--gradient-checkpointing`     | `train`, `finetune`                 | **Enable gradient checkpointing to save VRAM (trades compute for memory).** | `False`                 |
 | `--grad-clip`                  | `train`, `finetune`                 | Gradient clipping value. Prevents gradient explosion (0 to disable).                                                                     | `1.0`                   |
 | `--ponder-loss-weight`         | `train`, `finetune`                 | Weight for the Ponder Cost auxiliary loss.                                                                                               | `0.01`                  |
+| `--commitment-loss-weight`     | `train`, `finetune`                 | Weight for the commitment auxiliary loss to prevent posterior collapse.                                                                  | `0.5`                   |
+| `--commitment-threshold`       | `train`, `finetune`                 | Hinge loss threshold for drift penalty. Drift^2 below this is not penalized.                                                             | `0.05`                  |
 | `--override-scheduling`        | `train`                             | **[If resuming]** Ignore checkpoint's schedule state and use new LR args.                                                                | `False`                 |
 | `--starting-lr`                | `train`, `finetune`                 | Max Learning Rate for the schedule, or fixed LR if schedule disabled.                                                                    | `1e-4`                  |
 | `--min-lr`                     | `train`, `finetune`                 | Minimum Learning Rate for cosine annealing schedule.                                                                                     | `1e-6`                  |
@@ -414,7 +424,7 @@ python hierarchos.py train \
 | `--max_h_steps`                | `train`                             | **Maximum** number of reasoning steps H-module can take. **Impacts training speed.** | `5`                     |
 | `--max_l_steps`                | `train`                             | **Maximum** number of iterations for L-module convergence per H-step. **Impacts training speed.** | `5`                     |
 | `--l_conv_atol`                | `train`                             | Absolute tolerance for checking L-module state convergence.                                                                              | `1e-4`                  |
-| `--ltm_topk`                   | `train`                             | Number of LTM slots to retrieve per token.                                                                                               | `2`                     |
+| `--ltm_topk`                   | `train`                             | Number of LTM slots to retrieve per token.                                                                                               | `4`                     |
 | `--detach-every-n-steps`       | `train`                             | **Truncated BPTT:** Detach RNN state gradients every N timesteps. Set to `None` for full BPTT (memory intensive). Lower values = less memory, less temporal learning. | `32`                    |
 | `--max_length`                 | `train`, `finetune`                 | Maximum sequence length. **Required if using pre-chunked formats.** Set via scan (`--auto-max-length`), manually, or loaded from config. | `1024`                  |
 | `--auto-max-length`            | `train`, `finetune`                 | Automatically scan dataset (`--train` or `--hf_dataset`) to set `max_length`. **Ignored if using pre-chunked formats.** | `False`                 |
@@ -442,6 +452,7 @@ python hierarchos.py train \
 | `--context_dim`      | ***Required:*** New context dimension.                                                | Yes      |         |
 | `--h_hidden`         | ***Required:*** New H-RNN hidden size.                                                | Yes      |         |
 | `--l_hidden`         | ***Required:*** New L-RNN hidden size.                                                | Yes      |         |
+| *Other Arch Args* | *Optional:* Add other architectural args like `--ltm_slots`, `--max_length`, etc., if changing them. | No       | *(Uses old model's value)* |
 
 -----
 
@@ -470,6 +481,13 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
   * **PyTorch Team** for gradient checkpointing functionality.
 
 ## Changelog
+
+### v0.11.5 (alpha)
+
+  * **Coherence & Stability Fixes**:
+      * **Fixed Drift Discrepancy**: Aligned training/inference logic for Context Drift. Training now correctly initializes drift from the previous hidden state, eliminating token-to-token jitter.
+      * **LTM Clamping**: Added value clamping `[-20, 20]` to LTM updates to prevent saturation.
+      * **Fixed torch.compile Regression**: Resolved a `TypeError` in the worker loop's NaN check that prevented compilation.
 
 ### v0.11.0 (alpha)
 

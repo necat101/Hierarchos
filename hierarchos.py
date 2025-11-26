@@ -1786,16 +1786,15 @@ class HierarchosCore(nn.Module):
         # Keep a reference to the eager method for fallback
         self._worker_loop_eager = self._worker_loop.__wrapped__ if hasattr(self._worker_loop, "__wrapped__") else self._worker_loop
 
-    def _worker_loop(self, enc, static_context, l_state, prev_drift, timestep=None):
+    def _worker_loop(self, enc, static_context, l_state, initial_drift, timestep=None):
         if enc.dim() == 3 and enc.shape[0] == 1: enc = enc.squeeze(0)
         if static_context.dim() == 3 and static_context.shape[0] == 1: static_context = static_context.squeeze(0)
         if l_state.dim() == 4 and l_state.shape[0] == 1: l_state = l_state.squeeze(0)
-        if prev_drift.dim() == 3 and prev_drift.shape[0] == 1: prev_drift = prev_drift.squeeze(0)
+        if initial_drift.dim() == 3 and initial_drift.shape[0] == 1: initial_drift = initial_drift.squeeze(0)
 
-        # --- FIX: Use persisted drift state ---
-        # Instead of re-initializing from hidden state (which causes jitter),
-        # we continue from the previous drift state.
-        current_drift = prev_drift
+        # --- FIX: Use calculated initial drift ---
+        # We start with the drift derived from the previous state (passed as initial_drift)
+        current_drift = initial_drift
         
         drift_costs = [] 
         current_enc = enc
@@ -1804,7 +1803,10 @@ class HierarchosCore(nn.Module):
         # Detachment was breaking gradient flow. Shadow state explores convergence,
         # but gradients should flow through the exploration to learn better pondering.
         shadow_l_state = l_state.clone()  # Clone, but don't detach
-        dynamic_context = static_context # Start with static
+        
+        # --- FIX: Initialize dynamic_context with the initial drift ---
+        # This fixes the discontinuity/jitter where training assumed 0 drift at start of loop
+        dynamic_context = static_context + current_drift
 
         l_input_vec = torch.cat([current_enc, dynamic_context], dim=-1)
         l_input = self.l_input_proj(l_input_vec)
@@ -1906,8 +1908,9 @@ class HierarchosCore(nn.Module):
             l_state = torch.zeros(B, self.config.l_hidden, 5, device=device)
             l_state[:, :, 3] = -1e30
 
-        if drift_state is None:
-            drift_state = torch.zeros(B, self.config.context_dim, device=device)
+        # Drift state is now derived from l_state, so we don't need to persist it explicitly
+        # but we keep the argument for backward compatibility (it will be ignored/overwritten)
+
 
         # Initialize LTM State
         # If None, we start from the module's buffers (but treat them as tensors for the graph)
@@ -2038,25 +2041,35 @@ class HierarchosCore(nn.Module):
             # ------------------------------------------------------------------
             # The Worker iterates to find the best 'drift' (context adjustment)
             # to satisfy the Manager's goal.
+            
+            # --- FIX: Calculate Initial Drift from Previous State (Matching Inference) ---
+            if self.context_drift_proj is not None:
+                # l_state shape: [B, l_hidden, 5]. Slot 0 is the hidden state.
+                prev_worker_h = l_state[:, :, 0]
+                initial_drift = torch.tanh(self.context_drift_proj(prev_worker_h))
+                initial_drift = torch.clamp(initial_drift, min=-5.0, max=5.0)
+            else:
+                initial_drift = torch.zeros(B, self.config.context_dim, device=device)
+
             if self.config.gradient_checkpointing and self.training:
-                enc, l_state, cc, drift_state = checkpoint(self._worker_loop, enc, sliding_context, l_state, drift_state, t, use_reentrant=False)
+                enc, l_state, cc, final_drift = checkpoint(self._worker_loop, enc, sliding_context, l_state, initial_drift, t, use_reentrant=False)
             else:
                 # Use the compiled version if available, otherwise the eager one
                 loop_fn = self._worker_loop if hasattr(self, '_worker_loop') else self._worker_loop_eager
                 try:
-                    enc, l_state, cc, drift_state = loop_fn(enc, sliding_context, l_state, drift_state, timestep=t)
+                    enc, l_state, cc, final_drift = loop_fn(enc, sliding_context, l_state, initial_drift, timestep=t)
                     # Robustness: If compiled loop produces NaNs or Infs, treat as failure and fallback
                     if self.config.get('compile', False) and (
                         torch.isnan(enc).any() or torch.isinf(enc).any() or 
                         torch.isnan(l_state).any() or torch.isinf(l_state).any() or
-                        torch.isnan(drift_state).any() or torch.isinf(drift_state).any() or
+                        torch.isnan(final_drift).any() or torch.isinf(final_drift).any() or
                         torch.isnan(cc).any() or torch.isinf(cc).any()
                     ):
                         raise RuntimeError("NaNs/Infs detected in compiled worker loop output")
                 except Exception as e:
                     if self.config.get('compile', False) and hasattr(self, '_worker_loop_eager'):
                         print(f"\nWARNING: Compiled worker loop failed ({e}). Falling back to eager mode for this step.")
-                        enc, l_state, cc, drift_state = self._worker_loop_eager(enc, sliding_context, l_state, drift_state, timestep=t)
+                        enc, l_state, cc, final_drift = self._worker_loop_eager(enc, sliding_context, l_state, initial_drift, timestep=t)
                     else:
                         raise e
             
@@ -2072,7 +2085,8 @@ class HierarchosCore(nn.Module):
             # for short-term temporal dependencies.
             
             # Safety Clamp for Drift State
-            drift_state = torch.clamp(drift_state, min=-5.0, max=5.0)
+            # drift_state = torch.clamp(drift_state, min=-5.0, max=5.0) # No longer needed as final_drift is clamped inside loop
+
 
             final_embs.append(enc)
             commitment_costs.append(cc)
@@ -2087,6 +2101,9 @@ class HierarchosCore(nn.Module):
                 # We use the Hebbian update which is differentiable
                 # Project enc to val_dim
                 val_to_store = self.val_proj(enc)
+                
+                # <<< FIX: Clamp val_to_store to prevent memory saturation/instability >>>
+                val_to_store = torch.clamp(val_to_store, min=-20.0, max=20.0)
                 
                 # Expand to [B, topk, dim] to match topk_idx
                 val_expanded = val_to_store.unsqueeze(1).expand(-1, self.config.ltm_topk, -1)
@@ -2148,7 +2165,7 @@ class HierarchosCore(nn.Module):
             # RETURN CONTEXT STATES FOR TBPTT
             "prev_context": prev_context,
             "target_context": target_context,
-            "drift_state": drift_state, # Return new drift state
+            "drift_state": final_drift, # Return new drift state for analysis/verification
             "ltm_memory_state": (curr_fast_vals, curr_mom_vals), # Return new LTM state
         }
 

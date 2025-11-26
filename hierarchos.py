@@ -2400,6 +2400,10 @@ class QuantizedHierarchos:
                 current_drift = torch.zeros_like(static_context)
             
             # Loop for max_l_steps (Pondering)
+            # Loop for max_l_steps (Pondering)
+            # <<< FIX: Use Shadow State for Pondering (Match Training Logic) >>>
+            shadow_l_state = final_l_state.clone()
+            
             for _ in range(self.config.max_l_steps):
                 # 1. Calculate Dynamic Context
                 dynamic_context = static_context + current_drift
@@ -2408,22 +2412,24 @@ class QuantizedHierarchos:
                 l_input_raw = torch.cat([enc.cpu(), dynamic_context.cpu()], dim=-1)
                 l_input = self.l_input_proj(l_input_raw, device=device)
 
-                # 3. Run Worker RNN Cell
-                # Updates state iteratively in-place for this token
-                l_out, final_l_state = self.l_rnn(l_input, final_l_state, device=device)
+                # 3. Run Worker RNN Cell on SHADOW state
+                l_out, shadow_l_state = self.l_rnn(l_input, shadow_l_state, device=device)
                 
                 # 4. Calculate Drift Delta (The "Steering")
-                # Using the output we just generated to adjust context for the NEXT micro-step
                 if self.context_drift_proj is not None:
                     drift_delta = torch.tanh(self.context_drift_proj(l_out, device=device))
                     current_drift = torch.clamp(current_drift + drift_delta, min=-5.0, max=5.0)
-                    
-                    # Optimization: Early exit REMOVED for consistency with training
-                    # if torch.mean(torch.abs(drift_delta)) < self.config.l_conv_atol:
-                    #     break
                 else:
-                    # Fallback if drift proj missing in quantized weights
                     break
+            
+            # <<< FIX: Update Real State ONCE (Match Training Logic) >>>
+            # Use the FINAL drift/context to generate the FINAL input
+            dynamic_context = static_context + current_drift
+            l_input_raw = torch.cat([enc.cpu(), dynamic_context.cpu()], dim=-1)
+            l_input = self.l_input_proj(l_input_raw, device=device)
+            
+            # Update the actual state once
+            l_out, final_l_state = self.l_rnn(l_input, final_l_state, device=device)
 
             # Final projection to output dimension
             enc = enc + self.l_to_out(l_out, device=device)
@@ -2446,14 +2452,18 @@ class QuantizedHierarchos:
         Updates the LTM memory using gradients (Titans style).
         Requires external gradient computation (e.g. via Shadow Model).
         """
-        self.ltm.inner_update(topk_idx, grads, current_lr=lr, timestamp=timestamp, source=LTMModule.SRC_USER_INTERACTION)
+        # <<< FIX: Persist the updated state >>>
+        new_fast, new_mom = self.ltm.inner_update(topk_idx, grads, current_lr=lr, timestamp=timestamp, source=LTMModule.SRC_USER_INTERACTION)
+        self.ltm.fast_vals.copy_(new_fast)
+        self.ltm._mom_vals.copy_(new_mom)
 
     def update_memory_hebbian(self, topk_idx: torch.LongTensor, vals: torch.Tensor, timestamp: float, lr: float = 1e-3):
         """
         Updates the LTM memory using Hebbian rule (Fallback for Inference).
         """
-        # We don't have 'keys' here easily, but inner_update_hebbian just needs vals to add to the slots.
-        self.ltm.update_memory_hebbian(topk_idx, None, vals, current_lr=lr, timestamp=timestamp, source=LTMModule.SRC_USER_INTERACTION)
+        # <<< FIX: Persist the updated state >>>
+        new_fast = self.ltm.update_memory_hebbian(topk_idx, None, vals, current_lr=lr, timestamp=timestamp, source=LTMModule.SRC_USER_INTERACTION)
+        self.ltm.fast_vals.copy_(new_fast)
 
 def load_quantized(model_path: str):
     """Loads a quantized model directory, automatically finding the .npz and tokenizer."""

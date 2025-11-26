@@ -1,12 +1,20 @@
 -----
 
-# Hierarchos v0.11.5 (alpha): A Hybrid Memory-Reasoning Architecture
+# Hierarchos v0.11.10 (alpha): A Hybrid Memory-Reasoning Architecture
 
 A novel AI architecture that synergistically integrates Google's Titans memory system with a Hierarchical Reasoning Model (HRM) to move beyond the limitations of scale and take a decisive step on the path to AGI.
 
 Due to Amazon's "Chronos" forecasting models (still based on transformers BTW) I've decided to rename the project to "Hierarchos" from this point forward. This should prevent any naming confusion that may occur.
 
 -----
+
+### 🚀 **New in v0.11.10: The "Coherence" Update (Inference Fixes)**
+
+> This update resolves critical architectural flaws that were causing **coherence problems** and **hallucinations** during inference.
+>
+> 1.  **Fixed Worker Loop Mismatch:** 🎯 Corrected a major discrepancy where the inference engine (`QuantizedHierarchos`) was advancing the RNN state `N` times per token (where `N` is `max_l_steps`), while training only advanced it once. This caused the model's internal state to drift ahead of the input, leading to severe incoherence. Inference now correctly uses a **shadow state** for pondering, matching the training logic.
+> 2.  **Fixed Memory Persistence:** 🧠 Fixed a bug where LTM updates calculated during inference were being discarded. The model now correctly **persists** the new memory state (`fast_vals`, `mom_vals`) to its buffers, enabling true test-time learning.
+> 3.  **Verified Stability:** ✅ Validated with reproduction scripts confirming that training and inference drift dynamics are now identical.
 
 ### 🚀 **New in v0.11.5: The "Coherence" Update (Drift Fix & Stability)**
 
@@ -16,17 +24,7 @@ Due to Amazon's "Chronos" forecasting models (still based on transformers BTW) I
 > 2.  **LTM Stability Clamps:** 🔒 Added safety clamps to the Long-Term Memory (LTM) update mechanism to prevent memory saturation and numerical instability during extended training runs.
 > 3.  **Robust torch.compile Support:** 🛠️ Fixed a regression in the worker loop's robustness check that was causing `torch.compile` to fail on Windows CPU. Training with `--force-compile` is now stable.
 
-### 🚀 **New in v0.11.0: The "Gradient Flow" Update (Coherence & Learning)**
 
-> This update fixes **critical architectural flaws** that were preventing proper temporal learning and causing coherence problems, NaN errors, and training instability.
->
-> 1.  **Configurable Truncated BPTT:** 🔓 RWKV cells now implement proper truncated Back-Propagation Through Time instead of unconditional state detachment every step. The new `--detach-every-n-steps 32` parameter (default: 32) allows gradients to flow through multiple timesteps, enabling the model to **learn temporal dependencies** while preventing unbounded gradient accumulation. Set to `None` for full BPTT or adjust based on your memory constraints.
-> 2.  **Worker Loop Gradient Flow:** 🔗 Removed shadow state detachment in the Worker module that was breaking gradient flow during the pondering process. The Worker can now **learn to ponder more effectively** through proper gradient propagation in its exploration phase.
-> 3.  **Manager Feedback Learning:** 🧠 Fixed Manager (H-RNN) state flow to properly receive and learn from Worker (L-RNN) feedback via the `l_feedback_proj` layer. The hierarchical reasoning system can now **learn from both levels** of the architecture.
-> 4.  **Proven Training Improvements:** ✅ Comprehensive test suite demonstrates **22.8% loss reduction** in 20 training steps, with stable gradients flowing through all critical components (tok_emb, h_rnn, l_rnn, ltm). No NaN/Inf errors detected.
-> 5.  **Train/Test Consistency:** 🎯 Fixes the train/test mismatch caused by unconditional detachment, improving model coherence during both training and inference.
-
-### 🚀 **New in v0.10.0: The "Free Will" Update (Hinge Loss & Stability)**
 
 ### 📢 **Major Update in v0.7.0: Hugging Face `datasets` Integration & HRM Compute Note**
 
@@ -481,6 +479,13 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
   * **PyTorch Team** for gradient checkpointing functionality.
 
 ## Changelog
+
+### v0.11.10 (alpha)
+
+  * **Critical Inference Fixes**:
+      * **Worker Loop Correction**: Fixed logic error in `QuantizedHierarchos` where the RNN state was advanced multiple times per token. Now uses shadow state for pondering, matching training behavior.
+      * **Memory Persistence**: Fixed bug where LTM updates were discarded during inference. Now correctly persists `fast_vals` and `mom_vals` to buffers.
+      * **Verified Coherence**: Drift dynamics now match between training and inference.
 
 ### v0.11.5 (alpha)
 

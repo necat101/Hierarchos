@@ -15,10 +15,13 @@ import math # For ceil in dataset chunking (though that script is separate)
 
 # <<< MODIFIED: Set Tokenizers Parallelism Environment Variable >>>
 # Set this early, before tokenizers might be implicitly loaded by other imports
-# Setting to "true" forces parallelism despite potential fork issues (use with caution)
-# Setting to "false" explicitly disables parallelism in worker processes (safer, suppresses warning)
-# Only run this environment setup logic if on Windows
-if os.name == 'nt':
+os.environ["TOKENIZERS_PARALLELISM"] = "true"
+
+def setup_msvc_environment():
+    # Only run this environment setup logic if on Windows
+    if os.name != 'nt':
+        return
+
     CACHE_FILE = 'vcvars_path.cache.txt'
     vcvars_path = None
 
@@ -51,9 +54,6 @@ if os.name == 'nt':
         if vswhere_path:
             try:
                 # <<< MODIFICATION: Use vswhere to find vcvars64.bat directly >>>
-                # This is more robust than finding the installationPath and guessing.
-                # It asks for the path to 'vcvars64.bat' from the latest product
-                # that *requires* the C++ tools.
                 print("INFO: vswhere.exe found. Querying directly for vcvars64.bat...")
                 cmd = [
                     vswhere_path,
@@ -75,7 +75,6 @@ if os.name == 'nt':
 
             except Exception as e:
                 print(f"WARNING: 'vswhere.exe' direct find failed. Will fall back to manual prompt. Error: {e}")
-                # Note: stdout/stderr might be in e.args if check=True failed
                 if hasattr(e, 'stdout'): print(f"   (stdout: {e.stdout})")
                 if hasattr(e, 'stderr'): print(f"   (stderr: {e.stderr})")
         else:
@@ -89,10 +88,6 @@ if os.name == 'nt':
         print("Could not automatically find your 64-bit C++ compiler.")
         print("To use 'torch.compile' (e.g., with --gradient-checkpointing), this script")
         print("needs to find your 'vcvars64.bat' file.")
-        print("\nIt is usually located in a path like:")
-        print(r"  C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat")
-        print(r"  C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat")
-        print("---" * 20)
         
         try:
             user_path = input("Enter the full path to vcvars64.bat (or press Enter to skip): ").strip()
@@ -100,21 +95,19 @@ if os.name == 'nt':
             if user_path and os.path.exists(user_path):
                 vcvars_path = user_path
                 print("INFO: Path validated.")
-            elif user_path: # User provided a path, but it's invalid
+            elif user_path:
                 print(f"WARNING: Path '{user_path}' not found or is invalid.")
                 print("         Skipping environment setup. torch.compile may fail.")
-            else: # User pressed Enter
+            else:
                 print("INFO: Skipping 64-bit environment setup.")
-                print("         'torch.compile' may fail unless you are in the correct dev terminal.")
         
         except EOFError:
              print("\nINFO: No input received. Skipping 64-bit environment setup.")
         
         print("---" * 20)
 
-    # 4. If we have a valid path (from cache, auto-detect, or input), run it and set the environment
+    # 4. If we have a valid path, run it and set the environment
     if vcvars_path:
-        # Cache the valid path for next time, regardless of how we found it
         try:
             with open(CACHE_FILE, 'w') as f:
                 f.write(vcvars_path)
@@ -130,16 +123,10 @@ if os.name == 'nt':
 
             if not os.path.exists(vcvarsall_path):
                 print(f"❌ ERROR: 'vcvarsall.bat' not found in the same directory as 'vcvars64.bat'.")
-                print(f"  Looked for: {vcvarsall_path}")
                 raise FileNotFoundError("vcvarsall.bat not found")
 
-            # This command runs vcvarsall.bat x64, which sets up the env,
-            # then (&&) runs a python one-liner (using the *exact* python.exe path)
-            # to print that new environment as a JSON string.
-            # --- FIX: Add >NUL 2>&1 to redirect stdout and stderr ---
             cmd = f'"{vcvarsall_path}" x64 >NUL 2>&1 && echo ^"---ENV-JSON-START---^" && "{python_exe}" -c "import json, os; print(json.dumps(dict(os.environ)))"'
             
-            # Hide the command window
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             startupinfo.wShowWindow = subprocess.SW_HIDE
@@ -149,107 +136,109 @@ if os.name == 'nt':
                 capture_output=True,
                 text=True,
                 shell=True,
-                check=True, # This will raise CalledProcessError if it fails
+                check=True,
                 startupinfo=startupinfo,
                 encoding='utf-8',
                 errors='ignore',
-                cwd=vcvars_dir # Set CWD just in case
+                cwd=vcvars_dir
             )
             
             json_start = result.stdout.find("---ENV-JSON-START---")
             if json_start != -1:
-                # --- FIX: More robust JSON finding to skip control characters ---
                 raw_output_after_marker = result.stdout[json_start + len("---ENV-JSON-START---"):]
-                
-                # Find the first '{'
                 json_obj_start = raw_output_after_marker.find('{')
-                # Find the last '}'
                 json_obj_end = raw_output_after_marker.rfind('}')
                 
                 if json_obj_start != -1 and json_obj_end != -1 and json_obj_end > json_obj_start:
                     json_str = raw_output_after_marker[json_obj_start : json_obj_end + 1]
-                    
-                    # Now try to parse this cleaned string
                     try:
                         env_vars = json.loads(json_str)
-                        
-                        # ==========================================================
-                        # --- ❗️❗️❗️ BEGIN KEY FIX ❗️❗️❗️ ---
-                        # ==========================================================
-                        # We must use env_vars.get() to retrieve the new values
-                        # and only assign them to os.environ if they are not None.
-                        # This avoids the KeyError: 'LIB' when os.environ['LIB']
-                        # is used as a fallback but doesn't exist.
-
                         new_path = env_vars.get('PATH')
                         new_lib = env_vars.get('LIB')
                         new_include = env_vars.get('INCLUDE')
                         
-                        if new_path is not None:
-                            os.environ['PATH'] = new_path
-                        else:
-                            print("WARNING: 'PATH' not found in vcvarsall.bat output.")
-                            
-                        if new_lib is not None:
-                            os.environ['LIB'] = new_lib
-                        else:
-                            # This was the variable causing the KeyError.
-                            # Set it to an empty string if not provided by vcvarsall.
-                            print("INFO: 'LIB' not found in vcvarsall.bat output. Setting to empty string.")
-                            os.environ['LIB'] = "" 
-                            
-                        if new_include is not None:
-                            os.environ['INCLUDE'] = new_include
-                        else:
-                            # Also set INCLUDE to empty string just in case.
-                            print("INFO: 'INCLUDE' not found in vcvarsall.bat output. Setting to empty string.")
-                            os.environ['INCLUDE'] = ""
+                        if new_path is not None: os.environ['PATH'] = new_path
+                        if new_lib is not None: os.environ['LIB'] = new_lib
+                        else: os.environ['LIB'] = ""
+                        if new_include is not None: os.environ['INCLUDE'] = new_include
+                        else: os.environ['INCLUDE'] = ""
                         
-                        # ==========================================================
-                        # --- ❗️❗️❗️ END KEY FIX ❗️❗️❗️ ---
-                        # ==========================================================
-
                         print("INFO: 64-bit MSVC environment loaded successfully.")
                     except json.JSONDecodeError as json_e:
                         print(f"ERROR: Failed to parse the environment JSON. {json_e}")
-                        print("     --- Raw JSON String (cleaned) ---")
-                        print(json_str[:500] + "...") # Print start of what was parsed
-                        print("     --- Full stdout after marker ---")
-                        print(raw_output_after_marker[:500] + "...")
                 else:
-                    print(f"WARNING: Could not find valid JSON object markers '{{' and '}}' after '---ENV-JSON-START---'.")
-                    print("STDOUT after marker:", raw_output_after_marker)
+                    print(f"WARNING: Could not find valid JSON object markers.")
             else:
-                print(f"WARNING: Could not find JSON marker in vcvarsall.bat output. Compiler might still fail.")
-                print("STDOUT:", result.stdout)
-                print("STDERR:", result.stderr)
+                print(f"WARNING: Could not find JSON marker in vcvarsall.bat output.")
 
-        except subprocess.CalledProcessError as e:
-            print(f"ERROR: Failed to run vcvarsall.bat. torch.compile may fail.")
-            print(f"   Return Code: {e.returncode}")
-            print("   --- STDOUT ---")
-            print(e.stdout if e.stdout else "<No stdout>")
-            print("   --- STDERR ---")
-            print(e.stderr if e.stderr else "<No stderr>")
-            print("   --- End Output ---")
-            
-            # If the cached path failed, delete it so we ask again next time
-            if os.path.exists(CACHE_FILE):
-                print("INFO: Deleting bad cached path...")
-                try:
-                    os.remove(CACHE_FILE)
-                except Exception as del_e:
-                    print(f"WARNING: Could not delete cache file: {del_e}")
-                    
         except Exception as e:
-            # Catch other errors like file-not-found for subprocess itself or JSONDecodeError
             print(f"ERROR: An unexpected error occurred while trying to run vcvarsall.bat.")
             print(f"   Error: {e}")
-            print(f"   Error Type: {type(e)}") # Added type for debugging
-            traceback.print_exc(limit=2) # Print traceback for this
+            traceback.print_exc(limit=2)
         print("---" * 20)
 
-os.environ["TOKENIZERS_PARALLELISM"] = "true" 
+
+# --- Fix for Python Build Environment (Windows) ---
+# 1. Fix spaces in include paths (monkey-patch sysconfig).
+# 2. Fix missing python313.lib (add libs to LIB env var).
+import sysconfig
+import ctypes
+
+def _fix_python_build_environment_windows():
+    if os.name != 'nt': return
+    
+    try:
+        _GetShortPathNameW = ctypes.windll.kernel32.GetShortPathNameW
+        _GetShortPathNameW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+        _GetShortPathNameW.restype = ctypes.c_uint32
+
+        def get_short_path(path):
+            if not path or not os.path.exists(path): return path
+            buf_size = _GetShortPathNameW(path, None, 0)
+            if buf_size == 0: return path
+            buf = ctypes.create_unicode_buffer(buf_size)
+            _GetShortPathNameW(path, buf, buf_size)
+            return buf.value
+
+        # --- 1. Patch sysconfig for include paths ---
+        _original_get_path = sysconfig.get_path
+        _original_get_paths = sysconfig.get_paths
+
+        def _patched_get_path(name, scheme=sysconfig.get_default_scheme(), vars=None, expand=True):
+            path = _original_get_path(name, scheme, vars, expand)
+            if name in ('include', 'platinclude') and path:
+                return get_short_path(path)
+            return path
+
+        def _patched_get_paths(scheme=sysconfig.get_default_scheme(), vars=None, expand=True):
+            paths = _original_get_paths(scheme, vars, expand)
+            for key in ('include', 'platinclude'):
+                if key in paths and paths[key]:
+                    paths[key] = get_short_path(paths[key])
+            return paths
+
+        sysconfig.get_path = _patched_get_path
+        sysconfig.get_paths = _patched_get_paths
+        print("INFO: Patched sysconfig to use short paths for includes.")
+
+        # --- 2. Add 'libs' to LIB environment variable ---
+        # Windows Store Python often has libs in sys.exec_prefix (Program Files), 
+        # but the compiler might not find them, or spaces might be an issue.
+        exec_prefix_short = get_short_path(sys.exec_prefix)
+        libs_path = os.path.join(exec_prefix_short, 'libs')
+        
+        if os.path.exists(libs_path):
+            current_lib = os.environ.get('LIB', '')
+            os.environ['LIB'] = f"{libs_path};{current_lib}"
+            print(f"INFO: Added '{libs_path}' to LIB environment variable.")
+        else:
+            print(f"WARNING: Could not find libs path at '{libs_path}'")
+
+    except Exception as e:
+        print(f"WARNING: Failed to setup Python build environment: {e}")
+
+# Call it immediately
+_fix_python_build_environment_windows()
 
 import torch
 import torch.nn as nn
@@ -258,10 +247,22 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, IterableDataset
 from transformers import AutoTokenizer
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.serialization import safe_globals # May not be needed if not using legacy save/load
-# <<< NEW: Import gradient checkpointing >>>
+# Handle safe_globals compatibility (PyTorch 2.4+)
+try:
+    from torch.serialization import safe_globals
+except ImportError:
+    # Fallback for older PyTorch versions or if not exposed
+    import contextlib
+    @contextlib.contextmanager
+    def safe_globals(allowlist):
+        yield
+
+# Import signal for graceful shutdown
+import signal
+import traceback
+from torch.compiler import cudagraph_mark_step_begin
 from torch.utils.checkpoint import checkpoint
-# <<< END >>>
+
 
 
 # <<< NEW: Import Hugging Face datasets library >>>
@@ -282,7 +283,37 @@ except ImportError:
     print("Warning: 'peft' library not found. LoRA fine-tuning and merging will be unavailable.")
     _HAS_PEFT = False
 
-# <<< MODIFIED: Removed keyboard import >>>
+# --- Inductor Workarounds for Windows CPU ---
+if os.name == 'nt' and not torch.cuda.is_available():
+    print("INFO: Windows CPU detected. Applying Inductor config workarounds...")
+    import torch._inductor.config
+    torch._inductor.config.cpp_wrapper = False # Fixes AssertionError: buf72 in codegen and potential performance issues
+
+# --- DirectML Import (AMD GPU Acceleration on Windows) ---
+_HAS_DIRECTML = False
+try:
+    import torch_directml
+    _HAS_DIRECTML = True
+    # Don't print "found" yet to keep logs clean unless we actually use it
+except ImportError:
+    _HAS_DIRECTML = False
+
+# <<< MODIFICATION: Early check for DML flag in sys.argv >>>
+# We need to know this before setting up global optimizers/compilers
+_REQUESTED_DML = False
+if "--device" in sys.argv:
+    try:
+        _dev_idx = sys.argv.index("--device")
+        if _dev_idx + 1 < len(sys.argv) and sys.argv[_dev_idx+1].lower() in ['dml', 'directml']:
+            _REQUESTED_DML = True
+    except ValueError:
+        pass
+
+# --- Call MSVC Setup ONLY if NOT using DirectML and CUDA is available ---
+# We avoid this on DirectML to prevent the "zombie" compiler search.
+if not _REQUESTED_DML and os.name == 'nt':
+    setup_msvc_environment()
+
 
 # --- Optimizer Selection (Handles CUDA, bitsandbytes, and CPU fallback) ---
 _HAS_BNB = False # Default assumption
@@ -297,24 +328,32 @@ try:
     _torch_amp_available = True
 except ImportError:
     try:
-        # Fallback for older PyTorch versions (requires CUDA context, but import might work)
+        # Fallback for older PyTorch versions
         from torch.cuda.amp import GradScaler, autocast
         print("INFO: torch.cuda.amp (autocast/GradScaler) found.")
         _torch_amp_available = True
     except ImportError:
         print("Warning: torch.amp and torch.cuda.amp not found.")
         _torch_amp_available = False
-        # --- Define dummy autocast if import failed ---
         import contextlib
         @contextlib.contextmanager
-        def autocast(device_type, enabled=True, dtype=None): # Match signature
-            # print("Warning: Using dummy autocast context manager.") # Optional: uncomment for debugging
+        def autocast(device_type, enabled=True, dtype=None):
             yield
-        # GradScaler is only needed if _HAS_AMP is True later, so no dummy needed now
 
-# --- Now, determine optimizer and final AMP status based on CUDA ---
-if torch.cuda.is_available():
-    # Attempt to use bitsandbytes 8-bit AdamW if available
+# --- Now, determine optimizer and final AMP status based on device ---
+# <<< MODIFICATION: Only enter this block if DML was explicitly requested >>>
+if _HAS_DIRECTML and _REQUESTED_DML:
+    # DirectML explicitly requested
+    print("INFO: DirectML requested and found. Using standard torch.optim.AdamW optimizer.")
+    ADAM_OPTIMIZER = torch.optim.AdamW
+    _HAS_BNB = False
+    
+    # DirectML has limited AMP support - disable for stability as requested
+    _HAS_AMP = False
+    print("INFO: AMP support is DISABLED for DirectML (stability fix).")
+        
+elif torch.cuda.is_available():
+    # CUDA detected - attempt to use bitsandbytes
     try:
         import bitsandbytes as bnb
         ADAM_OPTIMIZER = bnb.optim.AdamW8bit
@@ -325,31 +364,37 @@ if torch.cuda.is_available():
         print("INFO: Falling back to standard torch.optim.AdamW optimizer.")
         ADAM_OPTIMIZER = torch.optim.AdamW
         _HAS_BNB = False
-
-    # Check if the actual AMP components were successfully imported earlier
+    
     if _torch_amp_available:
         _HAS_AMP = True
         print("INFO: AMP support is enabled (CUDA available).")
     else:
         _HAS_AMP = False
         print("Warning: AMP support is disabled (torch.amp/torch.cuda.amp import failed).")
-
-else: # No CUDA detected
-    print("Warning: CUDA not detected. Using CPU training.")
-    print("INFO: Falling back to standard torch.optim.AdamW optimizer (bitsandbytes requires CUDA).")
+        
+else:
+    # CPU fallback (Default behavior if DML not requested and no CUDA)
+    print("INFO: Using CPU training (CUDA not found or not selected).")
     ADAM_OPTIMIZER = torch.optim.AdamW
     _HAS_BNB = False
-    _HAS_AMP = False # AMP not usable on CPU
+    _HAS_AMP = False
     if _torch_amp_available:
-        # This case means torch.amp was importable but we are on CPU
         print("INFO: AMP components found but disabled (running on CPU).")
-    # If _torch_amp_available is False, the warning about dummy autocast will show if used
-
 
 # --- END Optimizer Selection ---
 
 
+
 # --- C++ Kernel Import ---
+_HAS_KERNEL = False
+_HAS_VULKAN = False
+
+# Disable custom kernels if DirectML is present to avoid incompatibility
+# We allow kernel import even if DirectML is present, to support mixed environments (e.g. CUDA + DML installed).
+# Runtime checks will prevent using kernels on DML devices if incompatible.
+# We allow kernel import even if DirectML is present, to support mixed environments (e.g. CUDA + DML installed).
+# Runtime checks will prevent using kernels on DML devices if incompatible.
+# (Logic moved to main() and QuantizedHierarchos)
 try:
     import hierarchos_matmul
     _HAS_KERNEL = True
@@ -361,18 +406,8 @@ try:
         print("INFO: Vulkan support is disabled in the compiled kernel.")
         _HAS_VULKAN = False
 except ImportError:
-    print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-    print("!!! WARNING: The compiled C++ kernel 'hierarchos_matmul' was not found.       !!!")
-    print("!!!          Quantization and quantized inference will be unavailable.     !!!")
-    print("!!!                                                                       !!!")
-    print("!!! To enable these features, please run the appropriate setup script:    !!!")
-    print("!!!  - On Windows:   Run setup.bat                                        !!!")
-    print("!!!  - On Linux/macOS: Run bash setup.sh                                    !!!")
-    print("!!!                                                                       !!!")
-    print("!!! Make sure you have CMake and a C++ compiler installed.                 !!!")
-    print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-    _HAS_KERNEL = False
-    _HAS_VULKAN = False
+    print("Warning: 'hierarchos_matmul' not found. Quantization disabled.")
+
 
 
 # --- CONSTANTS ---
@@ -389,13 +424,30 @@ class AttrDict(dict):
 
 
 # --- Device Utilities ---
-def pick_device():
+def pick_device(args=None):
     """Picks the best available device for PyTorch training."""
+    # Check CLI args first if provided
+    if args and hasattr(args, 'device') and args.device:
+        if args.device in ['dml', 'directml']:
+            if _HAS_DIRECTML: 
+                print("INFO: User explicitly requested DirectML.")
+                return torch_directml.device()
+            else: 
+                print("Warning: DirectML requested but torch-directml not available. Falling back to auto-detect.")
+        elif args.device == 'cuda':
+            if torch.cuda.is_available(): 
+                return torch.device("cuda")
+            else: 
+                print("Warning: CUDA requested but not available. Falling back to auto-detect.")
+        elif args.device == 'cpu':
+            return torch.device("cpu")
+    
+    # Auto-detection priority: CUDA -> CPU (DML is now OPT-IN only)
     if torch.cuda.is_available():
         return torch.device("cuda")
-    # Commenting out MPS check for stability, can be re-enabled if needed
-    # if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    #      return torch.device("mps")
+    
+    # Note: We do NOT return torch_directml.device() here automatically anymore.
+    
     return torch.device("cpu")
 
 def set_threads(n: int):
@@ -404,6 +456,20 @@ def set_threads(n: int):
         os.environ['OMP_NUM_THREADS'] = str(n)
     except Exception as e:
         print(f"Warning: Could not set thread count. {e}")
+
+def is_directml_device(device):
+    """Check if a device is DirectML."""
+    if _HAS_DIRECTML:
+        return isinstance(device, type(torch_directml.device()))
+    return False
+
+def get_device_type(device):
+    """Get normalized device type string for compatibility checks."""
+    if is_directml_device(device):
+        return 'dml'
+    elif isinstance(device, torch.device):
+        return device.type
+    return str(device)
 
 
 # --- Dataset & Dataloader ---
@@ -531,6 +597,8 @@ def create_dataloader_for_chunked(path, max_length, batch_size, num_workers=0):
             "attention_mask": attention_mask_batch
         }
 
+    # DirectML doesn't support pin_memory in the same way as CUDA
+    # Only enable pin_memory for actual CUDA devices
     pin_memory = torch.cuda.is_available() and num_workers > 0
     # persistent_workers is generally recommended with num_workers > 0
     # It avoids worker startup overhead for each epoch.
@@ -713,6 +781,7 @@ def create_dataloader_pt_chunked(directory_path, max_length, batch_size, num_wor
             "attention_mask": attention_mask_batch
         }
 
+    # DirectML doesn't support pin_memory in the same way as CUDA
     pin_memory = torch.cuda.is_available() and num_workers > 0
     persistent_workers = num_workers > 0
 
@@ -1029,6 +1098,7 @@ def create_map_style_dataloader(
         pad_token_id=pad_token_id
     )
 
+    # DirectML doesn't support pin_memory in the same way as CUDA
     pin_memory = torch.cuda.is_available() and num_workers > 0
     persistent_workers = num_workers > 0
     return DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn_with_padding, shuffle=shuffle,
@@ -1443,16 +1513,28 @@ class LTMModule(nn.Module):
         self.register_buffer("timestamps", torch.zeros(n_slots, dtype=torch.float32))
         self.register_buffer("sources", torch.full((n_slots,), self.SRC_UNKNOWN, dtype=torch.long))
 
-        # Buffer for accumulating deltas if not updating in-place
-        self.register_buffer("ltm_deltas", torch.zeros_like(self.vals.data))
-        self.accumulate_deltas = False
+        # Buffer for neg_inf to avoid creation in hot loop
+        self.register_buffer("neg_inf", torch.tensor(-float('inf')), persistent=False)
+
+        # <<< FIX: Pre-allocate buffers for update calculations >>>
+        self.register_buffer("update_counts", torch.zeros(n_slots, dtype=torch.float32), persistent=False)
+        self.register_buffer("update_slots", torch.zeros(n_slots, val_dim, dtype=torch.float32), persistent=False)
 
     def reset_working_memory(self):
         """Zeros out the Fast State (Working Memory) and associated momentum buffers."""
-        self.fast_vals.zero_()
-        self._mom_vals.zero_()
-        self.timestamps.zero_() # Reset timestamps
-        self.sources.fill_(self.SRC_UNKNOWN) # Reset sources
+        # ZLUDA Fix: Avoid in-place fill_ and direct device creation
+        device = self.fast_vals.device
+        
+        # Create zeros on CPU and move to device to avoid ZLUDA cuRAND/creation issues
+        zeros_vals = torch.zeros(self.fast_vals.shape, dtype=self.fast_vals.dtype, device='cpu').to(device)
+        self.fast_vals.copy_(zeros_vals)
+        self._mom_vals.copy_(zeros_vals) # Same shape/dtype
+        
+        zeros_ts = torch.zeros(self.timestamps.shape, dtype=self.timestamps.dtype, device='cpu').to(device)
+        self.timestamps.copy_(zeros_ts)
+        
+        sources_init = torch.full(self.sources.shape, self.SRC_UNKNOWN, dtype=self.sources.dtype, device='cpu').to(device)
+        self.sources.copy_(sources_init)
 
     def get_effective_memory(self):
         """Returns the combined memory (Slow + Fast)."""
@@ -1471,7 +1553,13 @@ class LTMModule(nn.Module):
                     valid_mask &= (self.sources == source_filter)
 
                 sim = torch.nan_to_num(sim, nan=-torch.inf, posinf=torch.finfo(sim.dtype).max, neginf=-torch.inf)
-                sim[:, ~valid_mask] = -torch.inf
+                # FIX: Use torch.where instead of in-place indexing to avoid DirectML scatter error
+                # Mask out invalid slots (similarity -> -inf)
+                # Use pre-registered neg_inf to avoid device sync/creation overhead
+                if not hasattr(self, 'neg_inf'):
+                     self.register_buffer("neg_inf", torch.tensor(-float('inf'), device=self.vals.device))
+                
+                sim = torch.where(valid_mask, sim, self.neg_inf)
 
         num_valid_slots_per_query = sim.isfinite().sum(dim=-1)
         num_valid_slots = num_valid_slots_per_query.min().item()
@@ -1487,18 +1575,50 @@ class LTMModule(nn.Module):
                     torch.zeros(idx_shape, device=queries.device, dtype=torch.float32))
 
         # Get top-k indices and values (sim scores)
-        sim_topk, idx = torch.topk(sim, k=effective_topk, dim=-1)
-
-        # <<< FIX: Proper Gradient Flow through Attention-Weighted Retrieval >>>
+        # FIX: Detach sim before topk to avoid 'scatter' in backward pass of topk
+        # We will re-gather the values using our safe matmul approach so gradients still flow.
+        sim_detached = sim.detach()
+        _, idx = torch.topk(sim_detached, k=effective_topk, dim=-1)
+        
+        # Now gather sim_topk using safe matmul
+        # idx: [B, T, K]
+        # sim: [B, T, Slots]
+        
+        # Reuse the one-hot logic we need for vals anyway
+        # We can do it once for both sim and vals if we structure it right.
+        
         # Use provided fast_vals if available (for differentiable training), else use buffer
         current_fast_vals = fast_vals if fast_vals is not None else self.fast_vals
         effective_memory = self.vals + current_fast_vals
         
-        # Gather values using indices: [..., effective_topk, val_dim]
-        # Use advanced indexing which maintains gradients
-        batch_shape = list(idx.shape[:-1])
-        idx_clamped = idx.clamp(min=0, max=effective_memory.shape[0]-1)
-        gathered_vals = effective_memory[idx_clamped]  # This creates a differentiable path
+        # Clamp indices to valid range (just in case)
+        effective_memory_size = self.vals.shape[0] # Slots
+        idx_clamped = idx.clamp(min=0, max=effective_memory_size-1)
+        
+        batch_shape = idx_clamped.shape
+        flat_idx = idx_clamped.view(-1)
+        
+        # Manual one-hot: [..., K, Slots]
+        num_classes = effective_memory_size
+        
+        # FIX: Revert to manual broadcasting for DirectML safety (F.one_hot crashes)
+        # Create range tensor with shape [1, ..., 1, Slots] matching idx rank
+        range_tensor = torch.arange(num_classes, device=flat_idx.device)
+        # Reshape range_tensor to [1] * idx.ndim + [-1]
+        view_shape = [1] * idx.ndim + [-1]
+        range_tensor = range_tensor.view(*view_shape)
+        
+        one_hot = (idx_clamped.unsqueeze(-1) == range_tensor).to(dtype=sim.dtype) # [..., K, Slots]
+        
+        # Gather sim_topk
+        # sim: [..., Slots] -> [..., 1, Slots]
+        sim_expanded = sim.unsqueeze(-2)
+        sim_topk = (one_hot * sim_expanded).sum(dim=-1) # [..., K]
+        
+        # Gather vals
+        # effective_memory: [Slots, ValDim]
+        # [..., K, Slots] @ [Slots, ValDim] -> [..., K, ValDim]
+        gathered_vals = torch.matmul(one_hot, effective_memory)
         
         # Compute attention weights from similarity scores
         attn_weights = F.softmax(sim_topk, dim=-1)  # [..., effective_topk]
@@ -1508,27 +1628,35 @@ class LTMModule(nn.Module):
             attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
         
         # Weighted values: [..., effective_topk, val_dim]
-        # Gradients flow through BOTH gathered_vals (to memory) AND attn_weights (to keys/queries)
-        weighted_vals = gathered_vals * attn_weights.unsqueeze(-1)
+        # attn_weights: [..., effective_topk] -> [..., effective_topk, 1]
+        # gathered_vals: [..., effective_topk, val_dim]
+        weighted_vals = gathered_vals * attn_weights.unsqueeze(-1) # Element-wise multiplication, NO SUM
         
-        # Gather timestamps
-        ts_retrieved = self.timestamps[idx_clamped]
+        # Ensure contiguous
+        weighted_vals = weighted_vals.contiguous()
+        
+        # Gather timestamps (No gradients needed here, but use matmul for consistency/safety)
+        # timestamps: [Slots] -> [Slots, 1]
+        # [..., K, Slots] @ [Slots, 1] -> [..., K, 1]
+        flat_ts = torch.matmul(one_hot, self.timestamps.unsqueeze(1)).squeeze(-1)
+        ts_retrieved = flat_ts # [..., K]
 
         # Handle padding if needed
         if effective_topk < topk:
             pad_size = topk - effective_topk
+            batch_shape_list = list(batch_shape[:-1])
             
             # Pad indices
-            idx_pad = torch.full(batch_shape + [pad_size], -1, device=idx.device, dtype=idx.dtype)
+            idx_pad = torch.full(batch_shape_list + [pad_size], -1, device=idx.device, dtype=idx.dtype)
             idx_ret = torch.cat([idx, idx_pad], dim=-1)
             
             # Pad weighted values
-            vals_pad = torch.zeros(batch_shape + [pad_size, weighted_vals.shape[-1]], 
-                                  device=weighted_vals.device, dtype=weighted_vals.dtype)
+            vals_pad = torch.zeros(batch_shape_list + [pad_size, weighted_vals.shape[-1]], 
+                                   device=weighted_vals.device, dtype=weighted_vals.dtype)
             vals_ret = torch.cat([weighted_vals, vals_pad], dim=-2)
             
             # Pad timestamps
-            ts_pad = torch.zeros(batch_shape + [pad_size], 
+            ts_pad = torch.zeros(batch_shape_list + [pad_size], 
                                device=ts_retrieved.device, dtype=ts_retrieved.dtype)
             ts_ret = torch.cat([ts_retrieved, ts_pad], dim=-1)
             
@@ -1538,10 +1666,12 @@ class LTMModule(nn.Module):
 
     def inner_update(self, topk_idx: torch.LongTensor, grads_tensor: torch.Tensor, current_lr: float, timestamp: float, 
                     source: int = SRC_USER_INTERACTION, tokens_covered: int = None,
-                    fast_vals: Optional[torch.Tensor] = None, mom_vals: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+                    fast_vals: Optional[torch.Tensor] = None, mom_vals: Optional[torch.Tensor] = None,
+                    inplace: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Performs a Fast Weight Associative Update (Titans Style).
-        RETURNS the new state (fast_vals, mom_vals) instead of modifying in-place.
+        If inplace=True, modifies fast_vals and mom_vals in-place (if they are provided or self buffers).
+        Returns the new state (fast_vals, mom_vals).
         """
         # If no state provided, use buffers (but treat as starting point)
         curr_fast = fast_vals if fast_vals is not None else self.fast_vals
@@ -1563,29 +1693,56 @@ class LTMModule(nn.Module):
             return curr_fast, curr_mom
         
         grads_flat = grads_tensor[valid_mask].view(-1, self.vals.size(1))
+        grads_flat = grads_flat.contiguous()
 
-        # Aggregate gradients
-        counts = torch.zeros(self.vals.size(0), device=device)
-        counts.index_add_(0, idx_flat.to(device), torch.ones_like(idx_flat, dtype=torch.float, device=device))
+        # Aggregate gradients using Matmul (safer for DirectML)
+        # Manual one-hot: [N, Slots]
+        num_classes = self.vals.size(0)
         
-        slot_grads = torch.zeros_like(self.vals.data)
-        slot_grads.index_add_(0, idx_flat.to(device), grads_flat.to(device))
+        # FIX: Revert to manual broadcasting
+        range_tensor = torch.arange(num_classes, device=device).unsqueeze(0)
+        one_hot = (idx_flat.unsqueeze(1) == range_tensor).to(dtype=grads_flat.dtype) # [N, Slots]
+        
+        # Counts: [Slots]
+        # Sum over N (dim 0 of one_hot)
+        # <<< FIX: Use pre-allocated buffer >>>
+        torch.sum(one_hot, dim=0, out=self.update_counts)
+        counts = self.update_counts
+        
+        # Slot grads: [Slots, ValDim]
+        # <<< FIX: Use pre-allocated buffer >>>
+        torch.matmul(one_hot.t(), grads_flat.to(device), out=self.update_slots)
+        slot_grads = self.update_slots
+        
+        # FIX: Avoid in-place indexing for normalization
+        # slot_grads[nonzero_mask] /= counts[nonzero_mask].unsqueeze(-1)
+        
+        # Safe division:
+        div = counts.unsqueeze(-1)
+        # Avoid division by zero by replacing 0 with 1
+        div_safe = torch.where(div > 0, div, torch.ones_like(div))
+        slot_grads = slot_grads / div_safe
         
         nonzero_mask = counts > 0
-        if nonzero_mask.any():
-            slot_grads[nonzero_mask] /= counts[nonzero_mask].unsqueeze(-1)
 
-        # --- TITANS UPDATE LOGIC (FUNCTIONAL) ---
+        # --- TITANS UPDATE LOGIC (FUNCTIONAL OR IN-PLACE) ---
         # 1. Momentum
         # new_mom = curr_mom * momentum + slot_grads
-        new_mom = curr_mom * self.momentum + slot_grads
-        # Clamp Momentum
-        new_mom = torch.clamp(new_mom, min=-50.0, max=50.0)
+        if inplace:
+            # In-place momentum update: mom = mom * momentum + grads
+            curr_mom.mul_(self.momentum).add_(slot_grads)
+            # Clamp Momentum
+            curr_mom.clamp_(min=-50.0, max=50.0)
+            new_mom = curr_mom
+        else:
+            new_mom = curr_mom * self.momentum + slot_grads
+            # Clamp Momentum
+            new_mom = torch.clamp(new_mom, min=-50.0, max=50.0)
         
         # 2. Compute Update
-        update_delta = (new_mom + self.weight_decay * curr_fast)
-        update_step = update_delta * (-current_lr)
-
+        # update_delta = (new_mom + self.weight_decay * curr_fast)
+        # update_step = update_delta * (-current_lr)
+        
         # 3. Apply Scaled Decay
         if tokens_covered is None:
             tokens_covered = self.reference_chunk_len
@@ -1593,19 +1750,52 @@ class LTMModule(nn.Module):
         decay_scaler = tokens_covered / float(self.reference_chunk_len)
         retention_rate = (1.0 - self.forget_rate) ** decay_scaler
         
-        # Apply decay to current state
-        decayed_fast = curr_fast * retention_rate
+        if inplace:
+            # Let's stick to the logic:
+            # 1. Compute update_step (dense)
+            # update_step = new_mom.add(curr_fast, alpha=self.weight_decay).mul_(-current_lr)
+            
+            # We can reuse `self.update_slots` for `update_step`.
+            # `new_mom` depends on `slot_grads`. We updated `new_mom` (curr_mom) in-place.
+            # So `slot_grads` data is already consumed into `curr_mom`.
+            # So we can reuse `self.update_slots` for `update_step`.
+            
+            self.update_slots.copy_(new_mom)
+            self.update_slots.add_(curr_fast, alpha=self.weight_decay)
+            self.update_slots.mul_(-current_lr)
+            
+            # 2. Decay curr_fast in-place
+            curr_fast.mul_(retention_rate)
+            
+            # 3. Apply update_step masked
+            nonzero_mask_expanded = nonzero_mask.unsqueeze(-1).expand_as(curr_fast)
+            self.update_slots.masked_fill_(~nonzero_mask_expanded, 0.0)
+            
+            curr_fast.add_(self.update_slots)
+            
+            # Clamp
+            curr_fast.clamp_(min=-20.0, max=20.0)
+            
+            new_fast = curr_fast
 
-        # 4. Apply update
-        # We need to apply update_step only to nonzero slots
-        # Create a mask for update
-        update_mask = torch.zeros_like(decayed_fast)
-        update_mask[nonzero_mask] = update_step[nonzero_mask]
-        
-        new_fast = decayed_fast + update_mask
+        else:
+            # Original functional logic
+            update_delta = (new_mom + self.weight_decay * curr_fast)
+            update_step = update_delta * (-current_lr)
+
+            # Apply decay to current state
+            decayed_fast = curr_fast * retention_rate
+
+            # 4. Apply update
+            update_mask = torch.zeros_like(decayed_fast)
+            nonzero_mask_expanded = nonzero_mask.unsqueeze(-1).expand_as(update_mask)
+            update_mask = torch.where(nonzero_mask_expanded, update_step, update_mask)
+            
+            new_fast = decayed_fast + update_mask
 
         # Clamp fast_vals
-        new_fast = torch.clamp(new_fast, min=-20.0, max=20.0)
+        if not inplace: # Already clamped if inplace
+            new_fast = torch.clamp(new_fast, min=-20.0, max=20.0)
 
         # --- UPDATE METADATA (Side Effect - still in-place for now as it's not differentiable) ---
         # Timestamps and sources are not part of the gradient graph usually
@@ -1616,10 +1806,12 @@ class LTMModule(nn.Module):
         return new_fast, new_mom
 
     def update_memory_hebbian(self, topk_idx: torch.LongTensor, keys: torch.Tensor, vals: torch.Tensor, current_lr: float, timestamp: float, 
-                              source: int = SRC_USER_INTERACTION, fast_vals: Optional[torch.Tensor] = None) -> torch.Tensor:
+                              source: int = SRC_USER_INTERACTION, tokens_covered: int = None, fast_vals: Optional[torch.Tensor] = None,
+                              inplace: bool = False) -> torch.Tensor:
         """
         Performs a Hebbian-style associative update.
-        RETURNS new fast_vals.
+        If inplace=True, modifies fast_vals in-place.
+        Returns new fast_vals.
         """
         curr_fast = fast_vals if fast_vals is not None else self.fast_vals
         
@@ -1630,21 +1822,51 @@ class LTMModule(nn.Module):
         
         vals_flat = vals[valid_mask].view(-1, self.vals.size(1))
         
-        # Aggregate updates
-        counts = torch.zeros(self.vals.size(0), device=self.vals.device)
-        counts.index_add_(0, idx_flat, torch.ones_like(idx_flat, dtype=torch.float))
+        # Aggregate updates using Matmul (safer for DirectML than index_add_)
+        # Manual one-hot: [N, Slots]
+        num_classes = self.vals.size(0)
         
-        slot_updates = torch.zeros_like(self.vals.data)
-        slot_updates.index_add_(0, idx_flat, vals_flat)
+        # FIX: Revert to manual broadcasting
+        range_tensor = torch.arange(num_classes, device=self.vals.device).unsqueeze(0)
+        one_hot = (idx_flat.unsqueeze(1) == range_tensor).to(dtype=vals_flat.dtype) # [N, Slots]
+        
+        # Counts: [Slots]
+        # Sum over N (dim 0 of one_hot)
+        counts = one_hot.sum(dim=0)
+        
+        # Slot updates: [Slots, ValDim]
+        # [Slots, N] @ [N, ValDim] -> [Slots, ValDim]
+        slot_updates = torch.matmul(one_hot.t(), vals_flat)
+        
+        # FIX: Avoid in-place indexing for normalization
+        # slot_updates[nonzero_mask] /= counts[nonzero_mask].unsqueeze(-1)
+        
+        # Safe division:
+        div = counts.unsqueeze(-1)
+        # Avoid division by zero by replacing 0 with 1 (slot_updates is 0 there anyway)
+        div_safe = torch.where(div > 0, div, torch.ones_like(div))
+        slot_updates = slot_updates / div_safe
         
         nonzero_mask = counts > 0
-        if nonzero_mask.any():
-            slot_updates[nonzero_mask] /= counts[nonzero_mask].unsqueeze(-1)
         
+        # --- Apply Scaled Decay (Match inner_update logic) ---
+        if tokens_covered is None:
+            tokens_covered = 1 # Default for inference/single-step
+        
+        decay_scaler = tokens_covered / float(self.reference_chunk_len)
+        retention_rate = (1.0 - self.forget_rate) ** decay_scaler
+
         # Apply update
-        # new_fast = curr_fast + slot_updates * current_lr
-        new_fast = curr_fast + slot_updates * current_lr
-        new_fast = torch.clamp(new_fast, min=-20.0, max=20.0)
+        # new_fast = curr_fast * retention_rate + slot_updates * current_lr
+        if inplace:
+            # In-place update
+            curr_fast.mul_(retention_rate)
+            curr_fast.add_(slot_updates, alpha=current_lr)
+            curr_fast.clamp_(min=-20.0, max=20.0)
+            new_fast = curr_fast
+        else:
+            new_fast = curr_fast * retention_rate + slot_updates * current_lr
+            new_fast = torch.clamp(new_fast, min=-20.0, max=20.0)
         
         # Update metadata (non-differentiable side effect)
         with torch.no_grad():
@@ -1653,14 +1875,90 @@ class LTMModule(nn.Module):
             
         return new_fast
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import math
-from torch.utils.checkpoint import checkpoint
 
-# Assuming AttrDict and LTMModule are imported or defined elsewhere
-# from your_utils import AttrDict, LTMModule
+
+
+class DirectMLAdamW(torch.optim.Optimizer):
+    """
+    A DirectML-optimized AdamW implementation that avoids 'lerp' and 'foreach' operations
+    which are known to cause CPU fallbacks and performance issues on DirectML.
+    """
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2):
+        if not 0.0 <= lr:
+            raise ValueError("Invalid learning rate: {}".format(lr))
+        if not 0.0 <= eps:
+            raise ValueError("Invalid epsilon value: {}".format(eps))
+        if not 0.0 <= betas[0] < 1.0:
+            raise ValueError("Invalid beta parameter at index 0: {}".format(betas[0]))
+        if not 0.0 <= betas[1] < 1.0:
+            raise ValueError("Invalid beta parameter at index 1: {}".format(betas[1]))
+        if not 0.0 <= weight_decay:
+            raise ValueError("Invalid weight_decay value: {}".format(weight_decay))
+        
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        super(DirectMLAdamW, self).__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group['lr']
+            beta1, beta2 = group['betas']
+            eps = group['eps']
+            weight_decay = group['weight_decay']
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                
+                # Perform optimization step
+                grad = p.grad
+                if grad.is_sparse:
+                    raise RuntimeError('DirectMLAdamW does not support sparse gradients')
+
+                state = self.state[p]
+
+                # State initialization
+                if len(state) == 0:
+                    state['step'] = 0
+                    # Exponential moving average of gradient values
+                    state['exp_avg'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    # Exponential moving average of squared gradient values
+                    state['exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+
+                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
+                state['step'] += 1
+                step = state['step']
+
+                # Weight decay
+                if weight_decay != 0:
+                    # p.data.mul_(1 - lr * weight_decay) # Standard AdamW decay
+                    # Use add for safety: p = p - p * lr * wd
+                    p.data.add_(p.data, alpha=-lr * weight_decay)
+
+                # Decay the first and second moment running average coefficient
+                # exp_avg = beta1 * exp_avg + (1 - beta1) * grad
+                # Avoid lerp: exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                
+                # exp_avg_sq = beta2 * exp_avg_sq + (1 - beta2) * (grad ** 2)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+                
+                # Bias correction
+                bias_correction1 = 1 - beta1 ** step
+                bias_correction2 = 1 - beta2 ** step
+                
+                denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(eps)
+                
+                step_size = lr / bias_correction1
+                
+                p.data.addcdiv_(exp_avg, denom, value=-step_size)
+
+        return loss
 
 class HierarchosCore(nn.Module):
     """
@@ -1703,6 +2001,10 @@ class HierarchosCore(nn.Module):
 
         if 'commitment_threshold' not in self.config:
             self.config['commitment_threshold'] = 0.05 
+
+        # CPU Optimization: Flush Denormals to Zero (Global Fix)
+        if not torch.cuda.is_available():
+             torch.set_flush_denormal(True)
 
         self.tok_emb = nn.Embedding(self.config.vocab_size, self.config.context_dim)
         
@@ -1761,9 +2063,30 @@ class HierarchosCore(nn.Module):
 
         # Keep torch.compile
         if self.config.get('compile', False):
+            # Check for DirectML (doesn't support torch.compile)
+            # Try to get device from config if not yet on self.device (which is set by .to(device) later usually?)
+            # Actually nn.Module doesn't have .device property by default.
+            # We should check self.config['device'] if available or assume cpu/cuda based on availability?
+            # But the user passes device to .to(device).
+            # Let's try to infer from parameters if they are already moved? No, .to() happens after init.
+            # So we rely on config or default to 'cpu' if not specified.
+            
+            # Better: Check if 'device' is in config
+            config_device = self.config.get('device', 'cpu')
+            if isinstance(config_device, torch.device):
+                device_type = config_device.type
+            else:
+                device_type = str(config_device)
+                if ':' in device_type: device_type = device_type.split(':')[0]
+            
+            if device_type == 'dml' or is_directml_device(torch.device(device_type) if device_type != 'unknown' else None):
+                print("INFO: DirectML detected - torch.compile is not supported.")
+                print("      Automatically disabling compilation. Training will use eager mode.")
+                print("      (torch.compile works normally on CUDA and CPU)")
+                self.config['compile'] = False
             # Check for Windows CPU + Compile (Known Hang Issue)
             # Allow override with --force-compile
-            if os.name == 'nt' and not torch.cuda.is_available() and not self.config.get('force_compile', False):
+            elif os.name == 'nt' and device_type == 'cpu' and not self.config.get('force_compile', False):
                 print("WARNING: torch.compile on Windows CPU is known to hang with complex RNN loops.")
                 print("         Disabling compilation for the Worker Loop to ensure stability.")
                 print("         Use --force-compile to override this safety check.")
@@ -1772,11 +2095,20 @@ class HierarchosCore(nn.Module):
                 try:
                     if hasattr(torch, "compile"):
                         print("INFO: --compile flag set. Applying torch.compile to Worker (L-RNN) loop...")
+                        
+                        # Dynamic shapes can cause instability/hangs on Windows CPU with Inductor
+                        use_dynamic = True
+                        # Robust check for Windows CPU
+                        if os.name == 'nt' and (device_type == 'cpu' or device_type == 'unknown'):
+                            print(f"INFO: Device type detected as '{device_type}'. Keeping dynamic shapes ENABLED (User Override).")
+                            use_dynamic = True
+
+                        compile_options = {"triton.cudagraphs": False} if device_type == 'cuda' else {}
                         self._worker_loop = torch.compile(
                             self._worker_loop,
-                            dynamic=True,
+                            dynamic=use_dynamic,
                             fullgraph=False,   
-                            options={"triton.cudagraphs": False}
+                            options=compile_options
                         )
                 except Exception as e:
                     print(f"WARNING: torch.compile failed ({e}) -- falling back to eager mode")
@@ -1847,10 +2179,9 @@ class HierarchosCore(nn.Module):
                 hinge_cost = torch.clamp(hinge_cost, max=100.0)
                 drift_costs.append(hinge_cost)
                 
-                # Convergence check REMOVED for torch.compile stability on Windows
-                # Dynamic control flow (break) causes issues with Inductor on CPU
-                # if torch.mean(torch.abs(drift_delta)) < self.config.l_conv_atol:
-                #    break
+                # Convergence check RESTORED for dynamic compute
+                if torch.mean(torch.abs(drift_delta)) < self.config.l_conv_atol:
+                   break
                 dynamic_context = static_context + current_drift
                 l_input_vec = torch.cat([current_enc, dynamic_context], dim=-1)
                 l_input = self.l_input_proj(l_input_vec)
@@ -1860,6 +2191,12 @@ class HierarchosCore(nn.Module):
         # timestep=0 indicates commitment step (vs negative timesteps for pondering)
         # We pass the actual timestep if provided, otherwise default to 0 (commitment)
         ts = timestep if timestep is not None else 0
+        
+        # Recalculate l_input with final drift (Match Inference Logic)
+        dynamic_context = static_context + current_drift
+        l_input_vec = torch.cat([current_enc, dynamic_context], dim=-1)
+        l_input = self.l_input_proj(l_input_vec)
+        
         final_l_out, next_l_state = self.l_rnn(l_input, l_state, timestep=ts)
         
         # <<< FIX: Clamp next_l_state to prevent numerical instability >>>
@@ -1881,8 +2218,12 @@ class HierarchosCore(nn.Module):
         B, T = input_ids.shape
         device = input_ids.device
 
+        # Reverted to standard embedding for better memory usage
         x = self.tok_emb(input_ids)
 
+        # ==================================================================
+        # 1. STATE INITIALIZATION (With Context Recovery)
+        # ==================================================================
         # ==================================================================
         # 1. STATE INITIALIZATION (With Context Recovery)
         # ==================================================================
@@ -1894,19 +2235,29 @@ class HierarchosCore(nn.Module):
             prev_context = torch.zeros(B, self.config.context_dim, device=device)
             target_context = torch.zeros(B, self.config.context_dim, device=device)
         else:
+            # FIX: Ensure state is on the correct device (it comes from CPU in training loop)
+            h_state = h_state.to(device)
+            
             # RECOVERY: If RNN state exists but context states are None (e.g., fresh start from load),
             # derive valid contexts from the hidden state to prevent "teleportation shock".
             if prev_context is None:
                 restored_ctx = self.h_to_context(h_state[:, :, 0])
                 prev_context = restored_ctx
+            else:
+                prev_context = prev_context.to(device)
+                
             if target_context is None:
                 # If we don't have a target, assume the current state IS the target
                 restored_ctx = self.h_to_context(h_state[:, :, 0])
                 target_context = restored_ctx
+            else:
+                target_context = target_context.to(device)
 
         if l_state is None:
             l_state = torch.zeros(B, self.config.l_hidden, 5, device=device)
             l_state[:, :, 3] = -1e30
+        else:
+            l_state = l_state.to(device)
 
         # Drift state is now derived from l_state, so we don't need to persist it explicitly
         # but we keep the argument for backward compatibility (it will be ignored/overwritten)
@@ -1952,7 +2303,9 @@ class HierarchosCore(nn.Module):
             pe = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
             if self.config.ltm_val_dim % 2 == 1: pe = torch.cat([pe, torch.zeros_like(pe[..., :1])], dim=-1)
             topk_vals = topk_vals + pe
-            gate = torch.sigmoid(self.ltm_gate_logit)
+            # FIX: Clamp gate input for DirectML stability
+            gate_input = torch.clamp(self.ltm_gate_logit, min=-50.0, max=50.0)
+            gate = torch.sigmoid(gate_input)
             gated_vals = topk_vals * gate
             mac_in = torch.cat([token_x, p, gated_vals.view(B, -1)], dim=-1)
             
@@ -2009,7 +2362,17 @@ class HierarchosCore(nn.Module):
                 halt_stack = torch.stack(h_halt_probs, dim=0)
                 remain = 1.0 - halt_stack
                 remain_shifted = torch.cat([torch.ones_like(remain[:1]), remain[:-1]], dim=0)
+                remain_shifted = torch.cat([torch.ones_like(remain[:1]), remain[:-1]], dim=0)
+                
+                # FIX: Revert to torch.cumprod for efficiency/compile support
                 cum_remain = torch.cumprod(remain_shifted, dim=0)
+                # cum_remain_list = []
+                # curr_val = torch.ones_like(remain_shifted[0])
+                # for i in range(remain_shifted.size(0)):
+                #     curr_val = curr_val * remain_shifted[i]
+                #     cum_remain_list.append(curr_val)
+                # cum_remain = torch.stack(cum_remain_list, dim=0)
+                
                 weights = halt_stack * cum_remain
                 remainder = cum_remain[-1] * (1.0 - halt_stack[-1])
                 total = weights.sum(dim=0) + remainder + 1e-8
@@ -2026,9 +2389,10 @@ class HierarchosCore(nn.Module):
             # C. LERP (Interpolation) - Matches Inference exactly
             step_in_stride = t % stride
             alpha = step_in_stride / float(stride)
-            
-            # This 'static_context' is now a sliding window, not a step function
+            # <<< RESTORED: torch.lerp >>>
+            # Formula: start + weight * (end - start)
             sliding_context = torch.lerp(prev_context, target_context, alpha)
+            # sliding_context = prev_context + alpha * (target_context - prev_context)
 
             # ==================================================================
             # 4. WORKER STEP (Receives Sliding Context)
@@ -2051,13 +2415,22 @@ class HierarchosCore(nn.Module):
             else:
                 initial_drift = torch.zeros(B, self.config.context_dim, device=device)
 
+            # --- FIX: Explicit Detachment for L-RNN (Prevent Recompilation) ---
+            # We handle detachment here instead of inside _worker_loop to avoid passing 
+            # 'timestep' as an argument, which causes torch.compile to recompile for every step.
+            detach_freq = getattr(self.config, 'detach_every_n_steps', 32)
+            if self.training and detach_freq is not None and t > 0 and t % detach_freq == 0:
+                 l_state = l_state.detach()
+
             if self.config.gradient_checkpointing and self.training:
-                enc, l_state, cc, final_drift = checkpoint(self._worker_loop, enc, sliding_context, l_state, initial_drift, t, use_reentrant=False)
+                # Pass None for timestep to avoid specialization
+                enc, l_state, cc, final_drift = checkpoint(self._worker_loop, enc, sliding_context, l_state, initial_drift, None, use_reentrant=False)
             else:
                 # Use the compiled version if available, otherwise the eager one
                 loop_fn = self._worker_loop if hasattr(self, '_worker_loop') else self._worker_loop_eager
                 try:
-                    enc, l_state, cc, final_drift = loop_fn(enc, sliding_context, l_state, initial_drift, timestep=t)
+                    # Pass timestep=None to avoid recompilation loop
+                    enc, l_state, cc, final_drift = loop_fn(enc, sliding_context, l_state, initial_drift, timestep=None)
                     # Robustness: If compiled loop produces NaNs or Infs, treat as failure and fallback
                     if self.config.get('compile', False) and (
                         torch.isnan(enc).any() or torch.isinf(enc).any() or 
@@ -2069,20 +2442,12 @@ class HierarchosCore(nn.Module):
                 except Exception as e:
                     if self.config.get('compile', False) and hasattr(self, '_worker_loop_eager'):
                         print(f"\nWARNING: Compiled worker loop failed ({e}). Falling back to eager mode for this step.")
-                        enc, l_state, cc, final_drift = self._worker_loop_eager(enc, sliding_context, l_state, initial_drift, timestep=t)
+                        enc, l_state, cc, final_drift = self._worker_loop_eager(enc, sliding_context, l_state, initial_drift, timestep=None)
                     else:
                         raise e
             
-            # <<< FIX: Detach l_state after worker loop to prevent gradient accumulation >>>
-            # This ensures truncated BPTT at the worker level
-            # if self.training and not self.config.gradient_checkpointing:
-            #    # Only detach if not using gradient checkpointing, as checkpointing already handles this
-            #    l_state = l_state.detach()
-            
             # <<< REVISION: Unconditional detachment REMOVED >>>
-            # We now rely on l_rnn's internal TBPTT logic (via timestep argument)
-            # to handle detachment at specific intervals. This restores gradient flow
-            # for short-term temporal dependencies.
+            # We now rely on the explicit detachment logic above.
             
             # Safety Clamp for Drift State
             # drift_state = torch.clamp(drift_state, min=-5.0, max=5.0) # No longer needed as final_drift is clamped inside loop
@@ -2112,7 +2477,26 @@ class HierarchosCore(nn.Module):
                     topk_idx, None, val_expanded, # val is the value to store
                     current_lr=self.config.ltm_lr,
                     timestamp=0.0, # Dummy timestamp
+                    tokens_covered=1, # <<< FIX: Single token step
                     fast_vals=curr_fast_vals
+                )
+            else:
+                # <<< FIX: Enable LTM Updates during Inference (Hebbian) >>>
+                # Project enc to val_dim
+                val_to_store = self.val_proj(enc)
+                val_to_store = torch.clamp(val_to_store, min=-20.0, max=20.0)
+                val_expanded = val_to_store.unsqueeze(1).expand(-1, self.config.ltm_topk, -1)
+                
+                # Update memory in-place (or return new state)
+                # FIX: Use inplace=True during inference to persist memory in the module buffers
+                do_inplace = not self.training
+                curr_fast_vals = self.ltm.update_memory_hebbian(
+                    topk_idx, None, val_expanded,
+                    current_lr=self.config.ltm_lr,
+                    timestamp=0.0,
+                    tokens_covered=1, # <<< FIX: Single token step
+                    fast_vals=curr_fast_vals,
+                    inplace=do_inplace
                 )
 
         # ==================================================================
@@ -2183,18 +2567,18 @@ class HierarchosCore(nn.Module):
         Updates the LTM memory using gradients (Titans style).
         Requires external gradient computation (e.g. via Shadow Model).
         """
-        # <<< FIX: Persist the updated state >>>
-        new_fast, new_mom = self.ltm.inner_update(topk_idx, grads, current_lr=lr, timestamp=timestamp, source=LTMModule.SRC_USER_INTERACTION)
-        self.ltm.fast_vals.copy_(new_fast)
-        self.ltm._mom_vals.copy_(new_mom)
+        # <<< FIX: Persist the updated state (Optimized In-Place) >>>
+        new_fast, new_mom = self.ltm.inner_update(topk_idx, grads, current_lr=lr, timestamp=timestamp, source=LTMModule.SRC_USER_INTERACTION, inplace=True)
+        # self.ltm.fast_vals.copy_(new_fast)
+        # self.ltm._mom_vals.copy_(new_mom)
 
-    def update_memory_hebbian(self, topk_idx: torch.LongTensor, vals: torch.Tensor, timestamp: float, lr: float = 1e-3):
+    def update_memory_hebbian(self, topk_idx: torch.LongTensor, vals: torch.Tensor, timestamp: float, lr: float = 1e-3, tokens_covered: int = 1):
         """
         Updates the LTM memory using Hebbian rule (Fallback for Inference).
         """
-        # <<< FIX: Persist the updated state >>>
-        new_fast = self.ltm.update_memory_hebbian(topk_idx, None, vals, current_lr=lr, timestamp=timestamp, source=LTMModule.SRC_USER_INTERACTION)
-        self.ltm.fast_vals.copy_(new_fast)
+        # <<< FIX: Persist the updated state (Optimized In-Place) >>>
+        new_fast = self.ltm.update_memory_hebbian(topk_idx, None, vals, current_lr=lr, timestamp=timestamp, source=LTMModule.SRC_USER_INTERACTION, tokens_covered=tokens_covered, inplace=True)
+        # self.ltm.fast_vals.copy_(new_fast) # No longer needed with inplace=True
 
 # ==================================================================
 # <<< RESTORED CLASS: QuantizedHierarchos for Inference >>>
@@ -2204,6 +2588,15 @@ class QuantizedHierarchos:
     def __init__(self, config: dict, q_data: dict):
         if not _HAS_KERNEL:
             raise ImportError("Cannot initialize QuantizedHierarchos: C++ kernel not found.")
+        
+        # Check for DirectML usage in config or environment (if possible to detect here)
+        # We can't easily check 'device' here as it's passed in __call__, but we can warn/error if we know.
+        # However, the user might load it on CPU.
+        # But if they try to use it with DirectML later, it will fail.
+        # We'll add a check in __call__ or just rely on the user not passing 'dml' device.
+        # Actually, let's check if the global device is DirectML if we can, but this class is device-agnostic until call.
+        pass # Logic handled in __call__ or via explicit device checks elsewhere.
+        
         self.config = AttrDict(config)
         
         if 'h_stride' not in self.config:
@@ -2253,7 +2646,7 @@ class QuantizedHierarchos:
         expected_quantized = [
             'qproj', 'in_proj', 'h_rnn', 'h_to_context',
             'l_input_proj', 'l_rnn', 'l_to_out', 'lm_head', 'h_halt_proj',
-            'context_drift_proj', 'l_feedback_proj' # <<< Added l_feedback_proj
+            'context_drift_proj', 'l_feedback_proj', 'val_proj' # <<< Added val_proj
         ]
         quantized_layers = {}
         for layer_name in expected_quantized:
@@ -2282,6 +2675,7 @@ class QuantizedHierarchos:
         self.h_halt_proj    = quantized_layers['h_halt_proj']
         self.context_drift_proj = quantized_layers.get('context_drift_proj')
         self.l_feedback_proj = quantized_layers.get('l_feedback_proj') # <<< Added l_feedback_proj
+        self.val_proj = quantized_layers.get('val_proj') # <<< Added val_proj
 
         print(f"Initialized QuantizedHierarchos ({self.qtype}) with RWKV recurrence.")
 
@@ -2306,8 +2700,15 @@ class QuantizedHierarchos:
         
         # Mutable context copies
         # We ensure they are on the correct device (Vulkan/CPU compat)
+        # Quantized model does NOT support DirectML (C++ kernel incompatibility).
+        if is_directml_device(device) or (isinstance(device, str) and device in ['dml', 'directml']):
+             raise ValueError("QuantizedHierarchos does not support DirectML. Please use the full-precision HierarchosCore model.")
+
         curr_prev_context = prev_context.to(device if device == 'vulkan' else 'cpu')
         curr_target_context = target_context.to(device if device == 'vulkan' else 'cpu')
+        
+        # Helper for device check
+        is_dml = is_directml_device(device) or (isinstance(device, str) and device in ['dml', 'directml', 'privateuseone'])
         
         logits = None
         stride = self.config.h_stride
@@ -2420,12 +2821,13 @@ class QuantizedHierarchos:
             # C. LERP (Interpolation)
             step_in_stride = abs_t % stride
             alpha = step_in_stride / float(stride)
-            
+            # <<< DIRECTML / VULKAN FIX: Explicit Lerp >>>
+            # Even though Quantized model is primarily for Vulkan/CPU, explicit math 
+            # is safer and often faster than the torch.lerp kernel dispatch overhead.
+            diff = curr_target_context - curr_prev_context
+            static_context = curr_prev_context + diff * alpha
             if device == 'vulkan':
-                static_context = torch.lerp(curr_prev_context.cpu(), curr_target_context.cpu(), alpha)
-                static_context = static_context.to(device) 
-            else:
-                static_context = torch.lerp(curr_prev_context, curr_target_context, alpha)
+                 static_context = static_context.to(device)
 
             # ==================================================================
             # 2. WORKER STEP (Corrected: Iterative Drift/Pondering)
@@ -2458,14 +2860,20 @@ class QuantizedHierarchos:
                 # 3. Run Worker RNN Cell on SHADOW state
                 l_out, shadow_l_state = self.l_rnn(l_input, shadow_l_state, device=device)
                 
+                # Safety Clamp for Shadow State (Match Training Logic)
+                shadow_l_state = torch.clamp(shadow_l_state, min=-50.0, max=50.0)
+                
                 # 4. Calculate Drift Delta (The "Steering")
                 if self.context_drift_proj is not None:
                     drift_delta = torch.tanh(self.context_drift_proj(l_out, device=device))
                     current_drift = torch.clamp(current_drift + drift_delta, min=-5.0, max=5.0)
+                    
+                    # Convergence Check (Match Training Logic)
+                    if torch.mean(torch.abs(drift_delta)) < self.config.l_conv_atol:
+                        break
                 else:
                     break
             
-            # <<< FIX: Update Real State ONCE (Match Training Logic) >>>
             # Use the FINAL drift/context to generate the FINAL input
             dynamic_context = static_context + current_drift
             l_input_raw = torch.cat([enc.cpu(), dynamic_context.cpu()], dim=-1)
@@ -2473,12 +2881,29 @@ class QuantizedHierarchos:
             
             # Update the actual state once
             l_out, final_l_state = self.l_rnn(l_input, final_l_state, device=device)
+            
+            # Clamp final state (Match Training Logic)
+            final_l_state = torch.clamp(final_l_state, min=-50.0, max=50.0)
 
             # Final projection to output dimension
             enc = enc + self.l_to_out(l_out, device=device)
 
             final_embedding = self.out_norm(enc.cpu())
+            final_embedding = self.out_norm(enc.cpu())
             logits = self.lm_head(final_embedding, device=device)
+
+            # ==================================================================
+            # 3. MEMORY UPDATE (Inference)
+            # ==================================================================
+            # Enable LTM Updates during Inference (Hebbian)
+            if self.val_proj is not None:
+                 # val_proj might be quantized or not.
+                 val_to_store = self.val_proj(enc.to(device), device=device) if hasattr(self.val_proj, 'qtype') else self.val_proj(enc.to(device))
+                 val_to_store = torch.clamp(val_to_store, min=-20.0, max=20.0)
+                 val_expanded = val_to_store.unsqueeze(1).expand(-1, self.config.ltm_topk, -1)
+                 
+                 # Update memory using Hebbian rule (inplace)
+                 self.update_memory_hebbian(topk_idx, val_expanded, timestamp=0.0, lr=self.config.ltm_lr, tokens_covered=1)
 
         return {
             "logits": logits.unsqueeze(1) if logits is not None else None,
@@ -2495,21 +2920,24 @@ class QuantizedHierarchos:
         Updates the LTM memory using gradients (Titans style).
         Requires external gradient computation (e.g. via Shadow Model).
         """
-        # <<< FIX: Persist the updated state >>>
-        new_fast, new_mom = self.ltm.inner_update(topk_idx, grads, current_lr=lr, timestamp=timestamp, source=LTMModule.SRC_USER_INTERACTION)
-        self.ltm.fast_vals.copy_(new_fast)
-        self.ltm._mom_vals.copy_(new_mom)
+        # Persist the updated state (Optimized In-Place)
+        self.ltm.inner_update(topk_idx, grads, current_lr=lr, timestamp=timestamp, source=LTMModule.SRC_USER_INTERACTION, inplace=True)
 
-    def update_memory_hebbian(self, topk_idx: torch.LongTensor, vals: torch.Tensor, timestamp: float, lr: float = 1e-3):
+    def update_memory_hebbian(self, topk_idx: torch.LongTensor, vals: torch.Tensor, timestamp: float, lr: float = 1e-3, tokens_covered: int = 1):
         """
         Updates the LTM memory using Hebbian rule (Fallback for Inference).
         """
-        # <<< FIX: Persist the updated state >>>
-        new_fast = self.ltm.update_memory_hebbian(topk_idx, None, vals, current_lr=lr, timestamp=timestamp, source=LTMModule.SRC_USER_INTERACTION)
-        self.ltm.fast_vals.copy_(new_fast)
+        # Persist the updated state (Optimized In-Place)
+        self.ltm.update_memory_hebbian(topk_idx, None, vals, current_lr=lr, timestamp=timestamp, source=LTMModule.SRC_USER_INTERACTION, tokens_covered=tokens_covered, inplace=True)
 
-def load_quantized(model_path: str):
+def load_quantized(model_path: str, device=None):
     """Loads a quantized model directory, automatically finding the .npz and tokenizer."""
+    # <<< FIX: DirectML Fallback >>>
+    if device and is_directml_device(device):
+        print("INFO: DirectML detected. Quantized models are incompatible with DirectML.")
+        print("      Falling back to full-precision model loading.")
+        return load_full_model_with_config(model_path, device)
+
     if not _HAS_KERNEL:
         raise ImportError("Cannot load quantized model: C++ kernel not found.")
 
@@ -2599,6 +3027,13 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     print("Running in TRAIN mode...")
     config = vars(args) # Start with CLI args
 
+    # Explicitly check for DirectML and kill compile flags
+    if is_directml_device(device):
+        print("INFO: DirectML detected. Forcing --compile to False, disabling AMP, and disabling CUDAGraphs.")
+        args.compile = False
+        config['compile'] = False
+        args.amp = False # Force disable AMP for DirectML stability
+
     if args.force_compile and not args.compile:
         print("INFO: --force-compile set but --compile missing. Auto-enabling --compile.")
         args.compile = True
@@ -2612,6 +3047,15 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     if not torch.cuda.is_available():
         print("INFO: CPU Training detected. Enabling torch.set_flush_denormal(True) to prevent performance hangs.")
         torch.set_flush_denormal(True)
+        # Optimize threading for CPU
+        if hasattr(os, 'cpu_count'):
+            num_threads = os.cpu_count()
+            # On hyperthreaded systems, physical cores might be better, but let's start with logical
+            # or maybe 3/4 of logical to leave room for OS?
+            # PyTorch default is usually all cores.
+            # Let's set it explicitly to ensure it's not restricted.
+            print(f"INFO: Setting intra-op threads to {num_threads}")
+            set_threads(num_threads)
 
     # ==========================================================
     # --- 1. ROBUST CONFIGURATION & RESUME LOGIC (From Old Version) ---
@@ -2643,7 +3087,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     model_config = None 
     scaler = None 
     scheduler = None 
-    use_amp = args.amp and (torch.cuda.is_available() and hasattr(torch.cuda.amp, 'autocast'))
+    use_amp = args.amp and _HAS_AMP
 
     # --- Handle starting from an existing model directory ---
     if args.model_path and not args.resume_from_ckpt:
@@ -2689,7 +3133,13 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
 
             # Initialize optimizer, scaler, scheduler FRESH
             print("INFO: Initializing optimizer, scheduler, and scaler from scratch.")
-            optimizer = ADAM_OPTIMIZER(model.parameters(), lr=args.starting_lr)
+            
+            # Use DirectMLAdamW if on DirectML to avoid CPU fallback
+            if is_directml_device(device):
+                print("INFO: DirectML detected. Using optimized DirectMLAdamW optimizer.")
+                optimizer = DirectMLAdamW(model.parameters(), lr=args.starting_lr)
+            else:
+                optimizer = ADAM_OPTIMIZER(model.parameters(), lr=args.starting_lr)
             if use_amp:
                 scaler = GradScaler()
                 print("INFO: Automatic Mixed Precision (AMP) ENABLED for training.")
@@ -2717,7 +3167,13 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
 
         # weights_only=False is crucial for loading optimizer, scheduler, scaler
         try:
-            checkpoint = torch.load(args.resume_from_ckpt, map_location=device, weights_only=False)
+            # DirectML workaround: Load to CPU first, then move to device
+            # DirectML device objects don't work with map_location parameter
+            if is_directml_device(device):
+                print("INFO: DirectML detected - loading checkpoint to CPU first, then moving to DirectML...")
+                checkpoint = torch.load(args.resume_from_ckpt, map_location='cpu', weights_only=False)
+            else:
+                checkpoint = torch.load(args.resume_from_ckpt, map_location=device, weights_only=False)
         except Exception as e:
             raise RuntimeError(f"Failed to load training checkpoint (needs optimizer/scheduler state): {e}")
 
@@ -2761,6 +3217,10 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                 model_config['model_type'] = 'hierarchos'
 
             print("INFO: Re-initializing model architecture from checkpoint config.")
+            # Ensure compile flag is set from args, overriding checkpoint
+            model_config['compile'] = args.compile
+            # DEBUG: Show exact config being used
+            print(f"DEBUG: Creating model with h_hidden={model_config.h_hidden}, l_hidden={model_config.l_hidden}, context_dim={model_config.context_dim}")
             model = HierarchosCore(model_config).to(device) 
         else:
             print("Warning: Config not found in checkpoint. Using current CLI args for model architecture.")
@@ -2783,7 +3243,13 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
 
         # --- Optimizer Initialization/Loading Logic ---
         initial_lr_for_optim = args.starting_lr if args.override_scheduling else model_config.get('starting_lr', args.starting_lr)
-        optimizer = ADAM_OPTIMIZER(model.parameters(), lr=initial_lr_for_optim)
+        
+        # Use DirectMLAdamW if on DirectML to avoid CPU fallback
+        if is_directml_device(device):
+            print("INFO: DirectML detected. Using optimized DirectMLAdamW optimizer.")
+            optimizer = DirectMLAdamW(model.parameters(), lr=initial_lr_for_optim)
+        else:
+            optimizer = ADAM_OPTIMIZER(model.parameters(), lr=initial_lr_for_optim)
 
         # Load model state dict with flexibility
         try:
@@ -2798,7 +3264,12 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             except Exception as e:
                 print(f"Warning: Could not load optimizer state: {e}. Starting optimizer from scratch.")
-                optimizer = ADAM_OPTIMIZER(model.parameters(), lr=initial_lr_for_optim) # Re-init with correct LR
+                # Use DirectMLAdamW if on DirectML to avoid CPU fallback
+                if is_directml_device(device):
+                    print("INFO: DirectML detected. Using optimized DirectMLAdamW optimizer (fallback).")
+                    optimizer = DirectMLAdamW(model.parameters(), lr=initial_lr_for_optim)
+                else:
+                    optimizer = ADAM_OPTIMIZER(model.parameters(), lr=initial_lr_for_optim) # Re-init with correct LR
         else:
             print("INFO: --override-scheduling detected. Skipping loading optimizer state.")
 
@@ -2865,11 +3336,6 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                     print("INFO: --override-scheduling detected. Ignoring checkpoint's scheduler state and using new LR args.")
                 elif not checkpoint_has_scheduler:
                     print("Warning: No scheduler state found in checkpoint. Initializing new schedule based on new LR args.")
-
-                # Set the step count to where it should be for the resumed epoch
-                steps_per_epoch = dataloader_len // args.accumulation_steps if dataloader_len > 0 else 0
-                # last_epoch should be the number of steps *completed*
-                scheduler.last_epoch = max(-1, start_epoch * steps_per_epoch -1) # -1 if starting epoch 0
                 print(f"INFO: Setting scheduler last_epoch to {scheduler.last_epoch} based on resumed epoch {start_epoch}.")
 
 
@@ -2878,6 +3344,9 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
 
     # <<< Starting completely fresh >>>
     else:
+        # Ensure compile flag is set from args
+        config['compile'] = args.compile
+        
         print("INFO: Starting training from scratch (no --resume-from-ckpt or --model-path provided).")
         if 'vocab_size' not in config:
             if current_vocab_size:
@@ -2891,7 +3360,14 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                 raise ValueError("max_length not determined for new model (use --max_length or --auto-max-length).")
 
         model = HierarchosCore(config).to(device)
-        optimizer = ADAM_OPTIMIZER(model.parameters(), lr=args.starting_lr)
+        
+        # Use DirectMLAdamW if on DirectML to avoid CPU fallback
+        if is_directml_device(device):
+            print("INFO: DirectML detected. Using optimized DirectMLAdamW optimizer.")
+            optimizer = DirectMLAdamW(model.parameters(), lr=args.starting_lr)
+        else:
+            optimizer = ADAM_OPTIMIZER(model.parameters(), lr=args.starting_lr)
+            
         model_config = AttrDict(config) 
 
         if use_amp:
@@ -2947,6 +3423,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         running_prev_context = None
         running_target_context = None
         running_drift_state = None
+        running_ltm_state = None # <<< NEW: Persist LTM state across chunks
         
         pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}")
         total_loss = 0.0
@@ -2965,12 +3442,17 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
             running_prev_context = None
             running_target_context = None
             running_drift_state = None
+            running_ltm_state = None
             
             model.reset_memory()
 
             # --- CUDAGraphs Protection ---
-            if device.type == 'cuda' and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
-                torch.compiler.cudagraph_mark_step_begin()
+            if device.type == 'cuda' and not is_directml_device(device):
+                try:
+                    if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+                        torch.compiler.cudagraph_mark_step_begin()
+                except:
+                    pass
 
             if batch is None:
                 print(f"Warning: Skipping empty batch at step {i}.")
@@ -3009,7 +3491,9 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                 labels = full_labels[:, start_t:end_t]
 
                 # --- AMP autocast context ---
-                with autocast(device_type=device.type, enabled=use_amp):
+                # DirectML devices need to use 'cpu' as device_type for autocast
+                autocast_device_type = 'cpu' if is_directml_device(device) else device.type
+                with autocast(device_type=autocast_device_type, enabled=use_amp):
                     
                     outputs = model(
                         input_ids=input_ids, 
@@ -3019,7 +3503,8 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                         l_state=running_l_state,
                         prev_context=running_prev_context,
                         target_context=running_target_context,
-                        drift_state=running_drift_state
+                        drift_state=running_drift_state,
+                        ltm_memory_state=running_ltm_state # <<< NEW: Pass LTM state
                     )
 
                     if outputs.get("topk_vals") is not None and outputs["topk_vals"].requires_grad:
@@ -3056,6 +3541,12 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                         running_drift_state = torch.clamp(running_drift_state, min=-5.0, max=5.0)
                     else: running_drift_state = None
 
+                    if outputs.get("ltm_memory_state") is not None:
+                        # Detach tuple elements
+                        f, m = outputs["ltm_memory_state"]
+                        running_ltm_state = (f.detach(), m.detach())
+                    else: running_ltm_state = None
+
                     # --- Robust Loss Calculation ---
                     combined_loss = None
                     ce_valid = cross_entropy_loss is not None and not torch.isnan(cross_entropy_loss) and not torch.isinf(cross_entropy_loss)
@@ -3070,6 +3561,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                         running_h_state = None
                         running_l_state = None
                         running_drift_state = None
+                        running_ltm_state = None
                         continue 
 
                     loss_accum = 0.0
@@ -3117,15 +3609,18 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                                 torch.nn.utils.clip_grad_norm_([ltm_grads_copy], args.grad_clip)
                                 current_chunk_len = end_t - start_t
 
-                            model.ltm.inner_update(
+                            # <<< FIX: Capture and persist LTM updates (Optimized In-Place) >>>
+                            new_fast, new_mom = model.ltm.inner_update(
                                 outputs["topk_idx"], 
                                 ltm_grads_copy, 
                                 current_lr=args.ltm_lr, 
-
                                 source=LTMModule.SRC_TRAINING_DATA,
                                 timestamp=float(end_t), # Use end_t as deterministic timestamp
-                                tokens_covered=end_t - start_t # <<< FIX: Pass actual token count for decay scaling
+                                tokens_covered=end_t - start_t, # <<< FIX: Pass actual token count for decay scaling
+                                inplace=True
                             )
+                            # Update running state for next chunk with the Gradient-Updated memory
+                            running_ltm_state = (new_fast.detach(), new_mom.detach())
                         else:
                             pass
 
@@ -3350,7 +3845,13 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len): # <<< Pass da
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    optimizer = ADAM_OPTIMIZER(model.parameters(), lr=args.starting_lr) # Only trainable params will have grads
+    # Use DirectMLAdamW if on DirectML to avoid CPU fallback
+    # Enable DirectMLAdamW for DirectML devices to avoid lerp CPU fallbacks
+    if is_directml_device(device):
+        print("INFO: DirectML detected. Using optimized DirectMLAdamW optimizer.")
+        optimizer = DirectMLAdamW(model.parameters(), lr=args.starting_lr)
+    else:
+        optimizer = ADAM_OPTIMIZER(model.parameters(), lr=args.starting_lr) # Only trainable params will have grads
     os.makedirs(args.out_dir, exist_ok=True)
 
     scaler = None
@@ -3387,8 +3888,10 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len): # <<< Pass da
 
             input_ids, attention_mask, labels = batch["input_ids"].to(device), batch["attention_mask"].to(device), batch["labels"].to(device)
 
-            # <<< FIXED: Added device_type >>>
-            with autocast(device_type=device.type, enabled=use_amp):
+            # <<< FIXED: Added device_type and DirectML support >>>
+            # DirectML devices need to use 'cpu' as device_type for autocast
+            autocast_device_type = 'cpu' if is_directml_device(device) else device.type
+            with autocast(device_type=autocast_device_type, enabled=use_amp):
                 outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
                 
                 cross_entropy_loss = outputs["loss"]
@@ -3721,12 +4224,22 @@ def chat(args, device, tokenizer):
         sys.exit(1)
 
     if npz_files:
-        if not _HAS_KERNEL:
-            print("ERROR: Cannot run quantized chat without the C++ kernel (not found or failed to import).")
+        # <<< FIX: Pass device to allow DirectML fallback >>>
+        # We allow calling load_quantized even if _HAS_KERNEL is False, 
+        # because it might fallback to full precision on DirectML.
+        try:
+            model, config = load_quantized(args.model_path, device=device)
+        except ImportError as e:
+            print(f"ERROR: {e}")
             return
-        model, config = load_quantized(args.model_path)
-        is_quantized = True
-        print(f"Loaded quantized model with {model.qtype} weights.")
+
+        if isinstance(model, QuantizedHierarchos):
+            is_quantized = True
+            print(f"Loaded quantized model with {model.qtype} weights.")
+        else:
+            print("INFO: Loaded full-precision model (fallback active).")
+            is_quantized = False
+            inference_device = device
 
         if args.device == 'vulkan':
             if not _HAS_VULKAN:
@@ -3774,6 +4287,13 @@ def chat(args, device, tokenizer):
             print(f"Error loading full precision model from {args.model_path}: {e}")
             traceback.print_exc()
             sys.exit(1)
+
+    # If using DirectML, we must use the full model (HierarchosCore) because
+    # QuantizedHierarchos depends on the C++ kernel which is CUDA/CPU only (or Vulkan via shader).
+    # If the user loaded a quantized model but wants DML, we might have a problem unless
+    # we de-quantize or if the kernel supports DML (it doesn't).
+    # For now, we assume the user knows what they are doing.
+    # But if is_quantized is True and device is DML, we should warn.
 
 
     # =================================================================
@@ -3826,7 +4346,8 @@ def chat(args, device, tokenizer):
     dummy_optimizer = None
     # Enable AMP for learning if requested AND possible (CUDA available AND (full model OR quantized learning enabled))
     # <<< MODIFIED: Changed device check >>>
-    use_amp = args.amp and _HAS_AMP and (not is_quantized or args.enable_quantized_learning) and (device.type == 'cuda')
+    # DirectML and CUDA can use AMP, but not CPU
+    use_amp = args.amp and _HAS_AMP and (not is_quantized or args.enable_quantized_learning) and (device.type == 'cuda' or is_directml_device(device))
 
     if use_amp:
         scaler = GradScaler()
@@ -3942,15 +4463,19 @@ def chat(args, device, tokenizer):
                         current_scale = scaler.get_scale()
                         if current_scale != 1.0:
                             ltm_grads_copy = ltm_grads_copy / current_scale
-                    tokens_in_interaction = full_sequence.shape[1]
                     # --- UPDATE LTM ---
-                    update_model.ltm.inner_update(
+                    # <<< FIX: Capture and persist LTM updates (Optimized In-Place) >>>
+                    new_fast, new_mom = update_model.ltm.inner_update(
                         outputs["topk_idx"], 
                         ltm_grads_copy, 
                         current_lr=current_ltm_lr, 
                         source=source_id,
-                        tokens_covered=total_tokens_in_interaction
+                        tokens_covered=tokens_in_interaction,
+                        inplace=True
                     )
+                    # Persist updates to model state
+                    # update_model.ltm.fast_vals.copy_(new_fast)
+                    # update_model.ltm._mom_vals.copy_(new_mom)
                     ltm_has_been_updated = True
                     
                     # Clean up AMP scaler state
@@ -4300,6 +4825,7 @@ def chat(args, device, tokenizer):
         elif ltm_has_been_updated:
              print("\n[Warning] LTM was updated, but no valid save configuration was found. Changes lost.")
 def main():
+    global _HAS_KERNEL
     parser = argparse.ArgumentParser(description="hierarchos: A Hybrid Memory-Reasoning Architecture")
     parser.add_argument("mode", type=str, choices=["train", "finetune", "chat", "quantize", "merge-lora"], help="Operation mode.")
 
@@ -4356,13 +4882,14 @@ def main():
     train_group.add_argument("--kayla", action="store_true", help="Enable Kayla-style instruction tuning (with thought-process). Ignored if using pre-chunked formats or --text_column.")
     train_group.add_argument("--lora_r", type=int, default=8, help="[Finetune] LoRA rank.")
     train_group.add_argument("--lora_alpha", type=int, default=16, help="[Finetune] LoRA alpha.")
-    train_group.add_argument("--finetune-unlock-percent", type=float, default=None, help="[Finetune] Target percentage of params to train (e.g., 1.5 for 1.5%). Overrides --lora_r.")
+    train_group.add_argument("--finetune-unlock-percent", type=float, default=None, help="[Finetune] Target percentage of params to train (e.g., 1.5 for 1.5%%). Overrides --lora_r.")
     train_group.add_argument("--quantize-on-complete", action="store_true", help="[Train] Automatically quantize after training.")
     train_group.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping value. Set to 0 to disable.")
     train_group.add_argument("--ponder-loss-weight", type=float, default=0.01, help="[HRM] Weight for the ponder cost auxiliary loss.")
     train_group.add_argument("--commitment-loss-weight", type=float, default=0.5, help="[HRM] Weight for the commitment auxiliary loss to prevent posterior collapse.")
     # <<< MERGED FROM V2: Commitment Threshold >>>
     train_group.add_argument("--commitment-threshold", type=float, default=0.05, help="[HRM] Hinge loss threshold (free bit budget) for drift penalty. Drift^2 below this is not penalized.")
+    train_group.add_argument("--training-chunk-size", type=int, default=128, help="[Titans] Chunk size for temporal segmentation during training.")
     
     train_group.add_argument("--override-scheduling", action="store_true", help="[Train] If resuming, ignore the scheduler state in the checkpoint and use the new LR args.")
     train_group.add_argument("--num_workers", type=int, default=0, help="Number of worker processes for data loading. Recommended: 2 or 4 for GPU training.")
@@ -4377,7 +4904,7 @@ def main():
     infer_group.add_argument("--max-new-tokens", type=int, default=512)
     infer_group.add_argument("--enable-quantized-learning", action="store_true", help="[Chat] Enable LTM updates for quantized models. Requires --shadow-model-path.")
     infer_group.add_argument("--ltm-lora-path", type=str, default=None, help="[Chat] Optional: Path to save/load LTM updates as a separate delta file.")
-    infer_group.add_argument("--device", type=str, default="cpu", choices=["cpu", "vulkan"], help="[Chat] Device for quantized inference.")
+    parser.add_argument("--device", type=str, default=None, choices=["cuda", "cpu", "dml"], help="Force specific device (cuda, cpu, dml)")
     infer_group.add_argument("--h-halt-thresh", type=float, default=0.9, help="[HRM] Probability threshold for early exiting the H-module loop during inference.")
     infer_group.add_argument("--static-ltm-lr", action="store_true", help="[Chat] Disable the cosine annealing schedule for LTM updates and use a fixed LR instead.")
     infer_group.add_argument("--ltm-schedule-steps", type=int, default=100, help="[Chat] The number of updates in one cosine annealing cycle for LTM learning.")
@@ -4449,8 +4976,31 @@ def main():
         print("Warning: --kayla flag is ignored when using pre-chunked dataset formats.")
 
     set_threads(args.threads)
-    pt_device = pick_device()
+    pt_device = pick_device(args)
     print(f"Using PyTorch device: {pt_device}")
+
+    # <<< DIRECTML CONSTRAINT ENFORCEMENT >>>
+    if is_directml_device(pt_device):
+        print("INFO: DirectML device selected. Enforcing stability constraints...")
+        
+        # 1. Disable torch.compile (not supported on DML)
+        if args.compile:
+            print("Warning: --compile is not supported on DirectML. Forcing --compile=False.")
+            args.compile = False
+        if args.force_compile:
+            print("Warning: --force-compile ignored on DirectML.")
+            args.force_compile = False
+            
+        # 2. Disable Custom Kernels (incompatible with DML tensors)
+        if _HAS_KERNEL:
+            print("INFO: Disabling custom C++ kernels (hierarchos_matmul) for this run to prevent crashes.")
+            # We modify the global flag so QuantizedHierarchos sees it
+            _HAS_KERNEL = False
+            
+        # 3. Disable AMP (if not already handled)
+        if args.amp:
+            print("Warning: AMP is unstable on DirectML. Forcing --amp=False.")
+            args.amp = False
 
     if pt_device.type == 'cuda':
         torch.set_float32_matmul_precision('high')

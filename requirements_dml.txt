@@ -1,0 +1,32 @@
+# DirectML Requirements for Hierarchos
+# Install with: pip install -r requirements_dml.txt
+
+# IMPORTANT: Python Version Compatibility
+# torch-directml requires Python 3.8, 3.9, 3.10, 3.11, or 3.12
+# It does NOT support Python 3.13+ yet
+# Check your Python version with: python --version
+# If you have Python 3.13, you need to:
+#   1. Install Python 3.12 from python.org
+#   2. Create a virtual environment with Python 3.12
+#   3. Then install these requirements
+
+# Core DirectML package for AMD GPU acceleration on Windows
+# Compatible with PyTorch 2.4.1 (included as dependency)
+torch-directml
+
+# Note: torch-directml includes compatible versions of:
+# - torch (2.4.1)
+# - torchvision  
+# - torchaudio
+# Do NOT install separate torch packages when using torch-directml
+# as this may cause version conflicts
+
+# Other Hierarchos dependencies (if not already installed)
+transformers>=4.30.0
+datasets
+numpy
+tqdm
+safetensors
+
+# Optional but recommended
+colorama

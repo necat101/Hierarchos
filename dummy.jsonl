@@ -1,0 +1,5 @@
+
+{"text": "This is a dummy sentence for training."}
+{"text": "Another dummy sentence to test the model."}
+{"text": "Hierarchos is a hierarchical agent."}
+{"text": "Testing CPU training with torch.compile."}

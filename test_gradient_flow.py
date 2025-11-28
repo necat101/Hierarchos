@@ -222,6 +222,49 @@ def test_training_convergence():
         print(f"WARNING: Model may not be learning effectively (improvement: {improvement:.1f}%)")
         return True  # Don't fail the test, just warn
 
+def test_memory_gradient_flow():
+    """Test 4: Verify gradients flow through the differentiable memory update."""
+    print("\\n=== Test 4: Memory Gradient Flow ===")
+    
+    config = create_test_config(compile=False)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = HierarchosCore(config).to(device)
+    model.train()
+    
+    B, T = 1, 4
+    input_ids = torch.randint(0, config['vocab_size'], (B, T)).to(device)
+    labels = torch.randint(0, config['vocab_size'], (B, T)).to(device)
+    
+    # We want to check if the initial memory state receives gradients
+    # This proves that the memory update chain is differentiable back to the start
+    initial_fast_vals = torch.zeros(config['ltm_slots'], config['ltm_val_dim'], device=device, requires_grad=True)
+    initial_mom_vals = torch.zeros(config['ltm_slots'], config['ltm_val_dim'], device=device, requires_grad=True)
+    
+    print("Running forward pass with tracked memory state...")
+    outputs = model(input_ids=input_ids, labels=labels, ltm_memory_state=(initial_fast_vals, initial_mom_vals))
+    loss = outputs['loss']
+    
+    print(f"Loss: {loss.item():.4f}")
+    
+    print("Running backward pass...")
+    loss.backward()
+    
+    # Check if initial_fast_vals received gradients
+    # If it did, it means the memory updates (which depend on previous fast_vals) 
+    # and retrievals (which use fast_vals) are connected in the graph.
+    if initial_fast_vals.grad is not None:
+        grad_norm = initial_fast_vals.grad.norm().item()
+        print(f"Initial fast_vals grad norm: {grad_norm:.6f}")
+        if grad_norm > 0:
+            print("[PASS] Gradients flow through memory updates!")
+            return True
+        else:
+            print("[FAIL] Initial fast_vals grad is zero (chain broken?)")
+            return False
+    else:
+        print("[FAIL] Initial fast_vals has no grad (detached?)")
+        return False
+
 def run_all_tests():
     """Run all validation tests."""
     print("="*60)
@@ -233,6 +276,7 @@ def run_all_tests():
         ("Gradient Flow End-to-End", test_gradient_flow_end_to_end),
         ("State Continuity", test_state_continuity),
         ("Training Convergence", test_training_convergence),
+        ("Memory Gradient Flow", test_memory_gradient_flow),
     ]
     
     results = []

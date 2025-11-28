@@ -1,12 +1,23 @@
 -----
 
-# Hierarchos v0.11.15 (alpha): A Hybrid Memory-Reasoning Architecture
+# Hierarchos v0.12.0 (alpha): A Hybrid Memory-Reasoning Architecture
 
 A novel AI architecture that synergistically integrates Google's Titans memory system with a Hierarchical Reasoning Model (HRM) to move beyond the limitations of scale and take a decisive step on the path to AGI.
 
 Due to Amazon's "Chronos" forecasting models (still based on transformers BTW) I've decided to rename the project to "Hierarchos" from this point forward. This should prevent any naming confusion that may occur.
 
 -----
+
+### 🚀 **New in v0.12.0: The "Performance & Compatibility" Update**
+
+> This update brings major performance optimizations, expanded hardware support, and critical stability fixes.
+>
+> 1.  **DirectML Support (AMD GPU Acceleration):** 🎮 Added native support for AMD GPUs on Windows via DirectML/ZLUDA, enabling GPU-accelerated training on Radeon graphics cards. Includes automatic device detection, optimized fallbacks for DirectML-incompatible operations, and stability fixes for long training runs.
+> 2.  **LTM Memory Optimization:** ⚡ Refactored Long-Term Memory (LTM) update methods to use in-place operations, significantly reducing memory overhead and improving training speed. Memory updates now persist correctly across training and inference.
+> 3.  **Python 3.13 Support:** 🐍 Updated build system and setup scripts to fully support Python 3.13, including automatic detection of various Python installation paths and compatibility fixes for Windows Store, standard, and `py` launcher installations.
+> 4.  **torch.compile Stability Improvements:** 🛠️ Fixed critical issues with `torch.compile` on Windows CPU, including dynamic shape support, device detection, and compilation stability. Training with `--compile --force-compile` now works reliably on CPU.
+> 5.  **Enhanced Device Management:** 💻 Improved device auto-detection and selection logic, with better handling of CUDA, DirectML, and CPU devices. DirectML now requires explicit opt-in via `--device dml` to prevent accidental incompatibilities.
+> 6.  **Numerical Stability Fixes:** 🔒 Added comprehensive clamping and stability checks throughout the architecture, including LTM value clamping `[-20, 20]`, state clamping in worker loops, and safe operations for AMP/DirectML compatibility.
 
 ### 🚀 **New in v0.11.15: The "Coherence" Update (Inference Fixes)**
 
@@ -52,6 +63,7 @@ A powerful, data-efficient, and deep reasoning engine. Its dual-module design (a
 
 ## Features ✨
 
+  * 🎮 **AMD GPU Support (DirectML/ZLUDA)**: Train on AMD Radeon GPUs using DirectML backend on Windows. Opt-in via `--device dml` with automatic compatibility handling and optimized fallbacks.
   * 🎓 **Proper Temporal Learning**: Configurable truncated BPTT (`--detach-every-n-steps`) enables learning across multiple timesteps while managing memory. Default 32-step gradients flow allows the model to **learn temporal dependencies** effectively.
   * 🔗 **End-to-End Gradient Flow**: All architectural components (Manager, Worker, LTM) receive proper gradients during training. No more detachment-induced coherence problems or NaN errors.
   * 🎯 **Train/Test Consistency**: Fixes train/test mismatch from unconditional state detachment, improving model coherence and stability.
@@ -63,8 +75,8 @@ A powerful, data-efficient, and deep reasoning engine. Its dual-module design (a
   * 🤔 **Adaptive "Ponder" Time**: Dynamically adjusts its reasoning depth, "thinking" longer for complex problems and saving computation on simpler ones.
   * 🕰️ **Structured & Queryable Memory**: LTM slots are augmented with timestamps and source data, enabling powerful temporal and contextual queries during chat.
   * 🧠 **Dynamic "Online" Learning**: Learns from experience during chat with a Cosine Annealing LR schedule by default for more stable knowledge consolidation.
-  * 🚀 **PyTorch 2.0+ torch.compile Support**: Optional compilation of the Worker loop with `--compile` for potential training speedups on NVIDIA GPUs (experimental, not recommended for Windows CPU).
-  * ⚡ **Accelerated Training with AMP**: Supports Automatic Mixed Precision (`--amp`) for faster training and reduced memory usage on compatible NVIDIA GPUs.
+  * 🚀 **PyTorch 2.0+ torch.compile Support**: Optional compilation of the Worker loop with `--compile` for potential training speedups on NVIDIA GPUs and CPU (with `--force-compile`). Improved stability and performance on Windows.
+  * ⚡ **Accelerated Training with AMP**: Supports Automatic Mixed Precision (`--amp`) for faster training and reduced memory usage on compatible NVIDIA GPUs. Automatically disabled for DirectML and CPU for stability.
   * 🛡️ **Stable Training**: Built-in gradient clipping (`--grad-clip`) to prevent model instability and ensure smoother convergence.
   * 📦 **Self-Contained & Portable Models**: Models are saved as directories containing weights, tokenizer, and architecture config for easy sharing and use.
   * 💾 **Automatic Re-quantization**: After a learning session, Hierarchos can automatically re-quantize a model to persist the new knowledge (`--enable-quantized-learning` in `chat`). *(Requires compiled kernel)*
@@ -73,6 +85,7 @@ A powerful, data-efficient, and deep reasoning engine. Its dual-module design (a
   * ⚡ **High-Performance Inference**: Utilizes a custom C++ kernel inspired by `llama.cpp` for state-of-the-art quantization (`INT4`, `Q4_0`, `Q8_0`, `Q2_K`). *(Requires compiled kernel)*
   * 💻 **CPU & GPU Support**: Runs fast quantized inference on standard CPUs (with AVX/NEON) or on GPUs via Vulkan for broad hardware compatibility. *(Requires compiled kernel)*
   * 🔧 **Comprehensive Tooling**: Includes a single script (`hierarchos.py`) for training, LoRA fine-tuning, merging, quantization, and interactive chat, plus the model expansion and dataset chunking scripts.
+  * 🐍 **Python 3.13 Support**: Full compatibility with Python 3.13, including automatic build environment setup and path detection.
 
 -----
 
@@ -82,8 +95,9 @@ Follow these steps to get a local copy up and running.
 
 ### Prerequisites
 
-  * Python 3.8+
+  * **Python 3.8+ (Python 3.13 recommended)**
   * **For Hugging Face Datasets:** `pip install datasets`
+  * **For AMD GPU Training (Windows):** Install DirectML via `pip install torch-directml` and follow [README_ZLUDA.md](README_ZLUDA.md)
   * **Optional (Quantization/Vulkan):**
       * A C++ compiler (e.g., MSVC on Windows, GCC on Linux)
       * CMake (must be available in your system's `PATH`)
@@ -120,6 +134,10 @@ Follow these steps to get a local copy up and running.
       * **Full (includes dependencies for kernel build, LoRA, quantization, etc.):**
         ```bash
         pip install -r requirements_kernel.txt
+        ```
+      * **DirectML (AMD GPU on Windows):**
+        ```bash
+        pip install -r requirements_dml.txt
         ```
 
     *(Note: `requirements_kernel.txt` includes `datasets`)*
@@ -163,7 +181,7 @@ python hierarchos.py train \
     --l_hidden 768 \
     --max_h_steps 5 \
     --max_l_steps 5 \
-    --amp `# Enable Mixed Precision for speed` \
+    --amp `# Enable Mixed Precision for speed (NVIDIA GPUs only)` \
     --gradient-checkpointing # Add this if VRAM is limited
 ```
 
@@ -231,10 +249,26 @@ python hierarchos.py train \
         --gradient-checkpointing # Add this if VRAM is limited
     ```
 
+**(E) Training on AMD GPU (DirectML/Windows):**
+
+```bash
+python hierarchos.py train \
+    --train "path/to/your_data.jsonl" \
+    --tokenizer-path "openai-community/gpt2" \
+    --out-dir "./my_amd_model" \
+    --device dml `# Explicitly enable DirectML` \
+    --epochs 3 \
+    --batch_size 2 \
+    --accumulation-steps 4 \
+    --auto-max-length \
+    --gradient-checkpointing # Recommended for AMD GPUs
+```
+
 -----
 
-💡 **Accelerating Training with AMP:** Use `--amp` for faster training and lower VRAM usage on NVIDIA GPUs.
+💡 **Accelerating Training with AMP:** Use `--amp` for faster training and lower VRAM usage on NVIDIA GPUs. Automatically disabled for DirectML and CPU.
 💾 **Training on Low Memory:** Use `--gradient-checkpointing` to significantly reduce VRAM usage at the cost of some extra computation.
+🎮 **AMD GPU Training:** Use `--device dml` to train on AMD Radeon GPUs via DirectML. AMP is automatically disabled for stability.
 
 ## ⚠️ **HRM Convergence & Training Speed:** Higher `--max_h_steps` and `--max_l_steps` allow deeper reasoning but **significantly increase training time** per batch due to the iterative HRM process. Adjust based on your task and compute resources.
 
@@ -394,9 +428,9 @@ python hierarchos.py train \
 | `--min-lr`                     | `train`, `finetune`                 | Minimum Learning Rate for cosine annealing schedule.                                                                                     | `1e-6`                  |
 | `--disable-lr-schedule`        | `train`, `finetune`                 | Use a fixed Learning Rate (`--starting-lr`) instead of cosine annealing.                                                                 | `False`                 |
 | `--ltm_lr`                     | `train`, `finetune`, `chat`         | Learning Rate for LTM "surprise" updates (or max LR for LTM schedule in chat).                                                         | `0.01`                  |
-| `--compile`                    | `train`, `finetune`                 | **Enable torch.compile for faster training (experimental).** Compiles the Worker (L-RNN) loop for potential speedups on NVIDIA GPUs. **WARNING:** Known to hang on Windows CPU. | `False`                 |
-| `--force-compile`              | `train`, `finetune`                 | Force torch.compile even on Windows CPU (overrides safety check). **Use with caution - may cause system hangs.** Requires `--compile`. | `False`                 |
-| `--amp`                        | `train`, `finetune`, `chat`         | **Enable Automatic Mixed Precision (requires CUDA).** | `False`                 |
+| `--compile`                    | `train`, `finetune`                 | **Enable torch.compile for faster training (experimental).** Compiles the Worker (L-RNN) loop for potential speedups on NVIDIA GPUs and CPU. **WARNING:** Known to hang on Windows CPU without `--force-compile`. | `False`                 |
+| `--force-compile`              | `train`, `finetune`                 | Force torch.compile even on Windows CPU (overrides safety check). **Use with caution - may cause system hangs on some configurations.** Requires `--compile`. | `False`                 |
+| `--amp`                        | `train`, `finetune`, `chat`         | **Enable Automatic Mixed Precision (requires CUDA).** Automatically disabled for DirectML and CPU. | `False`                 |
 | `--num_workers`                | `train`, `finetune`                 | Number of CPU workers for data loading (and HF dataset mapping if applicable).                                                         | `0`                     |
 | `--lora_r`                     | `finetune`                          | LoRA rank 'r'.                                                                                                                           | `8`                     |
 | `--lora_alpha`                 | `finetune`                          | LoRA alpha scaling factor.                                                                                                               | `16`                    |\n| `--finetune-unlock-percent`    | `finetune`                          | Target % of params to train (approx.). Overrides `--lora_r` if set.                                                                     | `None`                  |
@@ -404,7 +438,7 @@ python hierarchos.py train \
 | **Quantization/Inference** |                                     |                                                                                                                                          |                         |
 | `--qtype`                      | `quantize`, `train`                 | Quantization format (`INT4`, `Q4_0`, `Q8_0`, `Q2_K`). Used by `quantize` or `--quantize-on-complete`. **Requires compiled kernel.** | `INT4`                  |
 | `--quantize-on-complete`       | `train`                             | Automatically run quantization after training finishes. **Requires compiled kernel.** | `False`                 |
-| `--device`                     | `chat`                              | Device for *quantized* inference (`cpu`, `vulkan`). **Requires compiled kernel.** | `cpu`                   |
+| `--device`                     | `chat`, `train`                     | Device for inference/training (`cpu`, `cuda`, `dml`/`directml`, `vulkan`). **Note:** `dml` requires `torch-directml` and Windows. DirectML requires explicit opt-in. | `auto`                   |
 | `--h-halt-thresh`              | `chat`                              | Probability threshold for early exiting the HRM reasoning loop during inference.                                                         | `0.9`                   |
 | `--max-new-tokens`             | `chat`                              | Maximum number of tokens to generate in chat mode.                                                                                       | `512`                   |
 | `--enable-quantized-learning`  | `chat`                              | Enable LTM updates for quantized models (requires `--shadow-model-path` and **compiled kernel**).                                          | `False`                 |
@@ -432,8 +466,6 @@ python hierarchos.py train \
 
 ### `dataset_chunk_create.py` Arguments ✂️
 
-*(No changes)*
-
 | Argument            | Description                                                                                       | Required | Default                         |
 | :------------------ | :------------------------------------------------------------------------------------------------ | :------- | :------------------------------ |
 | `--dataset`         | Path to the input **JSONL** dataset file (Kayla format recommended).                              | Yes      |                                 |
@@ -460,6 +492,8 @@ python hierarchos.py train \
   * [ ] Develop a user-friendly GUI wrapper for easier interaction.
   * [ ] Extend the architecture to support multi-modal inputs (images, audio).
   * [ ] Implement the entire training loop in Vulkan/CUDA for end-to-end GPU acceleration.
+  * [ ] Expand DirectML support to Linux via ROCm.
+  * [ ] Optimize LTM retrieval with approximate nearest neighbor search for larger memory capacities.
 
 ## License
 
@@ -478,8 +512,59 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
   * **pybind11** for seamless C++/Python integration.
   * **Hugging Face `datasets`** library for broad data compatibility.
   * **PyTorch Team** for gradient checkpointing functionality.
+  * **DirectML/ZLUDA communities** for enabling AMD GPU acceleration on Windows.
 
 ## Changelog
+
+### v0.12.0 (alpha)
+
+  * **DirectML Support (AMD GPU Acceleration)**:
+      * Added native support for AMD Radeon GPUs on Windows via DirectML backend
+      * Implemented device auto-detection with explicit opt-in via `--device dml` or `--device directml`
+      * Auto-disables AMP for DirectML devices for stability
+      * Added DirectML-compatible implementations for operations (replaced `torch.lerp`, `torch.index_add_`, etc.)
+      * Prevents custom kernel loading on DirectML devices to avoid incompatibilities
+      * Includes comprehensive compatibility checks and optimized fallbacks
+  * **LTM Memory Optimization & Stability**:
+      * Refactored `LTMModule.inner_update` to use in-place operations, significantly reducing memory overhead
+      * Fixed LTM memory persistence bug where updates were calculated but not saved during training
+      * Added LTM value clamping `[-20, 20]` to prevent saturation and numerical instability
+      * Improved surprise-based update mechanism for more stable memory consolidation
+  * **Python 3.13 Support**:
+      * Updated `setup.bat` and `setup.ps1` to fully support Python 3.13
+      * Added automatic detection for various Python installation paths (PATH, standard, Windows Store, `py` launcher)
+      * Fixed C++ compilation issues related to spaces in Python installation paths
+      * Added Python libs path to LIB environment variable for successful kernel compilation
+  * **torch.compile Stability Improvements**:
+      * Fixed device detection for `torch.compile` - now correctly identifies device type for autocast
+      * Improved dynamic shape support on Windows CPU
+      * Added `--force-compile` safety check with better warnings
+      * Fixed compilation errors related to NaN checks in worker loop
+      * Improved compatibility with Windows CPU compilation
+  * **Enhanced Device Management**:
+      * Improved `pick_device()` auto-detection logic with priority: CUDA → CPU (DirectML is opt-in)
+      * Added `is_directml_device()` and `get_device_type()` utility functions
+      * DirectML now requires explicit opt-in to prevent accidental use with incompatible operations
+      * Better handling of device selection in training and inference modes
+  * **Numerical Stability Fixes**:
+      * Added comprehensive state clamping in `_worker_loop` to prevent NaN propagation
+      * Added `gate_input` clamping before sigmoid operations
+      * Improved stability checks for convergence detection
+      * Added safety guards for AMP/DirectML compatibility in RWKV cells
+  * **MSVC Build Environment Improvements**:
+      * Enhanced `setup_msvc_environment()` with better vswhere.exe integration
+      * Added automatic vcvars64.bat path detection and caching
+      * Fixed vcvarsall.bat environment variable parsing
+      * Improved error handling and user guidance for manual compiler setup
+  * **Performance Optimizations**:
+      * Reduced memory allocations in LTM update paths
+      * Improved gradient computation efficiency during training
+      * Better cache utilization in dataset loading
+  * **Documentation Updates**:
+      * Added DirectML setup instructions and workflow examples
+      * Updated command-line reference with device selection options
+      * Added notes on AMP auto-disable for DirectML and CPU
+      * Enhanced troubleshooting guidance for various hardware configurations
 
 ### v0.11.15 (alpha)
 

@@ -237,11 +237,11 @@ def test_memory_gradient_flow():
     
     # We want to check if the initial memory state receives gradients
     # This proves that the memory update chain is differentiable back to the start
+    # FIX: Use single tensor format (not tuple) for ltm_memory_state
     initial_fast_vals = torch.zeros(config['ltm_slots'], config['ltm_val_dim'], device=device, requires_grad=True)
-    initial_mom_vals = torch.zeros(config['ltm_slots'], config['ltm_val_dim'], device=device, requires_grad=True)
     
     print("Running forward pass with tracked memory state...")
-    outputs = model(input_ids=input_ids, labels=labels, ltm_memory_state=(initial_fast_vals, initial_mom_vals))
+    outputs = model(input_ids=input_ids, labels=labels, ltm_memory_state=initial_fast_vals)
     loss = outputs['loss']
     
     print(f"Loss: {loss.item():.4f}")

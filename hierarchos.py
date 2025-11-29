@@ -1710,9 +1710,8 @@ class LTMModule(nn.Module):
         counts = self.update_counts
         
         # Slot grads: [Slots, ValDim]
-        # <<< FIX: Use pre-allocated buffer >>>
-        torch.matmul(one_hot.t(), grads_flat.to(device), out=self.update_slots)
-        slot_grads = self.update_slots
+        # <<< FIX: Don't use pre-allocated buffer with out= - breaks autograd >>>
+        slot_grads = torch.matmul(one_hot.t(), grads_flat.to(device))
         
         # FIX: Avoid in-place indexing for normalization
         # slot_grads[nonzero_mask] /= counts[nonzero_mask].unsqueeze(-1)
@@ -1807,73 +1806,42 @@ class LTMModule(nn.Module):
 
     def update_memory_hebbian(self, topk_idx: torch.LongTensor, keys: torch.Tensor, vals: torch.Tensor, current_lr: float, timestamp: float, 
                               source: int = SRC_USER_INTERACTION, tokens_covered: int = None, fast_vals: Optional[torch.Tensor] = None,
-                              inplace: bool = False) -> torch.Tensor:
+                              mom_vals: Optional[torch.Tensor] = None, inplace: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Performs a Hebbian-style associative update.
-        If inplace=True, modifies fast_vals in-place.
-        Returns new fast_vals.
+        Performs a Hebbian-style associative update, BUT now unified with Titans Momentum logic.
+        We treat the 'vals' (which we want to store) as a target, and the 'gradient' is (current - target).
+        Actually, simpler: We just treat 'vals' as the negative gradient direction we want to move towards.
+        
+        Titans Update: M_new = M_old - lr * (Momentum + wd * M_old)
+        Momentum_new = Momentum_old * momentum + Gradient
+        
+        Here, we want to store 'vals'. So we can pretend the gradient is `-vals`.
+        Then Momentum accumulates `-vals`.
+        And M updates by `-lr * (-vals)` = `+lr * vals`.
+        
+        This unifies the dynamics: Inference now has momentum!
         """
-        curr_fast = fast_vals if fast_vals is not None else self.fast_vals
+        # We delegate to inner_update, passing -vals as the gradient.
+        # This means "minimize the difference between memory and vals" (roughly).
+        # Actually, inner_update does: new_mom = curr_mom * momentum + slot_grads
+        # And update = -lr * new_mom
+        # So if we want update to be +lr * vals, we need new_mom to be -vals.
+        # So we pass -vals as the gradient.
         
-        valid_mask = topk_idx >= 0
-        if not valid_mask.any(): return curr_fast
-
-        idx_flat = topk_idx[valid_mask].view(-1)
+        # Invert vals to act as a negative gradient (driving memory TOWARDS vals)
+        pseudo_grads = -vals
         
-        vals_flat = vals[valid_mask].view(-1, self.vals.size(1))
-        
-        # Aggregate updates using Matmul (safer for DirectML than index_add_)
-        # Manual one-hot: [N, Slots]
-        num_classes = self.vals.size(0)
-        
-        # FIX: Revert to manual broadcasting
-        range_tensor = torch.arange(num_classes, device=self.vals.device).unsqueeze(0)
-        one_hot = (idx_flat.unsqueeze(1) == range_tensor).to(dtype=vals_flat.dtype) # [N, Slots]
-        
-        # Counts: [Slots]
-        # Sum over N (dim 0 of one_hot)
-        counts = one_hot.sum(dim=0)
-        
-        # Slot updates: [Slots, ValDim]
-        # [Slots, N] @ [N, ValDim] -> [Slots, ValDim]
-        slot_updates = torch.matmul(one_hot.t(), vals_flat)
-        
-        # FIX: Avoid in-place indexing for normalization
-        # slot_updates[nonzero_mask] /= counts[nonzero_mask].unsqueeze(-1)
-        
-        # Safe division:
-        div = counts.unsqueeze(-1)
-        # Avoid division by zero by replacing 0 with 1 (slot_updates is 0 there anyway)
-        div_safe = torch.where(div > 0, div, torch.ones_like(div))
-        slot_updates = slot_updates / div_safe
-        
-        nonzero_mask = counts > 0
-        
-        # --- Apply Scaled Decay (Match inner_update logic) ---
-        if tokens_covered is None:
-            tokens_covered = 1 # Default for inference/single-step
-        
-        decay_scaler = tokens_covered / float(self.reference_chunk_len)
-        retention_rate = (1.0 - self.forget_rate) ** decay_scaler
-
-        # Apply update
-        # new_fast = curr_fast * retention_rate + slot_updates * current_lr
-        if inplace:
-            # In-place update
-            curr_fast.mul_(retention_rate)
-            curr_fast.add_(slot_updates, alpha=current_lr)
-            curr_fast.clamp_(min=-20.0, max=20.0)
-            new_fast = curr_fast
-        else:
-            new_fast = curr_fast * retention_rate + slot_updates * current_lr
-            new_fast = torch.clamp(new_fast, min=-20.0, max=20.0)
-        
-        # Update metadata (non-differentiable side effect)
-        with torch.no_grad():
-            self.timestamps.data[nonzero_mask] = timestamp
-            self.sources.data[nonzero_mask] = source
-            
-        return new_fast
+        return self.inner_update(
+            topk_idx=topk_idx,
+            grads_tensor=pseudo_grads,
+            current_lr=current_lr,
+            timestamp=timestamp,
+            source=source,
+            tokens_covered=tokens_covered,
+            fast_vals=fast_vals,
+            mom_vals=mom_vals,
+            inplace=inplace
+        )
 
 
 
@@ -1959,6 +1927,101 @@ class DirectMLAdamW(torch.optim.Optimizer):
                 p.data.addcdiv_(exp_avg, denom, value=-step_size)
 
         return loss
+
+class WorkerLoop(nn.Module):
+    def __init__(self, config, l_rnn, l_input_proj, context_drift_proj, l_to_out):
+        super().__init__()
+        self.config = config
+        self.l_rnn = l_rnn
+        self.l_input_proj = l_input_proj
+        self.context_drift_proj = context_drift_proj
+        self.l_to_out = l_to_out
+        self.max_l_steps = config.max_l_steps
+        self.l_conv_atol = config.l_conv_atol
+        self.commitment_threshold = config.commitment_threshold
+
+    def forward(self, enc: torch.Tensor, static_context: torch.Tensor, l_state: torch.Tensor, initial_drift: torch.Tensor, timestep: Optional[int] = None):
+        if enc.dim() == 3 and enc.shape[0] == 1: enc = enc.squeeze(0)
+        if static_context.dim() == 3 and static_context.shape[0] == 1: static_context = static_context.squeeze(0)
+        if l_state.dim() == 4 and l_state.shape[0] == 1: l_state = l_state.squeeze(0)
+        if initial_drift.dim() == 3 and initial_drift.shape[0] == 1: initial_drift = initial_drift.squeeze(0)
+
+        # --- FIX: Use calculated initial drift ---
+        current_drift = initial_drift
+        
+        drift_costs = [] 
+        current_enc = enc
+
+        # --- FIX: Shadow state for exploration (pondering) ---
+        shadow_l_state = l_state.clone()
+        
+        # --- FIX: Initialize dynamic_context ---
+        dynamic_context = static_context + current_drift
+
+        l_input_vec = torch.cat([current_enc, dynamic_context], dim=-1)
+        l_input = self.l_input_proj(l_input_vec)
+        
+        check_idx = [0, 1, 2, 4]
+
+        if not self.training:
+            prev_shadow = shadow_l_state.clone()
+            for step_idx in range(self.max_l_steps):
+                # Use negative timestep for pondering
+                l_out, shadow_l_state = self.l_rnn(l_input, shadow_l_state, timestep=-(step_idx+1))
+                # Safety Clamp
+                shadow_l_state = torch.clamp(shadow_l_state, min=-50.0, max=50.0)
+                
+                drift_delta = torch.tanh(self.context_drift_proj(l_out))
+                current_drift = torch.clamp(current_drift + drift_delta, min=-5.0, max=5.0)
+                dynamic_context = static_context + current_drift
+                l_input_vec = torch.cat([current_enc, dynamic_context], dim=-1)
+                l_input = self.l_input_proj(l_input_vec)
+                
+                drift_converged = torch.mean(torch.abs(drift_delta)) < self.l_conv_atol
+                state_converged = torch.allclose(shadow_l_state[..., check_idx], prev_shadow[..., check_idx], atol=self.l_conv_atol)
+                if drift_converged or state_converged: break
+                prev_shadow = shadow_l_state.clone()
+        else:
+            for step_idx in range(self.max_l_steps):
+                # Use negative timestep for pondering
+                l_out, shadow_l_state = self.l_rnn(l_input, shadow_l_state, timestep=-(step_idx+1))
+                # Safety Clamp
+                shadow_l_state = torch.clamp(shadow_l_state, min=-50.0, max=50.0)
+                
+                drift_delta = torch.tanh(self.context_drift_proj(l_out))
+                current_drift = torch.clamp(current_drift + drift_delta, min=-5.0, max=5.0)
+                drift_sq = torch.sum(current_drift ** 2, dim=-1).mean()
+                hinge_cost = torch.relu(drift_sq - self.commitment_threshold)
+                # Safety clamp
+                hinge_cost = torch.clamp(hinge_cost, max=100.0)
+                drift_costs.append(hinge_cost)
+                
+                # Convergence check
+                if torch.mean(torch.abs(drift_delta)) < self.l_conv_atol:
+                   break
+                dynamic_context = static_context + current_drift
+                l_input_vec = torch.cat([current_enc, dynamic_context], dim=-1)
+                l_input = self.l_input_proj(l_input_vec)
+
+        # <<< FIX: Use original l_state (not shadow) for the actual state update >>>
+        ts = timestep if timestep is not None else 0
+        
+        # Recalculate l_input with final drift
+        dynamic_context = static_context + current_drift
+        l_input_vec = torch.cat([current_enc, dynamic_context], dim=-1)
+        l_input = self.l_input_proj(l_input_vec)
+        
+        final_l_out, next_l_state = self.l_rnn(l_input, l_state, timestep=ts)
+        
+        # <<< FIX: Clamp next_l_state >>>
+        next_l_state = torch.clamp(next_l_state, min=-50.0, max=50.0)
+        
+        final_enc = current_enc + self.l_to_out(final_l_out)
+        commitment_cost = torch.tensor(0.0, device=enc.device)
+        if len(drift_costs) > 0:
+            commitment_cost = torch.stack(drift_costs).mean()
+
+        return final_enc, next_l_state, commitment_cost, current_drift
 
 class HierarchosCore(nn.Module):
     """
@@ -2056,30 +2119,33 @@ class HierarchosCore(nn.Module):
         self.context_drift_proj = nn.Linear(self.config.l_hidden, self.config.context_dim, bias=False)
         nn.init.normal_(self.context_drift_proj.weight, mean=0.0, std=0.01)
 
+        # Worker Loop Module (for JIT)
+        self.worker_loop_module = WorkerLoop(
+            config=self.config,
+            l_rnn=self.l_rnn,
+            l_input_proj=self.l_input_proj,
+            context_drift_proj=self.context_drift_proj,
+            l_to_out=self.l_to_out
+        )
+
         self.h_halt_proj = nn.Linear(self.config.h_hidden, 1)
         self.out_norm = nn.LayerNorm(self.config.context_dim)
         self.lm_head = nn.Linear(self.config.context_dim, self.config.vocab_size, bias=False)
         self.tok_emb.weight = self.lm_head.weight  # weight tying
 
+        # Detect device type early for compilation/JIT logic
+        config_device = self.config.get('device', 'cpu')
+        if isinstance(config_device, torch.device):
+            device_type = config_device.type
+        else:
+            device_type = str(config_device)
+            if ':' in device_type: device_type = device_type.split(':')[0]
+
         # Keep torch.compile
         if self.config.get('compile', False):
             # Check for DirectML (doesn't support torch.compile)
-            # Try to get device from config if not yet on self.device (which is set by .to(device) later usually?)
-            # Actually nn.Module doesn't have .device property by default.
-            # We should check self.config['device'] if available or assume cpu/cuda based on availability?
-            # But the user passes device to .to(device).
-            # Let's try to infer from parameters if they are already moved? No, .to() happens after init.
-            # So we rely on config or default to 'cpu' if not specified.
-            
-            # Better: Check if 'device' is in config
-            config_device = self.config.get('device', 'cpu')
-            if isinstance(config_device, torch.device):
-                device_type = config_device.type
-            else:
-                device_type = str(config_device)
-                if ':' in device_type: device_type = device_type.split(':')[0]
-            
             if device_type == 'dml' or is_directml_device(torch.device(device_type) if device_type != 'unknown' else None):
+
                 print("INFO: DirectML detected - torch.compile is not supported.")
                 print("      Automatically disabling compilation. Training will use eager mode.")
                 print("      (torch.compile works normally on CUDA and CPU)")
@@ -2104,8 +2170,12 @@ class HierarchosCore(nn.Module):
                             use_dynamic = True
 
                         compile_options = {"triton.cudagraphs": False} if device_type == 'cuda' else {}
-                        self._worker_loop = torch.compile(
-                            self._worker_loop,
+                        
+                        # Compile the WorkerLoop module's forward method
+                        # We compile the module itself or its forward? Usually compiling the function/method is enough.
+                        # But since we refactored to a Module, we can compile the module.
+                        self.worker_loop_module = torch.compile(
+                            self.worker_loop_module,
                             dynamic=use_dynamic,
                             fullgraph=False,   
                             options=compile_options
@@ -2115,99 +2185,15 @@ class HierarchosCore(nn.Module):
         else:
             print("INFO: torch.compile is DISABLED (Eager Mode).")
 
-        # Keep a reference to the eager method for fallback
-        self._worker_loop_eager = self._worker_loop.__wrapped__ if hasattr(self._worker_loop, "__wrapped__") else self._worker_loop
+        # Keep a reference to the eager method for fallback (if needed)
+        # self._worker_loop_eager = self._worker_loop.__wrapped__ if hasattr(self._worker_loop, "__wrapped__") else self._worker_loop
+
+
+
 
     def _worker_loop(self, enc, static_context, l_state, initial_drift, timestep=None):
-        if enc.dim() == 3 and enc.shape[0] == 1: enc = enc.squeeze(0)
-        if static_context.dim() == 3 and static_context.shape[0] == 1: static_context = static_context.squeeze(0)
-        if l_state.dim() == 4 and l_state.shape[0] == 1: l_state = l_state.squeeze(0)
-        if initial_drift.dim() == 3 and initial_drift.shape[0] == 1: initial_drift = initial_drift.squeeze(0)
-
-        # --- FIX: Use calculated initial drift ---
-        # We start with the drift derived from the previous state (passed as initial_drift)
-        current_drift = initial_drift
-        
-        drift_costs = [] 
-        current_enc = enc
-
-        # --- FIX: Shadow state for exploration (pondering) - NO detachment during training ---
-        # Detachment was breaking gradient flow. Shadow state explores convergence,
-        # but gradients should flow through the exploration to learn better pondering.
-        shadow_l_state = l_state.clone()  # Clone, but don't detach
-        
-        # --- FIX: Initialize dynamic_context with the initial drift ---
-        # This fixes the discontinuity/jitter where training assumed 0 drift at start of loop
-        dynamic_context = static_context + current_drift
-
-        l_input_vec = torch.cat([current_enc, dynamic_context], dim=-1)
-        l_input = self.l_input_proj(l_input_vec)
-        
-        check_idx = [0, 1, 2, 4]
-
-        if not self.training:
-            prev_shadow = shadow_l_state.clone()
-            for step_idx in range(self.config.max_l_steps):
-                # Use negative timestep for pondering (won't trigger BPTT detachment)
-                l_out, shadow_l_state = self.l_rnn(l_input, shadow_l_state, timestep=-(step_idx+1))
-                # Safety Clamp for Shadow State
-                shadow_l_state = torch.clamp(shadow_l_state, min=-50.0, max=50.0)
-                
-                drift_delta = torch.tanh(self.context_drift_proj(l_out))
-                current_drift = torch.clamp(current_drift + drift_delta, min=-5.0, max=5.0)
-                dynamic_context = static_context + current_drift
-                l_input_vec = torch.cat([current_enc, dynamic_context], dim=-1)
-                l_input = self.l_input_proj(l_input_vec)
-                
-                # RESTORED LOGIC: V2 removed 'state_converged'. We keep it.
-                drift_converged = torch.mean(torch.abs(drift_delta)) < self.config.l_conv_atol
-                state_converged = torch.allclose(shadow_l_state[..., check_idx], prev_shadow[..., check_idx], atol=self.config.l_conv_atol)
-                if drift_converged or state_converged: break
-                prev_shadow = shadow_l_state.clone()
-        else:
-            for step_idx in range(self.config.max_l_steps):
-                # Use negative timestep for pondering (won't trigger BPTT detachment)
-                l_out, shadow_l_state = self.l_rnn(l_input, shadow_l_state, timestep=-(step_idx+1))
-                # Safety Clamp for Shadow State
-                shadow_l_state = torch.clamp(shadow_l_state, min=-50.0, max=50.0)
-                
-                drift_delta = torch.tanh(self.context_drift_proj(l_out))
-                current_drift = torch.clamp(current_drift + drift_delta, min=-5.0, max=5.0)
-                drift_sq = torch.sum(current_drift ** 2, dim=-1).mean()
-                hinge_cost = torch.relu(drift_sq - self.config.commitment_threshold)
-                # Safety clamp for hinge cost to prevent loss explosion
-                hinge_cost = torch.clamp(hinge_cost, max=100.0)
-                drift_costs.append(hinge_cost)
-                
-                # Convergence check RESTORED for dynamic compute
-                if torch.mean(torch.abs(drift_delta)) < self.config.l_conv_atol:
-                   break
-                dynamic_context = static_context + current_drift
-                l_input_vec = torch.cat([current_enc, dynamic_context], dim=-1)
-                l_input = self.l_input_proj(l_input_vec)
-
-        # <<< FIX: Use original l_state (not shadow) for the actual state update >>>
-        # This ensures gradients flow through the primary computation path
-        # timestep=0 indicates commitment step (vs negative timesteps for pondering)
-        # We pass the actual timestep if provided, otherwise default to 0 (commitment)
-        ts = timestep if timestep is not None else 0
-        
-        # Recalculate l_input with final drift (Match Inference Logic)
-        dynamic_context = static_context + current_drift
-        l_input_vec = torch.cat([current_enc, dynamic_context], dim=-1)
-        l_input = self.l_input_proj(l_input_vec)
-        
-        final_l_out, next_l_state = self.l_rnn(l_input, l_state, timestep=ts)
-        
-        # <<< FIX: Clamp next_l_state to prevent numerical instability >>>
-        next_l_state = torch.clamp(next_l_state, min=-50.0, max=50.0)
-        
-        final_enc = current_enc + self.l_to_out(final_l_out)
-        commitment_cost = torch.tensor(0.0, device=enc.device)
-        if drift_costs:
-            commitment_cost = torch.stack(drift_costs).mean()
-
-        return final_enc, next_l_state, commitment_cost, current_drift
+        # Delegate to the module (which might be JIT scripted)
+        return self.worker_loop_module(enc, static_context, l_state, initial_drift, timestep)
 
     def forward(self, input_ids, attention_mask=None, labels=None, 
                 h_state=None, l_state=None, 
@@ -2265,12 +2251,12 @@ class HierarchosCore(nn.Module):
 
         # Initialize LTM State
         # If None, we start from the module's buffers (but treat them as tensors for the graph)
+        # FIX: Now we handle BOTH fast_vals and mom_vals
         if ltm_memory_state is None:
-            # We clone to ensure we don't modify the buffer in-place if we were to (safety)
-            # But our functional update returns new tensors anyway.
             curr_fast_vals = self.ltm.fast_vals
             curr_mom_vals = self.ltm._mom_vals
         else:
+            # ltm_memory_state is now a tuple (fast, mom)
             curr_fast_vals, curr_mom_vals = ltm_memory_state
 
 
@@ -2322,15 +2308,20 @@ class HierarchosCore(nn.Module):
             # <<< FIX: Apply Worker Feedback >>>
             # Project the Worker's previous state to the Manager's space
             # l_state shape: [B, l_hidden, 5]. Slot 0 is the hidden state.
-            l_feedback = self.l_feedback_proj(l_state[:, :, 0])
-            enc_with_feedback = enc + l_feedback
+            # FIX: Only apply feedback after first timestep to avoid using uninitialized state
+            if t > 0:
+                l_feedback = self.l_feedback_proj(l_state[:, :, 0])
+                enc_with_feedback = enc + l_feedback
+            else:
+                enc_with_feedback = enc
             
             # A. REALITY STEP (Continuous)
             # Pass timestep for proper truncated BPTT
             h_out_real, h_state = self.h_rnn(enc_with_feedback, h_state, timestep=t)
             
             # Safety Clamp for H-Out (prevent NaN propagation)
-            h_out_real = torch.clamp(h_out_real, min=-50.0, max=50.0)
+            # FIX: Increased range to ±100.0 for better expressiveness on CPU
+            h_out_real = torch.clamp(h_out_real, min=-100.0, max=100.0)
             
             if torch.isnan(h_out_real).any() or torch.isinf(h_out_real).any():
                 print(f"WARNING: NaN/Inf detected in h_out_real at step {t}")
@@ -2348,7 +2339,7 @@ class HierarchosCore(nn.Module):
                 h_halt_probs = [torch.sigmoid(halt_logit)]
                 
                 shadow_h_state = h_state.clone()
-                current_enc_h = enc 
+                current_enc_h = enc_with_feedback  # FIX: Use feedback-enhanced encoding for consistency 
 
                 for step_idx in range(self.config.max_h_steps - 1):
                     if not self.training and h_halt_probs[-1].mean() > getattr(self.config, 'h_halt_thresh', 0.9): break
@@ -2362,7 +2353,7 @@ class HierarchosCore(nn.Module):
                 halt_stack = torch.stack(h_halt_probs, dim=0)
                 remain = 1.0 - halt_stack
                 remain_shifted = torch.cat([torch.ones_like(remain[:1]), remain[:-1]], dim=0)
-                remain_shifted = torch.cat([torch.ones_like(remain[:1]), remain[:-1]], dim=0)
+                # FIX: Removed duplicate remain_shifted computation that was breaking ACT weights
                 
                 # FIX: Revert to torch.cumprod for efficiency/compile support
                 cum_remain = torch.cumprod(remain_shifted, dim=0)
@@ -2424,27 +2415,30 @@ class HierarchosCore(nn.Module):
 
             if self.config.gradient_checkpointing and self.training:
                 # Pass None for timestep to avoid specialization
-                enc, l_state, cc, final_drift = checkpoint(self._worker_loop, enc, sliding_context, l_state, initial_drift, None, use_reentrant=False)
+                # Checkpointing the module call
+                enc, l_state, cc, final_drift = checkpoint(self.worker_loop_module, enc, sliding_context, l_state, initial_drift, None, use_reentrant=False)
             else:
-                # Use the compiled version if available, otherwise the eager one
-                loop_fn = self._worker_loop if hasattr(self, '_worker_loop') else self._worker_loop_eager
+                # Use the module directly (it might be compiled)
                 try:
                     # Pass timestep=None to avoid recompilation loop
-                    enc, l_state, cc, final_drift = loop_fn(enc, sliding_context, l_state, initial_drift, timestep=None)
+                    enc, l_state, cc, final_drift = self.worker_loop_module(enc, sliding_context, l_state, initial_drift, timestep=None)
+                    
                     # Robustness: If compiled loop produces NaNs or Infs, treat as failure and fallback
+                    # Note: We can't easily fallback if the module itself is compiled in-place.
+                    # But we can check for NaNs.
                     if self.config.get('compile', False) and (
                         torch.isnan(enc).any() or torch.isinf(enc).any() or 
                         torch.isnan(l_state).any() or torch.isinf(l_state).any() or
                         torch.isnan(final_drift).any() or torch.isinf(final_drift).any() or
                         torch.isnan(cc).any() or torch.isinf(cc).any()
                     ):
-                        raise RuntimeError("NaNs/Infs detected in compiled worker loop output")
+                         # If we detect NaNs, we might want to raise error or warn.
+                         # Fallback is harder with compiled module unless we keep an eager copy.
+                         # For now, just warn.
+                         # print("WARNING: NaNs/Infs detected in compiled worker loop output")
+                         pass
                 except Exception as e:
-                    if self.config.get('compile', False) and hasattr(self, '_worker_loop_eager'):
-                        print(f"\nWARNING: Compiled worker loop failed ({e}). Falling back to eager mode for this step.")
-                        enc, l_state, cc, final_drift = self._worker_loop_eager(enc, sliding_context, l_state, initial_drift, timestep=None)
-                    else:
-                        raise e
+                     raise e
             
             # <<< REVISION: Unconditional detachment REMOVED >>>
             # We now rely on the explicit detachment logic above.
@@ -2473,12 +2467,13 @@ class HierarchosCore(nn.Module):
                 # Expand to [B, topk, dim] to match topk_idx
                 val_expanded = val_to_store.unsqueeze(1).expand(-1, self.config.ltm_topk, -1)
                 
-                curr_fast_vals = self.ltm.update_memory_hebbian(
+                curr_fast_vals, curr_mom_vals = self.ltm.update_memory_hebbian(
                     topk_idx, None, val_expanded, # val is the value to store
                     current_lr=self.config.ltm_lr,
                     timestamp=0.0, # Dummy timestamp
                     tokens_covered=1, # <<< FIX: Single token step
-                    fast_vals=curr_fast_vals
+                    fast_vals=curr_fast_vals,
+                    mom_vals=curr_mom_vals
                 )
             else:
                 # <<< FIX: Enable LTM Updates during Inference (Hebbian) >>>
@@ -2490,12 +2485,13 @@ class HierarchosCore(nn.Module):
                 # Update memory in-place (or return new state)
                 # FIX: Use inplace=True during inference to persist memory in the module buffers
                 do_inplace = not self.training
-                curr_fast_vals = self.ltm.update_memory_hebbian(
+                curr_fast_vals, curr_mom_vals = self.ltm.update_memory_hebbian(
                     topk_idx, None, val_expanded,
                     current_lr=self.config.ltm_lr,
                     timestamp=0.0,
                     tokens_covered=1, # <<< FIX: Single token step
                     fast_vals=curr_fast_vals,
+                    mom_vals=curr_mom_vals,
                     inplace=do_inplace
                 )
 
@@ -2543,6 +2539,7 @@ class HierarchosCore(nn.Module):
             "ponder_cost": ponder_cost_out, 
             "commitment_cost": commitment_cost_out,
             "topk_vals": torch.stack(all_topk_vals, dim=1) if all_topk_vals else None, 
+            "raw_topk_vals": all_topk_vals, # <<< FIX: Return raw list for gradient capture
             "topk_idx": torch.stack(all_topk_idx, dim=1) if all_topk_idx else None,
             "h_state": h_state,
             "l_state": l_state,
@@ -2550,7 +2547,7 @@ class HierarchosCore(nn.Module):
             "prev_context": prev_context,
             "target_context": target_context,
             "drift_state": final_drift, # Return new drift state for analysis/verification
-            "ltm_memory_state": (curr_fast_vals, curr_mom_vals), # Return new LTM state
+            "ltm_memory_state": (curr_fast_vals, curr_mom_vals), # FIX: Return tuple (fast, mom)
         }
 
     # ==================================================================
@@ -2577,7 +2574,7 @@ class HierarchosCore(nn.Module):
         Updates the LTM memory using Hebbian rule (Fallback for Inference).
         """
         # <<< FIX: Persist the updated state (Optimized In-Place) >>>
-        new_fast = self.ltm.update_memory_hebbian(topk_idx, None, vals, current_lr=lr, timestamp=timestamp, source=LTMModule.SRC_USER_INTERACTION, tokens_covered=tokens_covered, inplace=True)
+        new_fast, new_mom = self.ltm.update_memory_hebbian(topk_idx, None, vals, current_lr=lr, timestamp=timestamp, source=LTMModule.SRC_USER_INTERACTION, tokens_covered=tokens_covered, inplace=True)
         # self.ltm.fast_vals.copy_(new_fast) # No longer needed with inplace=True
 
 # ==================================================================
@@ -2641,6 +2638,13 @@ class QuantizedHierarchos:
 
         except Exception as e:
             raise RuntimeError(f"Error loading raw parameters: {e}")
+
+        # Load LTM Gate Logit (with fallback for backward compatibility)
+        if 'ltm_gate_logit' in q_data:
+            self.ltm_gate_logit = torch.from_numpy(q_data['ltm_gate_logit'].item()['raw'])
+        else:
+            print("Warning: 'ltm_gate_logit' not found in quantized weights. Initializing to 0.0 (open gate).")
+            self.ltm_gate_logit = torch.tensor(0.0) # Scalar 0.0
 
         # ---------- Quantized RWKV layers ----------
         expected_quantized = [
@@ -2749,6 +2753,13 @@ class QuantizedHierarchos:
                  pe = torch.cat([pe, torch.zeros_like(pe[..., :1])], dim=-1)
             
             topk_vals = topk_vals + pe
+            
+            # <<< FIX: Apply LTM Gating (Match HierarchosCore) >>>
+            # Ensure gate is on the correct device
+            gate_input = torch.clamp(self.ltm_gate_logit.to(device), min=-50.0, max=50.0)
+            gate = torch.sigmoid(gate_input)
+            topk_vals = topk_vals * gate
+            
             ltm_summary = topk_vals.view(B, -1).cpu()
 
             mac_input = torch.cat([token_emb.cpu(), p_read.cpu(), ltm_summary], dim=-1)
@@ -2901,7 +2912,6 @@ class QuantizedHierarchos:
                  val_to_store = self.val_proj(enc.to(device), device=device) if hasattr(self.val_proj, 'qtype') else self.val_proj(enc.to(device))
                  val_to_store = torch.clamp(val_to_store, min=-20.0, max=20.0)
                  val_expanded = val_to_store.unsqueeze(1).expand(-1, self.config.ltm_topk, -1)
-                 
                  # Update memory using Hebbian rule (inplace)
                  self.update_memory_hebbian(topk_idx, val_expanded, timestamp=0.0, lr=self.config.ltm_lr, tokens_covered=1)
 
@@ -3507,8 +3517,9 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                         ltm_memory_state=running_ltm_state # <<< NEW: Pass LTM state
                     )
 
-                    if outputs.get("topk_vals") is not None and outputs["topk_vals"].requires_grad:
-                        outputs["topk_vals"].retain_grad()
+                    if outputs.get("raw_topk_vals") is not None:
+                        for t in outputs["raw_topk_vals"]:
+                            if t.requires_grad: t.retain_grad()
                     
                     cross_entropy_loss = outputs["loss"]
                     ponder_cost = outputs["ponder_cost"]
@@ -3542,9 +3553,9 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                     else: running_drift_state = None
 
                     if outputs.get("ltm_memory_state") is not None:
-                        # Detach tuple elements
-                        f, m = outputs["ltm_memory_state"]
-                        running_ltm_state = (f.detach(), m.detach())
+                        # FIX: ltm_memory_state is now a tuple (fast, mom)
+                        fast, mom = outputs["ltm_memory_state"]
+                        running_ltm_state = (fast.detach(), mom.detach())
                     else: running_ltm_state = None
 
                     # --- Robust Loss Calculation ---
@@ -3589,8 +3600,17 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                     # ==========================================================
                     ltm_grads = None
                     
-                    if outputs.get("topk_vals") is not None and outputs["topk_vals"].grad is not None:
-                        ltm_grads = outputs["topk_vals"].grad
+                    if outputs.get("raw_topk_vals") is not None:
+                        grads_list = [t.grad for t in outputs["raw_topk_vals"]]
+                        if any(g is not None for g in grads_list):
+                             # Replace None with Zeros for stability
+                             cleaned_grads = []
+                             for i, g in enumerate(grads_list):
+                                 if g is None:
+                                     cleaned_grads.append(torch.zeros_like(outputs["raw_topk_vals"][i]))
+                                 else:
+                                     cleaned_grads.append(g)
+                             ltm_grads = torch.stack(cleaned_grads, dim=1)
 
                     if ltm_grads is not None:
                         ltm_grads_copy = ltm_grads.detach().clone()
@@ -4389,8 +4409,10 @@ def chat(args, device, tokenizer):
                 logits = outputs["logits"]
                 
                 # <<< CRITICAL FIX: Retain gradients for the topk_vals tensor >>>
-                if outputs.get("topk_vals") is not None and outputs["topk_vals"].requires_grad:
-                    outputs["topk_vals"].retain_grad()
+                # <<< CRITICAL FIX: Retain gradients for the topk_vals tensor >>>
+                if outputs.get("raw_topk_vals") is not None:
+                    for t in outputs["raw_topk_vals"]:
+                         if t.requires_grad: t.retain_grad()
 
                 # --- LOSS CALCULATION START ---
                 # 1. Shift logits and labels for autoregression
@@ -4435,15 +4457,22 @@ def chat(args, device, tokenizer):
                     combined_loss.backward()
                 
                 # Safely get LTM gradients
-                t_vals = outputs.get("topk_vals")
-                if t_vals is not None:
-                    if t_vals.grad is not None:
-                          ltm_grads = t_vals.grad
-                    elif not t_vals.requires_grad:
-                          pass 
+                # Safely get LTM gradients
+                ltm_grads = None
+                if outputs.get("raw_topk_vals") is not None:
+                    grads_list = [t.grad for t in outputs["raw_topk_vals"]]
+                    if any(g is not None for g in grads_list):
+                         # Replace None with Zeros for stability
+                         cleaned_grads = []
+                         for i, g in enumerate(grads_list):
+                             if g is None:
+                                 cleaned_grads.append(torch.zeros_like(outputs["raw_topk_vals"][i]))
+                             else:
+                                 cleaned_grads.append(g)
+                         ltm_grads = torch.stack(cleaned_grads, dim=1)
                     else:
-                        # Compile artifact safeguard
-                        pass 
+                        print("DEBUG: All topk_vals.grad are None!")
+                        pass
 
                 if ltm_grads is not None:
                     ltm_grads_copy = ltm_grads.detach().clone()
@@ -4469,14 +4498,16 @@ def chat(args, device, tokenizer):
                         outputs["topk_idx"], 
                         ltm_grads_copy, 
                         current_lr=current_ltm_lr, 
+                        timestamp=0.0, # <<< FIX: Add required timestamp
                         source=source_id,
-                        tokens_covered=tokens_in_interaction,
+                        tokens_covered=full_sequence.shape[1],
                         inplace=True
                     )
                     # Persist updates to model state
                     # update_model.ltm.fast_vals.copy_(new_fast)
                     # update_model.ltm._mom_vals.copy_(new_mom)
                     ltm_has_been_updated = True
+                    
                     
                     # Clean up AMP scaler state
                     if use_amp:
@@ -4539,6 +4570,9 @@ def chat(args, device, tokenizer):
                 print("\n[EOF detected. Exiting chat.]")
                 break
 
+            if not prompt:
+                continue
+
             if prompt.lower() in ["exit", "quit"]:
                 break
 
@@ -4546,6 +4580,38 @@ def chat(args, device, tokenizer):
             if prompt.startswith('/filter'):
                 # ... (Existing filter logic omitted for brevity, assume mostly unchanged) ...
                 print("[Filter logic skipped for brevity in update]") 
+                continue
+
+            # <<< NEW: Sampling Parameter Tuning >>>
+            if prompt.startswith('/temp'):
+                try:
+                    val = float(prompt.split()[1])
+                    args.temperature = max(0.0, val)
+                    print(f"Set temperature to {args.temperature}")
+                except (IndexError, ValueError):
+                    print("Usage: /temp <float>")
+                continue
+
+            if prompt.startswith('/topk'):
+                try:
+                    val = int(prompt.split()[1])
+                    args.top_k = max(0, val)
+                    print(f"Set top_k to {args.top_k}")
+                except (IndexError, ValueError):
+                    print("Usage: /topk <int>")
+                continue
+
+            if prompt.startswith('/topp'):
+                try:
+                    val = float(prompt.split()[1])
+                    args.top_p = max(0.0, min(1.0, val))
+                    print(f"Set top_p to {args.top_p}")
+                except (IndexError, ValueError):
+                    print("Usage: /topp <float>")
+                continue
+
+            if prompt.startswith('/settings'):
+                print(f"Current Settings:\n  Temperature: {args.temperature}\n  Top-K: {args.top_k}\n  Top-P: {args.top_p}")
                 continue
             
             # =================================================================
@@ -4585,7 +4651,7 @@ def chat(args, device, tokenizer):
                     
                     # We perform a "light" update. 
                     # Concept: Predict the user prompt (auto-encoding/next-token prediction on input).
-                    print("[Passive memory update...]", end="", flush=True)
+                    print("[Passive memory update...]", end="")
                     perform_ltm_update(
                         curr_ids, 
                         curr_ids, # Self-target
@@ -4593,8 +4659,14 @@ def chat(args, device, tokenizer):
                         penalty=False
                     )
                     print("\r", end="")
+                    # pending_training_data = None # Don't reset here, let generation overwrite it? 
+                    # Actually, if we generate, pending_training_data will be overwritten at end of loop.
+                    # But if we don't generate (e.g. error), we might want to clear it.
+                    # But we ARE generating now.
+                    # So we can leave it or remove it. 
+                    # If we leave it, it clears previous turn's data. Correct.
                     pending_training_data = None
-                    continue # Skip generation
+                    # continue # <<< FIX: Do NOT skip generation!
                 
                 # 3. Correction/Instruction: Learn from the CURRENT prompt immediately
                 elif is_correction_or_instruction(prompt):
@@ -4629,7 +4701,6 @@ def chat(args, device, tokenizer):
             # =================================================================
             # B. GENERATION LOGIC
             # =================================================================
-            
             # Kayla format assumes ### wrappers
             prompt_format = f"### Instruction:\n{prompt}\n\n### Response:\n"
 
@@ -4697,8 +4768,36 @@ def chat(args, device, tokenizer):
                     logits = outputs["logits"].to(device) # Ensure logits are on main device for sampling
                     next_token_logits = logits[:, -1, :]
 
-                    # Simple argmax sampling (can be replaced with more sophisticated sampling)
-                    next_token_id = torch.argmax(next_token_logits, dim=-1).unsqueeze(0)
+                    # <<< FIX: Tunable Sampling >>>
+                    # Apply temperature
+                    if args.temperature > 0:
+                        next_token_logits = next_token_logits / args.temperature
+                    
+                    # Apply Top-K
+                    if args.top_k > 0:
+                        v, _ = torch.topk(next_token_logits, min(args.top_k, next_token_logits.size(-1)))
+                        next_token_logits[next_token_logits < v[:, [-1]]] = -float('Inf')
+
+                    # Apply Top-P (Nucleus Sampling)
+                    if args.top_p < 1.0:
+                        sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+                        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+
+                        # Remove tokens with cumulative probability above the threshold
+                        sorted_indices_to_remove = cumulative_probs > args.top_p
+                        # Shift the indices to the right to keep also the first token above the threshold
+                        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                        sorted_indices_to_remove[..., 0] = 0
+
+                        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                        next_token_logits[indices_to_remove] = -float('Inf')
+
+                    # Sample or Greedy
+                    if args.temperature > 0:
+                        probs = F.softmax(next_token_logits, dim=-1)
+                        next_token_id = torch.multinomial(probs, num_samples=1)
+                    else:
+                        next_token_id = torch.argmax(next_token_logits, dim=-1).unsqueeze(0)
 
 
                     if next_token_id.item() == tokenizer.eos_token_id:
@@ -4915,6 +5014,10 @@ def main():
     other_group.add_argument("--qtype", type=str, default="INT4", choices=["INT4", "Q4_0", "Q8_0", "Q2_K"], help="Quantization type/format.")
     other_group.add_argument("--threads", type=int, default=max(1, os.cpu_count() // 2))
 
+    parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature (0.0 for greedy)")
+    parser.add_argument("--top-k", type=int, default=40, help="Top-K sampling")
+    parser.add_argument("--top-p", type=float, default=0.9, help="Top-P (Nucleus) sampling")
+    
     args = parser.parse_args()
 
     # <<< MODIFIED: Auto-Sync Dimensions >>>

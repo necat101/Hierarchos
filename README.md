@@ -1,12 +1,20 @@
 -----
 
-# Hierarchos v0.12.0 (alpha): A Hybrid Memory-Reasoning Architecture
+# Hierarchos v0.13.0 (alpha): A Hybrid Memory-Reasoning Architecture
 
 A novel AI architecture that synergistically integrates Google's Titans memory system with a Hierarchical Reasoning Model (HRM) to move beyond the limitations of scale and take a decisive step on the path to AGI.
 
 Due to Amazon's "Chronos" forecasting models (still based on transformers BTW) I've decided to rename the project to "Hierarchos" from this point forward. This should prevent any naming confusion that may occur.
 
 -----
+
+### 🚀 **New in v0.13.0: The "Interactive Control" Update**
+
+> This update introduces dynamic sampling controls for chat and resolves deep-seated gradient flow issues in the memory system.
+>
+> 1.  **Tunable Sampling:** 🎛️ You can now adjust Temperature, Top-K, and Top-P on the fly during chat using `/temp`, `/topk`, and `/topp` commands.
+> 2.  **LTM Gradient Fix:** 🧠 Fixed a critical bug where gradients weren't flowing back to the LTM module, ensuring the model actually *learns* to use its memory.
+> 3.  **Stability Fixes:** 🛠️ Resolved crashes and logic errors in the chat loop, ensuring smooth, uninterrupted conversations.
 
 ### 🚀 **New in v0.12.0: The "Performance & Compatibility" Update**
 
@@ -483,6 +491,7 @@ python hierarchos.py train \
 | `--context_dim`      | ***Required:*** New context dimension.                                                | Yes      |         |
 | `--h_hidden`         | ***Required:*** New H-RNN hidden size.                                                | Yes      |         |
 | `--l_hidden`         | ***Required:*** New L-RNN hidden size.                                                | Yes      |         |
+| *Other Arch Args* | *Optional:* Add other architectural args like `--ltm_slots`, `--max_length`, etc., if changing them. | No       | *(Uses old model's value)* |
 
 -----
 
@@ -514,6 +523,16 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
   * **DirectML/ZLUDA communities** for enabling AMD GPU acceleration on Windows.
 
 ## Changelog
+
+### v0.13.0 (alpha)
+
+  * **Interactive Sampling Parameters**:
+      * Added `/temp <float>`, `/topk <int>`, and `/topp <float>` commands to `chat` mode for dynamic control over generation creativity.
+      * Added `/settings` command to view current sampling parameters.
+  * **LTM Stability & Persistence Fixes**:
+      * **Fixed Gradient Flow**: Resolved a critical issue where LTM gradients were detached, preventing the model from learning to use its memory effectively during training.
+      * **Fixed Passive Updates**: Corrected a logic error that caused the model to skip generation after passive memory updates.
+      * **Crash Fixes**: Resolved `NameError` and `TypeError` in the LTM update routine.
 
 ### v0.12.0 (alpha)
 

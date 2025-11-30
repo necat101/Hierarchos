@@ -74,9 +74,12 @@ def test_drift_discrepancy():
         # Let's just use the model's components
         
         x = model.tok_emb(token_ids).squeeze(1)
-        q = torch.clamp(model.qproj(x), min=-10, max=10)
+
         # Real LTM Retrieval (Match Forward Logic)
         # We need to pass fast_vals=model.ltm.fast_vals to match forward's default behavior
+        # <<< FIX: Context-Aware Query >>>
+        q_in = torch.cat([x, curr_prev_context], dim=-1)
+        q = torch.clamp(model.qproj(q_in), min=-10, max=10)
         topk_vals, topk_idx, topk_ts = model.ltm.retrieve_topk(q, config['ltm_topk'], fast_vals=model.ltm.fast_vals)
         
         # Time Encoding (Match Forward Logic)

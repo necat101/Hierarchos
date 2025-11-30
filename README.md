@@ -1,12 +1,20 @@
 -----
 
-# Hierarchos v0.13.0 (alpha): A Hybrid Memory-Reasoning Architecture
+# Hierarchos v0.13.5 (alpha): A Hybrid Memory-Reasoning Architecture
 
 A novel AI architecture that synergistically integrates Google's Titans memory system with a Hierarchical Reasoning Model (HRM) to move beyond the limitations of scale and take a decisive step on the path to AGI.
 
 Due to Amazon's "Chronos" forecasting models (still based on transformers BTW) I've decided to rename the project to "Hierarchos" from this point forward. This should prevent any naming confusion that may occur.
 
 -----
+
+### 🚀 **New in v0.13.5: The "Coherence & Stability" Update**
+
+> This update resolves subtle architectural discrepancies between training and inference, ensuring the model's reasoning is mathematically consistent in all modes.
+>
+> 1.  **Fixed Coherence Drift:** 🎯 Eliminated a critical drift issue where the Manager's long-term planning (strided updates) diverged between parallel training and sequential inference. By unifying the timestep logic (`global_pos_offset`), the model now behaves identically in both modes.
+> 2.  **LTM Persistence Fix:** 🧠 Confirmed and fixed an issue where Long-Term Memory updates (both Hebbian and Gradient-based) were not correctly persisting across inference steps. The model now reliably "remembers" its interactions.
+> 3.  **Chat Coherence:** 💬 Updated the `chat` engine to fully utilize the new coherence fixes, ensuring that long conversations maintain consistent context and reasoning.
 
 ### 🚀 **New in v0.13.0: The "Interactive Control" Update**
 
@@ -491,6 +499,7 @@ python hierarchos.py train \
 | `--context_dim`      | ***Required:*** New context dimension.                                                | Yes      |         |
 | `--h_hidden`         | ***Required:*** New H-RNN hidden size.                                                | Yes      |         |
 | `--l_hidden`         | ***Required:*** New L-RNN hidden size.                                                | Yes      |         |
+| *Other Arch Args* | *Optional:* Add other architectural args like `--ltm_slots`, `--max_length`, etc., if changing them. | No       | *(Uses old model's value)* |
 
 -----
 
@@ -522,6 +531,14 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
   * **DirectML/ZLUDA communities** for enabling AMD GPU acceleration on Windows.
 
 ## Changelog
+
+### v0.13.5 (alpha)
+
+  * **Coherence & Stability Fixes**:
+      * **Fixed Manager Stride Logic**: Corrected the Manager's strided update check to use global position instead of local chunk index, eliminating drift between training (chunked) and inference (sequential).
+      * **Unified Lerp Interpolation**: Updated the context interpolation (Lerp) to use global position, ensuring smooth and consistent context transitions in all modes.
+      * **LTM Persistence**: Verified and fixed persistence of LTM `fast_vals` and `mom_vals` during inference, enabling reliable test-time learning.
+      * **Chat Engine Update**: Updated `chat` function to pass `global_pos_offset` to the full-precision model, propagating coherence fixes to interactive sessions.
 
 ### v0.13.0 (alpha)
 

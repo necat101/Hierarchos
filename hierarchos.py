@@ -1928,9 +1928,8 @@ class DirectMLAdamW(torch.optim.Optimizer):
 
         return loss
 
-class WorkerLoop(nn.Module):
+class WorkerLoop:
     def __init__(self, config, l_rnn, l_input_proj, context_drift_proj, l_to_out):
-        super().__init__()
         self.config = config
         self.l_rnn = l_rnn
         self.l_input_proj = l_input_proj
@@ -1940,7 +1939,7 @@ class WorkerLoop(nn.Module):
         self.l_conv_atol = config.l_conv_atol
         self.commitment_threshold = config.commitment_threshold
 
-    def forward(self, enc: torch.Tensor, static_context: torch.Tensor, l_state: torch.Tensor, initial_drift: torch.Tensor, timestep: Optional[int] = None):
+    def __call__(self, enc: torch.Tensor, static_context: torch.Tensor, l_state: torch.Tensor, initial_drift: torch.Tensor, timestep: Optional[int] = None):
         if enc.dim() == 3 and enc.shape[0] == 1: enc = enc.squeeze(0)
         if static_context.dim() == 3 and static_context.shape[0] == 1: static_context = static_context.squeeze(0)
         if l_state.dim() == 4 and l_state.shape[0] == 1: l_state = l_state.squeeze(0)
@@ -1960,10 +1959,12 @@ class WorkerLoop(nn.Module):
 
         l_input_vec = torch.cat([current_enc, dynamic_context], dim=-1)
         l_input = self.l_input_proj(l_input_vec)
+        # <<< FIX: Clamp l_input for stability >>>
+        l_input = torch.clamp(l_input, min=-50.0, max=50.0)
         
         check_idx = [0, 1, 2, 4]
 
-        if not self.training:
+        if not self.l_rnn.training:
             prev_shadow = shadow_l_state.clone()
             for step_idx in range(self.max_l_steps):
                 # Use negative timestep for pondering
@@ -2090,7 +2091,10 @@ class HierarchosCore(nn.Module):
         emb = torch.exp(torch.arange(half_dim, dtype=torch.float) * -emb)
         self.register_buffer('time_freqs', emb)
 
-        self.qproj = nn.Linear(self.config.context_dim, self.config.ltm_key_dim, bias=False)
+        # <<< FIX: Context-Aware LTM Query >>>
+        # We concatenate token embedding and context for the query projection
+        # This allows the model to retrieve memories relevant to the *situation*, not just the *word*.
+        self.qproj = nn.Linear(self.config.context_dim * 2, self.config.ltm_key_dim, bias=False)
         self.val_proj = nn.Linear(self.config.context_dim, self.config.ltm_val_dim, bias=False) # <<< NEW: Project to val dim
         in_dim = self.config.context_dim + self.config.persistent_dim + (self.config.ltm_val_dim * self.config.ltm_topk)
         self.in_proj = nn.Linear(in_dim, self.config.context_dim)
@@ -2141,47 +2145,9 @@ class HierarchosCore(nn.Module):
             device_type = str(config_device)
             if ':' in device_type: device_type = device_type.split(':')[0]
 
-        # Keep torch.compile
+        # Compilation is now handled explicitly via model.compile() to avoid state_dict mismatch
         if self.config.get('compile', False):
-            # Check for DirectML (doesn't support torch.compile)
-            if device_type == 'dml' or is_directml_device(torch.device(device_type) if device_type != 'unknown' else None):
-
-                print("INFO: DirectML detected - torch.compile is not supported.")
-                print("      Automatically disabling compilation. Training will use eager mode.")
-                print("      (torch.compile works normally on CUDA and CPU)")
-                self.config['compile'] = False
-            # Check for Windows CPU + Compile (Known Hang Issue)
-            # Allow override with --force-compile
-            elif os.name == 'nt' and device_type == 'cpu' and not self.config.get('force_compile', False):
-                print("WARNING: torch.compile on Windows CPU is known to hang with complex RNN loops.")
-                print("         Disabling compilation for the Worker Loop to ensure stability.")
-                print("         Use --force-compile to override this safety check.")
-                self.config['compile'] = False 
-            else:
-                try:
-                    if hasattr(torch, "compile"):
-                        print("INFO: --compile flag set. Applying torch.compile to Worker (L-RNN) loop...")
-                        
-                        # Dynamic shapes can cause instability/hangs on Windows CPU with Inductor
-                        use_dynamic = True
-                        # Robust check for Windows CPU
-                        if os.name == 'nt' and (device_type == 'cpu' or device_type == 'unknown'):
-                            print(f"INFO: Device type detected as '{device_type}'. Keeping dynamic shapes ENABLED (User Override).")
-                            use_dynamic = True
-
-                        compile_options = {"triton.cudagraphs": False} if device_type == 'cuda' else {}
-                        
-                        # Compile the WorkerLoop module's forward method
-                        # We compile the module itself or its forward? Usually compiling the function/method is enough.
-                        # But since we refactored to a Module, we can compile the module.
-                        self.worker_loop_module = torch.compile(
-                            self.worker_loop_module,
-                            dynamic=use_dynamic,
-                            fullgraph=False,   
-                            options=compile_options
-                        )
-                except Exception as e:
-                    print(f"WARNING: torch.compile failed ({e}) -- falling back to eager mode")
+             print("INFO: Model initialized in Eager Mode. Call model.compile() to enable JIT.")
         else:
             print("INFO: torch.compile is DISABLED (Eager Mode).")
 
@@ -2195,11 +2161,119 @@ class HierarchosCore(nn.Module):
         # Delegate to the module (which might be JIT scripted)
         return self.worker_loop_module(enc, static_context, l_state, initial_drift, timestep)
 
+    def compile(self):
+        """Applies torch.compile to the worker loop if enabled in config."""
+        if not self.config.get('compile', False):
+            return
+
+        # Detect device type early for compilation/JIT logic
+        config_device = self.config.get('device', 'cpu')
+        if isinstance(config_device, torch.device):
+            device_type = config_device.type
+        else:
+            device_type = str(config_device)
+            if ':' in device_type: device_type = device_type.split(':')[0]
+
+        # Check for DirectML (doesn't support torch.compile)
+        if device_type == 'dml' or is_directml_device(torch.device(device_type) if device_type != 'unknown' else None):
+            print("INFO: DirectML detected - torch.compile is not supported.")
+            print("      Automatically disabling compilation. Training will use eager mode.")
+            self.config['compile'] = False
+            return
+
+        # Check for Windows CPU + Compile (Known Hang Issue)
+        # Allow override with --force-compile
+        if os.name == 'nt' and device_type == 'cpu' and not self.config.get('force_compile', False):
+            print("WARNING: torch.compile on Windows CPU is known to hang with complex RNN loops.")
+            print("         Disabling compilation for the Worker Loop to ensure stability.")
+            print("         Use --force-compile to override this safety check.")
+            self.config['compile'] = False
+            return
+
+        try:
+            if hasattr(torch, "compile"):
+                print("INFO: --compile flag set. Applying torch.compile to Worker (L-RNN) loop...")
+                
+                # Dynamic shapes can cause instability/hangs on Windows CPU with Inductor
+                use_dynamic = True
+                # Robust check for Windows CPU
+                if os.name == 'nt' and (device_type == 'cpu' or device_type == 'unknown'):
+                    print(f"INFO: Device type detected as '{device_type}'. Keeping dynamic shapes ENABLED (User Override).")
+                    use_dynamic = True
+
+                compile_options = {"triton.cudagraphs": False} if device_type == 'cuda' else {}
+                
+                # Compile the WorkerLoop module's forward method
+                self.worker_loop_module = torch.compile(
+                    self.worker_loop_module,
+                    dynamic=use_dynamic,
+                    fullgraph=False,   
+                    options=compile_options
+                )
+                print("INFO: WorkerLoop compiled successfully.")
+        except Exception as e:
+            print(f"WARNING: torch.compile failed ({e}) -- falling back to eager mode")
+
+    def compile(self):
+        """Applies torch.compile to the worker loop if enabled in config."""
+        if not self.config.get('compile', False):
+            return
+
+        # Detect device type early for compilation/JIT logic
+        config_device = self.config.get('device', 'cpu')
+        if isinstance(config_device, torch.device):
+            device_type = config_device.type
+        else:
+            device_type = str(config_device)
+            if ':' in device_type: device_type = device_type.split(':')[0]
+
+        # Check for DirectML (doesn't support torch.compile)
+        if device_type == 'dml' or is_directml_device(torch.device(device_type) if device_type != 'unknown' else None):
+            print("INFO: DirectML detected - torch.compile is not supported.")
+            print("      Automatically disabling compilation. Training will use eager mode.")
+            self.config['compile'] = False
+            return
+
+        # Check for Windows CPU + Compile (Known Hang Issue)
+        # Allow override with --force-compile
+        if os.name == 'nt' and device_type == 'cpu' and not self.config.get('force_compile', False):
+            print("WARNING: torch.compile on Windows CPU is known to hang with complex RNN loops.")
+            print("         Disabling compilation for the Worker Loop to ensure stability.")
+            print("         Use --force-compile to override this safety check.")
+            self.config['compile'] = False
+            return
+
+        try:
+            if hasattr(torch, "compile"):
+                print("INFO: --compile flag set. Applying torch.compile to Worker (L-RNN) loop...")
+                
+                # Dynamic shapes can cause instability/hangs on Windows CPU with Inductor
+                use_dynamic = True
+                # Robust check for Windows CPU
+                if os.name == 'nt' and (device_type == 'cpu' or device_type == 'unknown'):
+                    print(f"INFO: Device type detected as '{device_type}'. Keeping dynamic shapes ENABLED (User Override).")
+                    use_dynamic = True
+
+                compile_options = {"triton.cudagraphs": False} if device_type == 'cuda' else {}
+                
+                # Compile the WorkerLoop module's forward method
+                self.worker_loop_module = torch.compile(
+                    self.worker_loop_module,
+                    dynamic=use_dynamic,
+                    fullgraph=False,   
+                    options=compile_options
+                )
+                print("INFO: WorkerLoop compiled successfully.")
+        except Exception as e:
+            print(f"WARNING: torch.compile failed ({e}) -- falling back to eager mode")
+
+
     def forward(self, input_ids, attention_mask=None, labels=None, 
                 h_state=None, l_state=None, 
                 prev_context=None, target_context=None, # State Persistence
                 drift_state=None, # <<< NEW: Persisted Drift State
                 ltm_memory_state=None, # <<< NEW: Persisted LTM State (fast_vals, mom_vals)
+                global_pos_offset=0, # <<< NEW: For correct Stride/Lerp in inference
                 min_timestamp=0.0, source_filter=None, **kwargs):
         B, T = input_ids.shape
         device = input_ids.device
@@ -2207,9 +2281,6 @@ class HierarchosCore(nn.Module):
         # Reverted to standard embedding for better memory usage
         x = self.tok_emb(input_ids)
 
-        # ==================================================================
-        # 1. STATE INITIALIZATION (With Context Recovery)
-        # ==================================================================
         # ==================================================================
         # 1. STATE INITIALIZATION (With Context Recovery)
         # ==================================================================
@@ -2275,9 +2346,17 @@ class HierarchosCore(nn.Module):
         for t in range(T):
             token_x = x[:, t]
             
+            # Calculate absolute position for Stride/Lerp
+            abs_t = global_pos_offset + t
+            
             # --- LTM Retrieval ---
             p = self.persistent.unsqueeze(0).expand(B, -1)
-            q = torch.clamp(self.qproj(token_x), min=-10, max=10)
+            
+            # <<< FIX: Context-Aware Query >>>
+            # Concatenate token_x (embedding) and prev_context
+            # prev_context is [B, dim], token_x is [B, dim]
+            q_in = torch.cat([token_x, prev_context], dim=-1)
+            q = torch.clamp(self.qproj(q_in), min=-10, max=10)
             
             # Pass current fast_vals to retrieval
             topk_vals, topk_idx, topk_ts = self.ltm.retrieve_topk(q, self.config.ltm_topk, min_timestamp, source_filter, fast_vals=curr_fast_vals)
@@ -2308,12 +2387,10 @@ class HierarchosCore(nn.Module):
             # <<< FIX: Apply Worker Feedback >>>
             # Project the Worker's previous state to the Manager's space
             # l_state shape: [B, l_hidden, 5]. Slot 0 is the hidden state.
-            # FIX: Only apply feedback after first timestep to avoid using uninitialized state
-            if t > 0:
-                l_feedback = self.l_feedback_proj(l_state[:, :, 0])
-                enc_with_feedback = enc + l_feedback
-            else:
-                enc_with_feedback = enc
+            # FIX: Always apply feedback (even at t=0, using initial l_state) to match inference logic
+            # and ensure continuity across chunks.
+            l_feedback = self.l_feedback_proj(l_state[:, :, 0])
+            enc_with_feedback = enc + l_feedback
             
             # A. REALITY STEP (Continuous)
             # Pass timestep for proper truncated BPTT
@@ -2329,7 +2406,8 @@ class HierarchosCore(nn.Module):
             step_ponder_cost = torch.tensor(0.0, device=device)
             
             # B. PLANNING STEP (Strided)
-            if t % stride == 0:
+            # FIX: Use absolute position for stride check to ensure consistency across chunks/inference
+            if abs_t % stride == 0:
                 # The old target becomes the new starting point for interpolation
                 prev_context = target_context
 
@@ -2373,12 +2451,14 @@ class HierarchosCore(nn.Module):
                 
                 # Update Target Context
                 target_context = self.h_to_context(final_h_out)
+                # <<< FIX: Clamp target_context for stability >>>
+                target_context = torch.clamp(target_context, min=-50.0, max=50.0)
                 
                 step_ponder_cost = len(h_step_outputs) + remainder.mean()
                 ponder_costs.append(step_ponder_cost)
             
             # C. LERP (Interpolation) - Matches Inference exactly
-            step_in_stride = t % stride
+            step_in_stride = abs_t % stride
             alpha = step_in_stride / float(stride)
             # <<< RESTORED: torch.lerp >>>
             # Formula: start + weight * (end - start)
@@ -2680,6 +2760,17 @@ class QuantizedHierarchos:
         self.context_drift_proj = quantized_layers.get('context_drift_proj')
         self.l_feedback_proj = quantized_layers.get('l_feedback_proj') # <<< Added l_feedback_proj
         self.val_proj = quantized_layers.get('val_proj') # <<< Added val_proj
+        
+        # <<< FIX: Backward Compatibility for Context-Aware Query >>>
+        self.use_context_aware_query = False
+        if self.qproj.K == self.config.context_dim * 2:
+            self.use_context_aware_query = True
+            print("INFO: Context-Aware LTM Query detected and enabled.")
+        elif self.qproj.K == self.config.context_dim:
+            self.use_context_aware_query = False
+            print("Warning: Quantized model uses old qproj dimension (token only). Context-aware query disabled.")
+        else:
+             print(f"Warning: Unexpected qproj dimension {self.qproj.K}. Expected {self.config.context_dim} or {self.config.context_dim * 2}.")
 
         print(f"Initialized QuantizedHierarchos ({self.qtype}) with RWKV recurrence.")
 
@@ -2728,7 +2819,15 @@ class QuantizedHierarchos:
             token_emb = self.tok_emb(token_ids) 
             p_read = self.persistent.unsqueeze(0).expand(B, -1)
 
-            query = self.qproj(token_emb, device=device)
+            # <<< FIX: Context-Aware Query (with Backward Compatibility) >>>
+            if self.use_context_aware_query:
+                # Concatenate token_emb and curr_prev_context
+                # Ensure both are on the same device (Quantized model handles device placement)
+                q_in = torch.cat([token_emb.to(device), curr_prev_context.to(device)], dim=-1)
+                query = self.qproj(q_in, device=device)
+            else:
+                # Old behavior: Token only
+                query = self.qproj(token_emb.to(device), device=device)
             
             query = torch.clamp(query, min=-10.0, max=10.0)
             
@@ -2783,6 +2882,10 @@ class QuantizedHierarchos:
 
             # A. Continuous Update (The V2 Fix)
             h_out_real, new_h_state = self.h_rnn(enc_with_feedback, final_h_state, device=device)
+            
+            # <<< FIX: Clamp h_out_real to match HierarchosCore (Coherence Fix) >>>
+            h_out_real = torch.clamp(h_out_real, min=-100.0, max=100.0)
+            
             final_h_state = new_h_state
 
             # B. Strided Goal Update
@@ -3022,12 +3125,32 @@ def load_full_model_with_config(model_path: str, device):
 
     model = HierarchosCore(config).to(device) # Pass AttrDict config to model
 
+    # <<< FIX: Handle qproj shape mismatch (Old -> New Architecture) >>>
+    # We do this BEFORE loading to avoid "size mismatch" errors/warnings
+    state_dict = checkpoint['model_state_dict']
+    if 'qproj.weight' in state_dict:
+        old_w = state_dict['qproj.weight']
+        new_w = model.qproj.weight
+        if old_w.shape != new_w.shape:
+            print(f"INFO: Adapting qproj.weight from {old_w.shape} to {new_w.shape} for backward compatibility.")
+            if old_w.shape[0] == new_w.shape[0] and old_w.shape[1] * 2 == new_w.shape[1]:
+                # Case: Output dim same, Input dim doubled (Context-Aware update)
+                # Initialize new weight with noise
+                adapted_w = torch.randn_like(new_w) * 0.02
+                # Copy old weights to first half (Token part)
+                adapted_w[:, :old_w.shape[1]] = old_w
+                # Update state dict
+                state_dict['qproj.weight'] = adapted_w
+            else:
+                print("Warning: qproj shape mismatch is not a simple doubling. Skipping adaptation (will be re-initialized).")
+                del state_dict['qproj.weight'] # Remove to avoid error, let it re-init
+
     # Load state dict, be flexible with missing/extra keys if needed
     try:
-        model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+        model.load_state_dict(state_dict, strict=True)
     except RuntimeError as e:
         print(f"Warning: Non-strict state dict loading due to mismatch: {e}. Trying strict=False.")
-        model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        model.load_state_dict(state_dict, strict=False)
 
 
     return model, config # Return model and AttrDict config
@@ -3158,6 +3281,8 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
             if not args.disable_lr_schedule and num_update_steps > 0:
                 print(f"INFO: Step-based Cosine Annealing LR scheduler ENABLED. Total update steps: {num_update_steps}, Max LR: {args.starting_lr}, Min LR: {args.min_lr}")
                 scheduler = CosineAnnealingLR(optimizer, T_max=num_update_steps, eta_min=args.min_lr)
+            # <<< FIX: Compile AFTER initialization >>>
+            model.compile()
             # start_epoch remains 0
 
         except FileNotFoundError:
@@ -3261,16 +3386,77 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         else:
             optimizer = ADAM_OPTIMIZER(model.parameters(), lr=initial_lr_for_optim)
 
+        # <<< FIX: Handle qproj shape mismatch (Old -> New Architecture) >>>
+        # We do this BEFORE loading to avoid "size mismatch" errors/warnings
+        state_dict = checkpoint['model_state_dict']
+        if 'qproj.weight' in state_dict:
+            old_w = state_dict['qproj.weight']
+            new_w = model.qproj.weight
+            if old_w.shape != new_w.shape:
+                print(f"INFO: Adapting qproj.weight from {old_w.shape} to {new_w.shape} for backward compatibility.")
+                if old_w.shape[0] == new_w.shape[0] and old_w.shape[1] * 2 == new_w.shape[1]:
+                    # Case: Output dim same, Input dim doubled (Context-Aware update)
+                    # Initialize new weight with noise
+                    adapted_w = torch.randn_like(new_w) * 0.02
+                    # Copy old weights to first half (Token part)
+                    adapted_w[:, :old_w.shape[1]] = old_w
+                    # Update state dict
+                    state_dict['qproj.weight'] = adapted_w
+                else:
+                    print("Warning: qproj shape mismatch is not a simple doubling. Skipping adaptation (will be re-initialized).")
+                    del state_dict['qproj.weight'] # Remove to avoid error, let it re-init
+
         # Load model state dict with flexibility
         try:
-            model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+            model.load_state_dict(state_dict, strict=True)
         except RuntimeError as e:
             print(f"Warning: Non-strict model state dict loading: {e}. Trying strict=False.")
-            model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            model.load_state_dict(state_dict, strict=False)
 
         # --- Conditional Optimizer State Loading ---
         if not args.override_scheduling:
             try:
+                # <<< FIX: Adapt Optimizer State for qproj >>>
+                if 'optimizer_state_dict' in checkpoint:
+                    optim_state_dict = checkpoint['optimizer_state_dict']
+                    if 'state' in optim_state_dict and 'param_groups' in optim_state_dict:
+                        try:
+                            # Find qproj parameter index in the model
+                            qproj_param = model.qproj.weight
+                            # Note: This assumes model.parameters() order matches the optimizer's param_groups[0]
+                            # which is true for the simple optimizer init used here.
+                            param_idx = list(model.parameters()).index(qproj_param)
+                            
+                            # Get the ID from the saved groups (assuming group 0)
+                            if len(optim_state_dict['param_groups']) > 0 and len(optim_state_dict['param_groups'][0]['params']) > param_idx:
+                                saved_id = optim_state_dict['param_groups'][0]['params'][param_idx]
+                                
+                                if saved_id in optim_state_dict['state']:
+                                    param_state = optim_state_dict['state'][saved_id]
+                                    # Check if adaptation is needed (compare exp_avg shape to current param shape)
+                                    if 'exp_avg' in param_state and param_state['exp_avg'].shape != qproj_param.shape:
+                                        print(f"INFO: Adapting optimizer state for qproj (ID {saved_id}) from {param_state['exp_avg'].shape} to {qproj_param.shape}")
+                                        
+                                        # Adapt exp_avg
+                                        old_exp = param_state['exp_avg']
+                                        new_exp = torch.zeros_like(qproj_param)
+                                        if old_exp.shape[0] == new_exp.shape[0] and old_exp.shape[1] * 2 == new_exp.shape[1]:
+                                             new_exp[:, :old_exp.shape[1]] = old_exp
+                                             param_state['exp_avg'] = new_exp
+                                        
+                                        # Adapt exp_avg_sq
+                                        if 'exp_avg_sq' in param_state:
+                                            old_sq = param_state['exp_avg_sq']
+                                            new_sq = torch.zeros_like(qproj_param)
+                                            if old_sq.shape[0] == new_sq.shape[0] and old_sq.shape[1] * 2 == new_sq.shape[1]:
+                                                 new_sq[:, :old_sq.shape[1]] = old_sq
+                                                 param_state['exp_avg_sq'] = new_sq
+                                        
+                                        # If step is tensor, move to cpu? No, usually it's a scalar or tensor on device.
+                                        # We don't need to change step.
+                        except (ValueError, IndexError) as e:
+                            print(f"Warning: Could not adapt optimizer state for qproj: {e}")
+
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             except Exception as e:
                 print(f"Warning: Could not load optimizer state: {e}. Starting optimizer from scratch.")
@@ -3351,6 +3537,9 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
 
         print(f"Successfully loaded model state. Resuming from epoch {start_epoch + 1}.")
 
+        # <<< FIX: Compile AFTER loading state dict >>>
+        model.compile()
+
 
     # <<< Starting completely fresh >>>
     else:
@@ -3387,6 +3576,9 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         if not args.disable_lr_schedule and num_update_steps > 0:
             print(f"INFO: Step-based Cosine Annealing LR scheduler ENABLED. Total update steps: {num_update_steps}, Max LR: {args.starting_lr}, Min LR: {args.min_lr}")
             scheduler = CosineAnnealingLR(optimizer, T_max=num_update_steps, eta_min=args.min_lr)
+
+    # <<< FIX: Compile AFTER initialization >>>
+    model.compile()
 
     # --- CRITICAL FIX: Correctly placed logic to update LTM reference chunk size ---
     training_chunk_size = getattr(args, 'training_chunk_size', 128)
@@ -3446,15 +3638,29 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
 
         for i, batch in enumerate(pbar):
 
-            # --- CRITICAL FIX: STATE RESET PER BATCH ---
-            running_h_state = None
-            running_l_state = None
-            running_prev_context = None
-            running_target_context = None
-            running_drift_state = None
-            running_ltm_state = None
-            
-            model.reset_memory()
+            # --- CRITICAL FIX: STATE RESET PER BATCH (Conditional) ---
+            # If persist_state is True, we carry over states from the previous batch.
+            # This is useful for training on long sequences split into chunks.
+            if not getattr(args, 'persist_state', False):
+                running_h_state = None
+                running_l_state = None
+                running_prev_context = None
+                running_target_context = None
+                running_drift_state = None
+                running_ltm_state = None
+                
+                model.reset_memory()
+            else:
+                # If persisting, we detach states to prevent backprop through batches (TBPTT limited to batch)
+                # But we keep the values.
+                if running_h_state is not None: running_h_state = running_h_state.detach()
+                if running_l_state is not None: running_l_state = running_l_state.detach()
+                if running_prev_context is not None: running_prev_context = running_prev_context.detach()
+                if running_target_context is not None: running_target_context = running_target_context.detach()
+                if running_drift_state is not None: running_drift_state = running_drift_state.detach()
+                if running_ltm_state is not None: 
+                    running_ltm_state = (running_ltm_state[0].detach(), running_ltm_state[1].detach())
+
 
             # --- CUDAGraphs Protection ---
             if device.type == 'cuda' and not is_directml_device(device):
@@ -4756,6 +4962,7 @@ def chat(args, device, tokenizer):
                             h_state=h_state, # Pass persistent state
                             l_state=l_state, # Pass persistent state
                             drift_state=drift_state,
+                            global_pos_offset=total_tokens_generated, # <<< FIX: Pass global offset for Stride/Lerp
                             min_timestamp=min_ts_filter, 
                             source_filter=source_id_filter
                         )

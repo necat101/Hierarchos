@@ -499,7 +499,6 @@ python hierarchos.py train \
 | `--context_dim`      | ***Required:*** New context dimension.                                                | Yes      |         |
 | `--h_hidden`         | ***Required:*** New H-RNN hidden size.                                                | Yes      |         |
 | `--l_hidden`         | ***Required:*** New L-RNN hidden size.                                                | Yes      |         |
-| *Other Arch Args* | *Optional:* Add other architectural args like `--ltm_slots`, `--max_length`, etc., if changing them. | No       | *(Uses old model's value)* |
 
 -----
 

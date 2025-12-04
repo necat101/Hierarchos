@@ -1,12 +1,18 @@
 -----
 
-# Hierarchos v0.13.5 (alpha): A Hybrid Memory-Reasoning Architecture
+# Hierarchos v0.13.10 (alpha): A Hybrid Memory-Reasoning Architecture
 
 A novel AI architecture that synergistically integrates Google's Titans memory system with a Hierarchical Reasoning Model (HRM) to move beyond the limitations of scale and take a decisive step on the path to AGI.
 
 Due to Amazon's "Chronos" forecasting models (still based on transformers BTW) I've decided to rename the project to "Hierarchos" from this point forward. This should prevent any naming confusion that may occur.
 
 -----
+
+### 🚀 **New in v0.13.10: The "Ponder Cost" Fix**
+
+> This update addresses a critical issue in the training objective that was preventing the model from learning efficient reasoning.
+>
+> 1.  **Differentiable Ponder Cost:** 🧠 Replaced the static, hard-coded ponder cost calculation with a differentiable Adaptive Computation Time (ACT) sum. This allows gradients to flow back to the halting mechanism, enabling the model to actually *learn* when to stop thinking, rather than being forced to run for the maximum duration.
 
 ### 🚀 **New in v0.13.5: The "Coherence & Stability" Update**
 
@@ -499,6 +505,7 @@ python hierarchos.py train \
 | `--context_dim`      | ***Required:*** New context dimension.                                                | Yes      |         |
 | `--h_hidden`         | ***Required:*** New H-RNN hidden size.                                                | Yes      |         |
 | `--l_hidden`         | ***Required:*** New L-RNN hidden size.                                                | Yes      |         |
+| *Other Arch Args* | *Optional:* Add other architectural args like `--ltm_slots`, `--max_length`, etc., if changing them. | No       | *(Uses old model's value)* |
 
 -----
 
@@ -530,6 +537,11 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
   * **DirectML/ZLUDA communities** for enabling AMD GPU acceleration on Windows.
 
 ## Changelog
+
+### v0.13.10 (alpha)
+
+  * **Training Fixes**:
+      * **Fixed Ponder Cost Calculation**: Switched from a static loop count to a differentiable ACT sum (`cum_remain.sum()`). This fixes the issue where the ponder cost was "stuck" at the maximum value during training, allowing the halting mechanism to learn efficiency.
 
 ### v0.13.5 (alpha)
 

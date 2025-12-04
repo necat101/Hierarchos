@@ -2454,7 +2454,7 @@ class HierarchosCore(nn.Module):
                 # <<< FIX: Clamp target_context for stability >>>
                 target_context = torch.clamp(target_context, min=-50.0, max=50.0)
                 
-                step_ponder_cost = len(h_step_outputs) + remainder.mean()
+                step_ponder_cost = cum_remain.sum(dim=0).mean()
                 ponder_costs.append(step_ponder_cost)
             
             # C. LERP (Interpolation) - Matches Inference exactly

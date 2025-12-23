@@ -1,6 +1,6 @@
 -----
 
-# Hierarchos v0.13.10 (alpha): A Hybrid Memory-Reasoning Architecture
+# Hierarchos v0.14 (alpha): A Hybrid Memory-Reasoning Architecture
 
 A novel AI architecture that synergistically integrates Google's Titans memory system with a Hierarchical Reasoning Model (HRM) to move beyond the limitations of scale and take a decisive step on the path to AGI.
 
@@ -8,11 +8,16 @@ Due to Amazon's "Chronos" forecasting models (still based on transformers BTW) I
 
 -----
 
-### 🚀 **New in v0.13.10: The "Ponder Cost" Fix**
+### 🚀 **New in v0.14: The "Global Parity" Update**
 
-> This update addresses a critical issue in the training objective that was preventing the model from learning efficient reasoning.
+> This update resolves a critical "Positional Jitter" bug in the training loop that was causing loss plateaus and improves chat recovery.
 >
-> 1.  **Differentiable Ponder Cost:** 🧠 Replaced the static, hard-coded ponder cost calculation with a differentiable Adaptive Computation Time (ACT) sum. This allows gradients to flow back to the halting mechanism, enabling the model to actually *learn* when to stop thinking, rather than being forced to run for the maximum duration.
+> 1.  **Fixed Training Loss Plateau:** 📉 Discovered and fixed a bug where `global_pos_offset` was missing in the training loop. This caused the hierarchical manager to reset its stride logic at every chunk boundary, preventing the model from learning long-term dependencies. Loss can now finally break through the 1.92 floor.
+> 2.  **Differentiable Ponder Cost:** 🧠 Replaced the static ponder cost calculation with a differentiable ACT sum. This allows the model to *learn* to be efficient, significantly reducing computation time during inference.
+> 3.  **New Chat Recovery Commands:** 🛠️ Added `/reset` to clear all RNN and Hierarchical states, allowing you to flush "story mode" hallucinations instantly. Improved `/reset_ltm` to perform a thorough memory wipe (clearing fast weights, timestamps, and sources).
+> 4.  **Incremental Generation:** 💬 Refactored the chat loop to use state-of-the-art incremental generation (prefill + single token steps), preventing RNN state corruption and ensuring perfect coherence across long turns.
+
+### 🚀 **New in v0.13.10: The "Ponder Cost" Fix (Legacy)**
 
 ### 🚀 **New in v0.13.5: The "Coherence & Stability" Update**
 
@@ -505,6 +510,7 @@ python hierarchos.py train \
 | `--context_dim`      | ***Required:*** New context dimension.                                                | Yes      |         |
 | `--h_hidden`         | ***Required:*** New H-RNN hidden size.                                                | Yes      |         |
 | `--l_hidden`         | ***Required:*** New L-RNN hidden size.                                                | Yes      |         |
+| *Other Arch Args* | *Optional:* Add other architectural args like `--ltm_slots`, `--max_length`, etc., if changing them. | No       | *(Uses old model's value)* |
 
 -----
 
@@ -537,10 +543,19 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
 
 ## Changelog
 
-### v0.13.10 (alpha)
+### v0.14 (alpha)
 
-  * **Training Fixes**:
-      * **Fixed Ponder Cost Calculation**: Switched from a static loop count to a differentiable ACT sum (`cum_remain.sum()`). This fixes the issue where the ponder cost was "stuck" at the maximum value during training, allowing the halting mechanism to learn efficiency.
+  * **Critical Training Fix**:
+      * **Fixed Positional Jitter**: Passed `global_pos_offset` in the training loop. This ensures the Manager's stride/interpolation logic is continuous across chunk boundaries, resolving the 1.92 loss plateau.
+  * **Architecture & Learning**:
+      * **Differentiable Ponder Cost**: Switched to a differentiable ACT sum (`cum_remain.sum()`), enabling the model to learn halting efficiency.
+  * **Chat & Recovery**:
+      * **Incremental Generation**: Refactored chat to use prefill + single-token steps for perfect RNN state management.
+      * **Full State Reset**: Added `/reset` command to zero out all internal states (h_state, l_state, context, drift).
+      * **Thorough LTM Reset**: Updated `/reset_ltm` to clear all memory buffers including timestamps and sources.
+      * **State Persistence**: Fixed a bug where hierarchical states were being reset during incremental steps.
+
+### v0.13.10 (alpha)
 
 ### v0.13.5 (alpha)
 

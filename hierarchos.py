@@ -3024,6 +3024,7 @@ class QuantizedHierarchos:
             "l_state": final_l_state.cpu(),
             "prev_context": curr_prev_context.cpu(),
             "target_context": curr_target_context.cpu(),
+            "drift_state": current_drift.cpu(), # <<< FIX: Return drift state
             "topk_vals": torch.stack(all_topk_vals, dim=1).cpu() if all_topk_vals else None,
             "topk_idx": torch.stack(all_topk_idx, dim=1).cpu() if all_topk_idx else None
         }
@@ -3720,7 +3721,8 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                         prev_context=running_prev_context,
                         target_context=running_target_context,
                         drift_state=running_drift_state,
-                        ltm_memory_state=running_ltm_state # <<< NEW: Pass LTM state
+                        ltm_memory_state=running_ltm_state,
+                        global_pos_offset=start_t # <<< FIX: Pass chunk start position
                     )
 
                     if outputs.get("raw_topk_vals") is not None:
@@ -4739,7 +4741,12 @@ def chat(args, device, tokenizer):
         update_model.eval()
 
     print("\nWelcome to hierarchos Chat. Type 'exit' or 'quit' to end.")
-    print("Use '/filter time=-<seconds>' or '/filter source=<id>' to constrain memory.")
+    print("Commands:")
+    print("  /filter time=-<seconds> | /filter source=<id>  : Constrain memory retrieval")
+    print("  /settings | /topk <int> | /topp <float>        : View/Change sampling")
+    print("  /reset                                         : Clear RNN & Hierarchical states")
+    print("  /reset_ltm                                     : Clear LTM memory (fast_vals)")
+    print("  /status                                        : Show model state info")
     print("Press Ctrl+C to stop generation at any time.")
     print("="*50)
 
@@ -4819,6 +4826,36 @@ def chat(args, device, tokenizer):
             if prompt.startswith('/settings'):
                 print(f"Current Settings:\n  Temperature: {args.temperature}\n  Top-K: {args.top_k}\n  Top-P: {args.top_p}")
                 continue
+
+            if prompt.startswith('/reset_ltm'):
+                print("Resetting LTM memory (clearing fast_vals, momentum, timestamps, and sources)...")
+                model.ltm.reset_working_memory()
+                if is_quantized and shadow_model:
+                    shadow_model.ltm.reset_working_memory()
+                ltm_has_been_updated = True # Trigger save prompt on exit if they want to persist the reset
+                print("LTM Reset complete.")
+                continue
+
+            if prompt.startswith('/reset'):
+                print("Resetting all RNN and Hierarchical states...")
+                h_state.zero_()
+                h_state[:, :, 3] = -1e30 # PP init
+                l_state.zero_()
+                l_state[:, :, 3] = -1e30 # PP init
+                prev_context.zero_()
+                target_context.zero_()
+                drift_state.zero_()
+                total_tokens_generated = 0
+                print("State Reset complete. Model is now fresh.")
+                continue
+
+            if prompt.startswith('/status'):
+                print(f"Model Status:")
+                print(f"  Total Tokens Generated: {total_tokens_generated}")
+                print(f"  Device: {device}")
+                print(f"  Quantized: {is_quantized}")
+                print(f"  LTM Learning: {'ACTIVE' if learning_enabled else 'OFF'}")
+                continue
             
             # =================================================================
             # A. CHECK FOR FEEDBACK & PERFORM UPDATES (Anti-Echo-Chamber)
@@ -4848,46 +4885,10 @@ def chat(args, device, tokenizer):
                             LTMModule.SRC_USER_INTERACTION,
                             penalty=True  # <--- Triggers Unlikelihood Loss
                         )
-
-                # 3. Passive Update on CURRENT Input (The "Titans" Memory Logic)
-                # Using 'elif' ensures we don't passively memorize the prompt if it was a feedback trigger above.
-                elif not is_correction_or_instruction(prompt) and not prompt.startswith("/"):
-                    # Encode just the user prompt
-                    curr_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)[0]
-                    
-                    # We perform a "light" update. 
-                    # Concept: Predict the user prompt (auto-encoding/next-token prediction on input).
-                    print("[Passive memory update...]", end="")
-                    perform_ltm_update(
-                        curr_ids, 
-                        curr_ids, # Self-target
-                        LTMModule.SRC_USER_INTERACTION,
-                        penalty=False
-                    )
-                    print("\r", end="")
-                    # pending_training_data = None # Don't reset here, let generation overwrite it? 
-                    # Actually, if we generate, pending_training_data will be overwritten at end of loop.
-                    # But if we don't generate (e.g. error), we might want to clear it.
-                    # But we ARE generating now.
-                    # So we can leave it or remove it. 
-                    # If we leave it, it clears previous turn's data. Correct.
-                    pending_training_data = None
-                    # continue # <<< FIX: Do NOT skip generation!
                 
-                # 3. Correction/Instruction: Learn from the CURRENT prompt immediately
-                elif is_correction_or_instruction(prompt):
-                    print("[Correction/Instruction detected. Memorizing inputs...]", end="", flush=True)
-                    
-                    curr_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)[0]
-                    perform_ltm_update(
-                        curr_ids, 
-                        curr_ids, 
-                        LTMModule.SRC_CORRECTION,
-                        penalty=False
-                    )
-                    
-                    if pending_training_data is not None:
-                        pending_training_data = None
+                # <<< REMOVED: Passive and Correction LTM updates >>>
+                # These were redundant with the model's internal Hebbian updates 
+                # and caused instability due to high loss on self-prediction tasks.
 
             # Manual learn commands
             if prompt.strip() == "/learn" and pending_training_data:
@@ -4905,134 +4906,174 @@ def chat(args, device, tokenizer):
 
 
             # =================================================================
-            # B. GENERATION LOGIC
+            # B. GENERATION LOGIC (Incremental: Prefill + Single Token Steps)
             # =================================================================
-            # Kayla format assumes ### wrappers
             prompt_format = f"### Instruction:\n{prompt}\n\n### Response:\n"
-
             if tokenizer is None:
                 print("Error: Tokenizer not loaded. Cannot proceed.")
                 break
             prompt_ids = tokenizer.encode(prompt_format, return_tensors="pt").to(device)
 
-
             print("\nhierarchos: ", end="", flush=True)
             response_ids = []
             
-            # Current IDs for the loop
-            current_ids = prompt_ids
-
-            # Generation loop uses no_grad
+            # 1. PREFILL PASS
             with torch.no_grad():
-                for i in range(args.max_new_tokens):
-                    # <<< MODIFIED: Check signal interrupt flag >>>
-                    if _interrupt_flag:
-                        _interrupt_flag = False # Reset flag for next turn
-                        print("\n[Generation interrupted by user.]", end="", flush=True)
-                        break
+                model_input_ids = prompt_ids.cpu() if is_quantized else prompt_ids.to(device)
+                if is_quantized:
+                    outputs = model(
+                        input_ids=model_input_ids, 
+                        h_state=h_state.cpu(), 
+                        l_state=l_state.cpu(), 
+                        prev_context=prev_context.cpu(),
+                        target_context=target_context.cpu(),
+                        drift_state=drift_state.cpu(), # <<< RESTORED
+                        global_pos_offset=total_tokens_generated,
+                        device=inference_device, 
+                        min_timestamp=min_ts_filter, 
+                        source_filter=source_id_filter
+                    )
+                    h_state = outputs['h_state']
+                    l_state = outputs['l_state']
+                    prev_context = outputs['prev_context']
+                    target_context = outputs['target_context']
+                    drift_state = outputs['drift_state']
+                else:
+                    outputs = model(
+                        model_input_ids.to(device), 
+                        h_state=h_state, 
+                        l_state=l_state, 
+                        prev_context=prev_context, 
+                        target_context=target_context, 
+                        drift_state=drift_state, # <<< RESTORED
+                        global_pos_offset=total_tokens_generated,
+                        min_timestamp=min_ts_filter, 
+                        source_filter=source_id_filter
+                    )
+                    if outputs.get('h_state') is not None: h_state = outputs['h_state']
+                    if outputs.get('l_state') is not None: l_state = outputs['l_state']
+                    if outputs.get('drift_state') is not None: drift_state = outputs['drift_state']
+                    if outputs.get('prev_context') is not None: prev_context = outputs['prev_context']
+                    if outputs.get('target_context') is not None: target_context = outputs['target_context']
 
-                    # Input for the model call
-                    model_input_ids = current_ids.cpu() if is_quantized else current_ids.to(device)
-
-
-                    if is_quantized:
-                        # <<< v2 FIX: Pass persistent states & global offset >>>
-                        outputs = model(
-                            input_ids=model_input_ids, 
-                            h_state=h_state.cpu(), 
-                            l_state=l_state.cpu(), 
-                            prev_context=prev_context.cpu(),
-                            target_context=target_context.cpu(),
-                            drift_state=drift_state.cpu(),
-                            global_pos_offset=total_tokens_generated, # Critical for Lerp continuity
-                            device=inference_device, 
-                            min_timestamp=min_ts_filter, 
-                            source_filter=source_id_filter
-                        )
-                        # Update CPU states from output
-                        h_state = outputs['h_state']
-                        l_state = outputs['l_state']
-                        prev_context = outputs['prev_context']
-                        target_context = outputs['target_context']
-                        drift_state = outputs['drift_state']
-                    else:
-                        # Full model expects inputs on its device
-                        outputs = model(
-                            model_input_ids.to(device), 
-                            h_state=h_state, # Pass persistent state
-                            l_state=l_state, # Pass persistent state
-                            drift_state=drift_state,
-                            global_pos_offset=total_tokens_generated, # <<< FIX: Pass global offset for Stride/Lerp
-                            min_timestamp=min_ts_filter, 
-                            source_filter=source_id_filter
-                        )
-                        # Update states (assuming forward returns them in dict)
-                        if outputs.get('h_state') is not None: h_state = outputs['h_state']
-                        if outputs.get('l_state') is not None: l_state = outputs['l_state']
-                        if outputs.get('drift_state') is not None: drift_state = outputs['drift_state']
-
-
-                    logits = outputs["logits"].to(device) # Ensure logits are on main device for sampling
-                    next_token_logits = logits[:, -1, :]
-
-                    # <<< FIX: Tunable Sampling >>>
-                    # Apply temperature
-                    if args.temperature > 0:
-                        next_token_logits = next_token_logits / args.temperature
-                    
-                    # Apply Top-K
+                logits = outputs["logits"].to(device)
+                next_token_logits = logits[:, -1, :]
+                
+                # Sample first token
+                if args.temperature > 0:
+                    next_token_logits = next_token_logits / args.temperature
                     if args.top_k > 0:
                         v, _ = torch.topk(next_token_logits, min(args.top_k, next_token_logits.size(-1)))
                         next_token_logits[next_token_logits < v[:, [-1]]] = -float('Inf')
-
-                    # Apply Top-P (Nucleus Sampling)
                     if args.top_p < 1.0:
                         sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
                         cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-
-                        # Remove tokens with cumulative probability above the threshold
                         sorted_indices_to_remove = cumulative_probs > args.top_p
-                        # Shift the indices to the right to keep also the first token above the threshold
                         sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
                         sorted_indices_to_remove[..., 0] = 0
-
                         indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
                         next_token_logits[indices_to_remove] = -float('Inf')
+                    
+                    probs = F.softmax(next_token_logits, dim=-1)
+                    next_token_id = torch.multinomial(probs, num_samples=1)
+                else:
+                    next_token_id = torch.argmax(next_token_logits, dim=-1).unsqueeze(0)
 
-                    # Sample or Greedy
-                    if args.temperature > 0:
-                        probs = F.softmax(next_token_logits, dim=-1)
-                        next_token_id = torch.multinomial(probs, num_samples=1)
-                    else:
-                        next_token_id = torch.argmax(next_token_logits, dim=-1).unsqueeze(0)
-
-
-                    if next_token_id.item() == tokenizer.eos_token_id:
-                        break
-
+                total_tokens_generated += prompt_ids.shape[1]
+                
+                if next_token_id.item() != tokenizer.eos_token_id:
                     response_ids.append(next_token_id.item())
-                    # Decode token safely, handling potential errors
-                    try:
-                        decoded_token = tokenizer.decode([next_token_id.item()])
-                    except Exception as e:
-                        print(f"[Decode Error: {e}]", end="")
-                        decoded_token = "" # Continue with empty token
-
-
-                    # Stop generation if a special token like ### is encountered
-                    if "###" in decoded_token and len(decoded_token) <= 5:
-                        break
-
+                    decoded_token = tokenizer.decode([next_token_id.item()])
                     print(decoded_token, end="", flush=True)
+                    current_ids = next_token_id # Start incremental loop with this token
+                else:
+                    current_ids = None
 
-                    # Append the new token for the next iteration's input
-                    current_ids = torch.cat([current_ids, next_token_id.to(current_ids.device)], dim=1)
-                    # Truncate input_ids if they exceed max_length (important for long chats)
-                    if current_ids.shape[1] > config.max_length:
-                        current_ids = current_ids[:, -config.max_length:]
+            # 2. INCREMENTAL GENERATION LOOP
+            if current_ids is not None:
+                with torch.no_grad():
+                    for i in range(args.max_new_tokens - 1):
+                        if _interrupt_flag:
+                            _interrupt_flag = False
+                            print("\n[Generation interrupted by user.]", end="", flush=True)
+                            break
 
-                    # <<< v2 FIX: Increment Global Counter >>>
-                    total_tokens_generated += 1
+                        model_input_ids = current_ids.cpu() if is_quantized else current_ids.to(device)
+
+                        if is_quantized:
+                            outputs = model(
+                                input_ids=model_input_ids, 
+                                h_state=h_state.cpu(), 
+                                l_state=l_state.cpu(), 
+                                prev_context=prev_context.cpu(),
+                                target_context=target_context.cpu(),
+                                drift_state=drift_state.cpu(), # <<< RESTORED
+                                global_pos_offset=total_tokens_generated,
+                                device=inference_device, 
+                                min_timestamp=min_ts_filter, 
+                                source_filter=source_id_filter
+                            )
+                            h_state = outputs['h_state']
+                            l_state = outputs['l_state']
+                            prev_context = outputs['prev_context']
+                            target_context = outputs['target_context']
+                            drift_state = outputs['drift_state']
+                        else:
+                            outputs = model(
+                                model_input_ids.to(device), 
+                                h_state=h_state, 
+                                l_state=l_state, 
+                                prev_context=prev_context, 
+                                target_context=target_context, 
+                                drift_state=drift_state, # <<< RESTORED
+                                global_pos_offset=total_tokens_generated,
+                                min_timestamp=min_ts_filter, 
+                                source_filter=source_id_filter
+                            )
+                            if outputs.get('h_state') is not None: h_state = outputs['h_state']
+                            if outputs.get('l_state') is not None: l_state = outputs['l_state']
+                            if outputs.get('drift_state') is not None: drift_state = outputs['drift_state']
+                            if outputs.get('prev_context') is not None: prev_context = outputs['prev_context']
+                            if outputs.get('target_context') is not None: target_context = outputs['target_context']
+
+                        logits = outputs["logits"].to(device)
+                        next_token_logits = logits[:, -1, :]
+
+                        if args.temperature > 0:
+                            next_token_logits = next_token_logits / args.temperature
+                            if args.top_k > 0:
+                                v, _ = torch.topk(next_token_logits, min(args.top_k, next_token_logits.size(-1)))
+                                next_token_logits[next_token_logits < v[:, [-1]]] = -float('Inf')
+                            if args.top_p < 1.0:
+                                sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+                                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                                sorted_indices_to_remove = cumulative_probs > args.top_p
+                                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                                sorted_indices_to_remove[..., 0] = 0
+                                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                                next_token_logits[indices_to_remove] = -float('Inf')
+                            
+                            probs = F.softmax(next_token_logits, dim=-1)
+                            next_token_id = torch.multinomial(probs, num_samples=1)
+                        else:
+                            next_token_id = torch.argmax(next_token_logits, dim=-1).unsqueeze(0)
+
+                        if next_token_id.item() == tokenizer.eos_token_id:
+                            break
+
+                        response_ids.append(next_token_id.item())
+                        try:
+                            decoded_token = tokenizer.decode([next_token_id.item()])
+                        except Exception as e:
+                            print(f"[Decode Error: {e}]", end="")
+                            decoded_token = ""
+
+                        if "###" in decoded_token and len(decoded_token) <= 5:
+                            break
+
+                        print(decoded_token, end="", flush=True)
+                        current_ids = next_token_id
+                        total_tokens_generated += 1
 
             print("\n")
 
@@ -5227,14 +5268,15 @@ def main():
     
     args = parser.parse_args()
 
-    # <<< MODIFIED: Auto-Sync Dimensions >>>
+    # <<< MODIFIED: Auto-Sync Dimensions (Only in Train Mode) >>>
     # If user did not specify hidden sizes, lock them to context_dim to prevent mismatch errors.
-    if args.h_hidden is None:
-        print(f"INFO: --h_hidden not specified. Defaulting to context_dim ({args.context_dim}).")
-        args.h_hidden = args.context_dim
-    if args.l_hidden is None:
-        print(f"INFO: --l_hidden not specified. Defaulting to context_dim ({args.context_dim}).")
-        args.l_hidden = args.context_dim
+    if args.mode == 'train' and not args.resume_from_ckpt:
+        if args.h_hidden is None:
+            print(f"INFO: --h_hidden not specified. Defaulting to context_dim ({args.context_dim}).")
+            args.h_hidden = args.context_dim
+        if args.l_hidden is None:
+            print(f"INFO: --l_hidden not specified. Defaulting to context_dim ({args.context_dim}).")
+            args.l_hidden = args.context_dim
     # --------------------------------------
 
     # --- Argument Validation ---

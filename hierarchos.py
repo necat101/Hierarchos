@@ -2550,8 +2550,8 @@ class HierarchosCore(nn.Module):
                 curr_fast_vals, curr_mom_vals = self.ltm.update_memory_hebbian(
                     topk_idx, None, val_expanded, # val is the value to store
                     current_lr=self.config.ltm_lr,
-                    timestamp=0.0, # Dummy timestamp
-                    tokens_covered=1, # <<< FIX: Single token step
+                    timestamp=float(abs_t), # <<< FIX: Use absolute position as timestamp
+                    tokens_covered=1,
                     fast_vals=curr_fast_vals,
                     mom_vals=curr_mom_vals
                 )
@@ -3016,7 +3016,7 @@ class QuantizedHierarchos:
                  val_to_store = torch.clamp(val_to_store, min=-20.0, max=20.0)
                  val_expanded = val_to_store.unsqueeze(1).expand(-1, self.config.ltm_topk, -1)
                  # Update memory using Hebbian rule (inplace)
-                 self.update_memory_hebbian(topk_idx, val_expanded, timestamp=0.0, lr=self.config.ltm_lr, tokens_covered=1)
+                 self.update_memory_hebbian(topk_idx, val_expanded, timestamp=float(abs_t), lr=self.config.ltm_lr, tokens_covered=1)
 
         return {
             "logits": logits.unsqueeze(1) if logits is not None else None,

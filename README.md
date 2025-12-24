@@ -1,12 +1,23 @@
 -----
 
-# Hierarchos v0.14 (alpha): A Hybrid Memory-Reasoning Architecture
+# Hierarchos v0.15 (alpha): A Hybrid Memory-Reasoning Architecture
 
 A novel AI architecture that synergistically integrates Google's Titans memory system with a Hierarchical Reasoning Model (HRM) to move beyond the limitations of scale and take a decisive step on the path to AGI.
 
 Due to Amazon's "Chronos" forecasting models (still based on transformers BTW) I've decided to rename the project to "Hierarchos" from this point forward. This should prevent any naming confusion that may occur.
 
 -----
+
+### 🚀 **New in v0.15: The "Modular Architecture" Update**
+
+> This major update refactors Hierarchos into a clean, modular package structure for better maintainability, faster training, and easier development.
+>
+> 1.  **Modular Package Structure:** 📦 Reorganized the monolithic 5,600-line `hierarchos.py` into a clean `hierarchos/` package with separate modules for models, training, and utilities. This improves code organization, reduces import overhead, and enables better `torch.compile` caching.
+> 2.  **New CLI Interface:** 💻 Added `hierarchos_cli.py` as an alternative entry point that uses the modular package. Both the original monolith and the new modular CLI are fully compatible with the same checkpoints.
+> 3.  **Temporal Chunking Fix:** 📊 Fixed a critical training parity issue in the modular trainer. Sequences are now processed in 128-token temporal chunks with proper TBPTT (Truncated Backpropagation Through Time), matching the original training loop behavior exactly.
+> 4.  **Per-Batch State Reset:** 🔄 Fixed state handling to reset RNN states and LTM working memory at the start of each batch by default (matching original behavior). Use `--persist-state` to carry states between batches for long-form training.
+> 5.  **Full Forward Parity:** ✅ The modular `HierarchosCore` now produces *identical* outputs to the original, verified with side-by-side testing. Loss, logits, and all intermediate states match exactly.
+> 6.  **Faster Training:** ⚡ Users report faster training speeds with the modular version due to reduced import overhead, better `torch.compile` caching, and improved memory locality.
 
 ### 🚀 **New in v0.14: The "Global Parity" Update**
 
@@ -18,6 +29,7 @@ Due to Amazon's "Chronos" forecasting models (still based on transformers BTW) I
 > 4.  **Incremental Generation:** 💬 Refactored the chat loop to use state-of-the-art incremental generation (prefill + single token steps), preventing RNN state corruption and ensuring perfect coherence across long turns.
 
 ### 🚀 **New in v0.13.10: The "Ponder Cost" Fix (Legacy)**
+
 
 ### 🚀 **New in v0.13.5: The "Coherence & Stability" Update**
 
@@ -35,42 +47,8 @@ Due to Amazon's "Chronos" forecasting models (still based on transformers BTW) I
 > 2.  **LTM Gradient Fix:** 🧠 Fixed a critical bug where gradients weren't flowing back to the LTM module, ensuring the model actually *learns* to use its memory.
 > 3.  **Stability Fixes:** 🛠️ Resolved crashes and logic errors in the chat loop, ensuring smooth, uninterrupted conversations.
 
-### 🚀 **New in v0.12.0: The "Performance & Compatibility" Update**
-
-> This update brings major performance optimizations, expanded hardware support, and critical stability fixes.
->
-> 1.  **DirectML Support (AMD GPU Acceleration):** 🎮 Added native support for AMD GPUs on Windows via DirectML/ZLUDA, enabling GPU-accelerated training on Radeon graphics cards. Includes automatic device detection, optimized fallbacks for DirectML-incompatible operations, and stability fixes for long training runs.
-> 2.  **LTM Memory Optimization:** ⚡ Refactored Long-Term Memory (LTM) update methods to use in-place operations, significantly reducing memory overhead and improving training speed. Memory updates now persist correctly across training and inference.
-> 3.  **Python 3.13 Support:** 🐍 Updated build system and setup scripts to fully support Python 3.13, including automatic detection of various Python installation paths and compatibility fixes for Windows Store, standard, and `py` launcher installations.
-> 4.  **torch.compile Stability Improvements:** 🛠️ Fixed critical issues with `torch.compile` on Windows CPU, including dynamic shape support, device detection, and compilation stability. Training with `--compile --force-compile` now works reliably on CPU.
-> 5.  **Enhanced Device Management:** 💻 Improved device auto-detection and selection logic, with better handling of CUDA, DirectML, and CPU devices. DirectML now requires explicit opt-in via `--device dml` to prevent accidental incompatibilities.
-> 6.  **Numerical Stability Fixes:** 🔒 Added comprehensive clamping and stability checks throughout the architecture, including LTM value clamping `[-20, 20]`, state clamping in worker loops, and safe operations for AMP/DirectML compatibility.
-
-### 🚀 **New in v0.11.15: The "Coherence" Update (Inference Fixes)**
-
-> This update resolves critical architectural flaws that were causing **coherence problems** and **hallucinations** during inference.
->
-> 1.  **Fixed Worker Loop Mismatch:** 🎯 Corrected a major discrepancy where the inference engine (`QuantizedHierarchos`) was advancing the RNN state `N` times per token (where `N` is `max_l_steps`), while training only advanced it once. This caused the model's internal state to drift ahead of the input, leading to severe incoherence. Inference now correctly uses a **shadow state** for pondering, matching the training logic.
-> 2.  **Fixed Memory Persistence:** 🧠 Fixed a bug where LTM updates calculated during inference were being discarded. The model now correctly **persists** the new memory state (`fast_vals`, `mom_vals`) to its buffers, enabling true test-time learning.
-> 3.  **Manager Pondering (ACT) in Inference:** ⚖️ Implemented the "Manager Pondering" (Adaptive Computation Time) logic in `QuantizedHierarchos` to match the training behavior. This resolves the "drift discrepancy" by ensuring the Manager's goal setting is consistent between training and inference.
-> 4.  **Verified Stability:** ✅ Validated with reproduction scripts confirming that training and inference drift dynamics are now identical. Training results show stable convergence (e.g., loss=10.6880, ponder=3.09, commit=4.30e-01).
-
-### 🚀 **New in v0.11.5: The "Coherence" Update (Drift Fix & Stability)**
-
-> This update resolves a critical **training-inference discrepancy** and further stabilizes the memory system.
->
-> 1.  **Fixed Context Drift Discrepancy:** 🎯 Aligned the "Context Drift" logic between training and inference. Previously, training ignored the initial drift state, causing a massive discontinuity (jitter) at every token. Now, both modes calculate drift consistently from the hidden state, ensuring smooth transitions.
-> 2.  **LTM Stability Clamps:** 🔒 Added safety clamps to the Long-Term Memory (LTM) update mechanism to prevent memory saturation and numerical instability during extended training runs.
-> 3.  **Robust torch.compile Support:** 🛠️ Fixed a regression in the worker loop's robustness check that was causing `torch.compile` to fail on Windows CPU. Training with `--force-compile` is now stable.
 
 
-
-### 📢 **Major Update in v0.7.0: Hugging Face `datasets` Integration & HRM Compute Note**
-
-> This version significantly expanded dataset compatibility by integrating the Hugging Face `datasets` library and clarified the computational cost of the HRM's reasoning process.
->
-> 1.  **Load Datasets from Anywhere:** 🌍 Hierarchos can now directly load and process datasets from the **Hugging Face Hub** or local paths using the `datasets` library. This adds support for numerous formats like **CSV, Parquet, JSON, Arrow**, etc., beyond the original JSONL support. New command-line arguments (`--hf_dataset`, `--hf_dataset_config`, `--hf_dataset_split`, `--text_column`, `--prompt_column`, `--completion_column`) allow specifying the dataset, configuration, split, and relevant text columns.
-> 2.  **Clarified HRM Training Cost:** ⏱️ Added notes explaining how the HRM's iterative convergence (`--max_h_steps`, `--max_l_steps`) directly impacts **training speed and compute requirements**. Higher step limits allow for deeper reasoning but increase training time significantly compared to fixed-depth architectures.
 
 ## About The Project
 
@@ -187,6 +165,29 @@ Follow these steps to get a local copy up and running.
 ## 📚 User Guide: Comprehensive Workflows
 
 This guide covers common scenarios from data preparation to inference.
+
+### Choosing Your Entry Point
+
+Hierarchos provides **two entry points** with identical functionality:
+
+| Entry Point | Description | When to Use |
+|-------------|-------------|-------------|
+| `hierarchos.py` | Original monolithic script (5,600 lines) | If you prefer a single-file solution |
+| `hierarchos_cli.py` | New modular CLI | **Recommended** - faster imports, better `torch.compile` caching |
+
+Both are fully checkpoint-compatible. You can train with one and resume with the other.
+
+**Example using modular CLI:**
+```bash
+python hierarchos_cli.py train \
+    --hf_dataset "tatsu-lab/alpaca" \
+    --prompt_column "instruction" \
+    --completion_column "output" \
+    --out-dir "./my_model" \
+    --epochs 3 \
+    --force-compile  # Better torch.compile support in modular version
+```
+
 
 ### Workflow 1: Training a New Model
 
@@ -542,6 +543,19 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
   * **DirectML/ZLUDA communities** for enabling AMD GPU acceleration on Windows.
 
 ## Changelog
+
+### v0.15 (alpha)
+
+  * **Modular Architecture**:
+      * **Package Refactor**: Reorganized monolithic `hierarchos.py` (5,600 lines) into a clean `hierarchos/` package with separate modules for `models/`, `training/`, and `utils/`.
+      * **New CLI**: Added `hierarchos_cli.py` as the recommended entry point. Fully checkpoint-compatible with the original `hierarchos.py`.
+      * **Faster Training**: Reduced import overhead and improved `torch.compile` caching due to better code separation and memory locality.
+  * **Training Loop Parity Fixes**:
+      * **Temporal Chunking**: Implemented 128-token temporal chunking with TBPTT in the modular trainer, matching the original training behavior.
+      * **Per-Batch State Reset**: Fixed state handling to reset RNN states and call `model.reset_memory()` at the start of each batch by default (matching original). Added `--persist-state` flag for long-form training.
+      * **Full Forward Parity**: Ported complete `HierarchosCore.forward()` method (~360 lines) including full ACT pondering, shadow states, LTM updates, and all stability clamping.
+  * **Verification**:
+      * **Side-by-Side Testing**: Verified modular and original produce identical outputs on same inputs (loss, logits, all intermediate states).
 
 ### v0.14 (alpha)
 

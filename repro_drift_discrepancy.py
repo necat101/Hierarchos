@@ -1,7 +1,15 @@
-
 import torch
 import torch.nn as nn
-from hierarchos import HierarchosCore, QuantizedHierarchos, AttrDict
+from hierarchos import HierarchosCore, QuantizedHierarchos
+
+class AttrDict(dict):
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(name)
+    def __setattr__(self, name, value):
+        self[name] = value
 
 def test_drift_discrepancy():
     print("--- Testing Drift Discrepancy ---")
@@ -26,7 +34,7 @@ def test_drift_discrepancy():
     }
     
     # 2. Initialize Model
-    model = HierarchosCore(config)
+    model = HierarchosCore(AttrDict(config))
     model.train() # Enable training mode to disable early exit in worker loop
     
     # 3. Create Inputs
@@ -144,6 +152,7 @@ def test_drift_discrepancy():
             final_h_out = (weights.unsqueeze(-1) * h_stack).sum(dim=0) + remainder.unsqueeze(-1) * h_stack[-1]
 
             curr_target_context = model.h_to_context(final_h_out)
+            curr_target_context = torch.clamp(curr_target_context, min=-50.0, max=50.0)
             
         step_in_stride = t % stride
         alpha = step_in_stride / float(stride)
@@ -181,6 +190,22 @@ def test_drift_discrepancy():
         l_out, final_l_state = model.l_rnn(l_input, final_l_state, timestep=t)
         # Add clamping
         final_l_state = torch.clamp(final_l_state, min=-50.0, max=50.0)
+
+        # --- LTM UPDATE (Matching Forward Logic) ---
+        # 5. MEMORY UPDATE (Hebbian)
+        val_to_store = model.val_proj(l_out)
+        val_to_store = torch.clamp(val_to_store, min=-20.0, max=20.0)
+        val_expanded = val_to_store.unsqueeze(1).expand(-1, config['ltm_topk'], -1)
+        
+        # update_memory_hebbian with inplace=True updates the model's memory state
+        # directly, which is what forward does during its loop.
+        model.ltm.update_memory_hebbian(
+            topk_idx, None, val_expanded, 
+            current_lr=config.get('ltm_lr', 1e-3),
+            timestamp=float(t),
+            tokens_covered=1,
+            inplace=True
+        )
             
     print(f"Inference Final Drift State Mean: {current_drift.mean().item():.6f}")
     

@@ -1520,6 +1520,10 @@ class LTMModule(nn.Module):
         self.register_buffer("update_counts", torch.zeros(n_slots, dtype=torch.float32), persistent=False)
         self.register_buffer("update_slots", torch.zeros(n_slots, val_dim, dtype=torch.float32), persistent=False)
 
+        # <<< NEW: Online Learning Accumulator >>>
+        self.register_buffer("ltm_deltas", torch.zeros(n_slots, val_dim), persistent=False)
+        self.accumulate_deltas = False
+
     def reset_working_memory(self):
         """Zeros out the Fast State (Working Memory) and associated momentum buffers."""
         # ZLUDA Fix: Avoid in-place fill_ and direct device creation
@@ -2329,6 +2333,9 @@ class HierarchosCore(nn.Module):
         else:
             # ltm_memory_state is now a tuple (fast, mom)
             curr_fast_vals, curr_mom_vals = ltm_memory_state
+            # Ensure they are on the correct device
+            curr_fast_vals = curr_fast_vals.to(device)
+            curr_mom_vals = curr_mom_vals.to(device)
 
 
         final_embs = []
@@ -2389,7 +2396,7 @@ class HierarchosCore(nn.Module):
             # l_state shape: [B, l_hidden, 5]. Slot 0 is the hidden state.
             # FIX: Always apply feedback (even at t=0, using initial l_state) to match inference logic
             # and ensure continuity across chunks.
-            l_feedback = self.l_feedback_proj(l_state[:, :, 0])
+            l_feedback = self.l_feedback_proj(l_state[:, :, 0].to(device))
             enc_with_feedback = enc + l_feedback
             
             # A. REALITY STEP (Continuous)
@@ -2449,6 +2456,11 @@ class HierarchosCore(nn.Module):
                 remainder = remainder / total
                 final_h_out = (weights.unsqueeze(-1) * h_stack).sum(dim=0) + remainder.unsqueeze(-1) * h_stack[-1]
                 
+                # --- Stability Marker: Check for NaNs/Infs in Manager Output ---
+                if torch.isnan(final_h_out).any() or torch.isinf(final_h_out).any():
+                    print(f"WARNING: Manager output (final_h_out) contains NaNs/Infs at step {abs_t}. Clamping for stability.")
+                    final_h_out = torch.nan_to_num(final_h_out, nan=0.0, posinf=10.0, neginf=-10.0)
+                
                 # Update Target Context
                 target_context = self.h_to_context(final_h_out)
                 # <<< FIX: Clamp target_context for stability >>>
@@ -2480,7 +2492,7 @@ class HierarchosCore(nn.Module):
             # --- FIX: Calculate Initial Drift from Previous State (Matching Inference) ---
             if self.context_drift_proj is not None:
                 # l_state shape: [B, l_hidden, 5]. Slot 0 is the hidden state.
-                prev_worker_h = l_state[:, :, 0]
+                prev_worker_h = l_state[:, :, 0].to(device) # <<< FIX: Ensure same device
                 initial_drift = torch.tanh(self.context_drift_proj(prev_worker_h))
                 initial_drift = torch.clamp(initial_drift, min=-5.0, max=5.0)
             else:
@@ -3003,7 +3015,6 @@ class QuantizedHierarchos:
             enc = enc + self.l_to_out(l_out, device=device)
 
             final_embedding = self.out_norm(enc.cpu())
-            final_embedding = self.out_norm(enc.cpu())
             logits = self.lm_head(final_embedding, device=device)
 
             # ==================================================================
@@ -3409,6 +3420,15 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
 
         # Load model state dict with flexibility
         try:
+            # <<< FIX: Pre-handle transient LTM buffers to avoid warnings >>>
+            for k in ["ltm.neg_inf", "ltm.update_counts", "ltm.update_slots", "ltm.ltm_deltas"]:
+                if k not in state_dict and k in model.state_dict():
+                    # Initialize missing buffers if model expects them (e.g. recent version change)
+                    state_dict[k] = model.state_dict()[k]
+                elif k in state_dict and k not in model.state_dict():
+                    # Ignore unexpected buffers from old checkpoints
+                    del state_dict[k]
+
             model.load_state_dict(state_dict, strict=True)
         except RuntimeError as e:
             print(f"Warning: Non-strict model state dict loading: {e}. Trying strict=False.")
@@ -3470,7 +3490,8 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         else:
             print("INFO: --override-scheduling detected. Skipping loading optimizer state.")
 
-        start_epoch = checkpoint.get('completed_epoch', 0) # Use get for safety
+        start_epoch = checkpoint.get('completed_epoch', 0) 
+        start_step = checkpoint.get('mid_epoch_step', 0)
 
         # --- Initialize AMP GradScaler ---
         if use_amp:
@@ -3536,7 +3557,10 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                 print(f"INFO: Setting scheduler last_epoch to {scheduler.last_epoch} based on resumed epoch {start_epoch}.")
 
 
-        print(f"Successfully loaded model state. Resuming from epoch {start_epoch + 1}.")
+        if start_step > 0:
+            print(f"Successfully loaded model state. Resuming from epoch {start_epoch + 1}, step {start_step}.")
+        else:
+            print(f"Successfully loaded model state. Resuming from epoch {start_epoch + 1}.")
 
         # <<< FIX: Compile AFTER loading state dict >>>
         model.compile()
@@ -3595,6 +3619,11 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     
     # --- End of Fix ---
 
+    # --- Initialize Step counters ---
+    if not args.resume_from_ckpt:
+        start_epoch = 0
+        start_step = 0
+
     # ==========================================================
     # --- 2. TRAINING LOOP ---
     # ==========================================================
@@ -3638,6 +3667,11 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         steps_in_epoch = 0 # Track steps for averaging
 
         for i, batch in enumerate(pbar):
+            # Mid-Epoch Resumption: Skip steps already processed
+            if epoch == start_epoch and i < start_step:
+                if i == start_step - 1:
+                    print(f"INFO: Resuming from mid-epoch step {start_step}...")
+                continue
 
             # --- CRITICAL FIX: STATE RESET PER BATCH (Conditional) ---
             # If persist_state is True, we carry over states from the previous batch.
@@ -3884,6 +3918,19 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                     optimizer.zero_grad(set_to_none=True)
                     backward_called_in_cycle = False
                     global_step += 1 
+
+                    # Periodic Checkpointing (Progress Protection)
+                    if args.save_steps > 0 and (i + 1) % args.save_steps == 0:
+                        print(f"\n[Step {i+1}] Periodic Checkpoint: Saving to {args.out_dir}...")
+                        torch.save({
+                            'completed_epoch': epoch, # Not yet finished
+                            'mid_epoch_step': i + 1,
+                            'model_state_dict': model.state_dict(),
+                            'optimizer_state_dict': optimizer.state_dict(),
+                            'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                            'scaler_state_dict': scaler.state_dict() if scaler else None,
+                            'config': dict(model.config),
+                        }, os.path.join(args.out_dir, f"hierarchos_epoch_{epoch+1}_step_{i+1}.pt"))
 
                 else:
                     print(f"\nWarning: Skipping optimizer step at batch {i+1} due to invalid loss(es) in accumulation cycle.")
@@ -5237,6 +5284,7 @@ def main():
     # <<< MERGED FROM V2: Commitment Threshold >>>
     train_group.add_argument("--commitment-threshold", type=float, default=0.05, help="[HRM] Hinge loss threshold (free bit budget) for drift penalty. Drift^2 below this is not penalized.")
     train_group.add_argument("--training-chunk-size", type=int, default=128, help="[Titans] Chunk size for temporal segmentation during training.")
+    train_group.add_argument("--save-steps", type=int, default=0, help="Save a checkpoint every N steps (0 to disable).")
     
     train_group.add_argument("--override-scheduling", action="store_true", help="[Train] If resuming, ignore the scheduler state in the checkpoint and use the new LR args.")
     train_group.add_argument("--num_workers", type=int, default=0, help="Number of worker processes for data loading. Recommended: 2 or 4 for GPU training.")

@@ -84,6 +84,7 @@ def main():
     train_group.add_argument("--commitment-loss-weight", type=float, default=0.5)
     train_group.add_argument("--commitment-threshold", type=float, default=0.05)
     train_group.add_argument("--override-scheduling", action="store_true")
+    train_group.add_argument("--save-steps", type=int, default=0, help="Save a checkpoint every N steps (0 to disable).")
     train_group.add_argument("--num_workers", type=int, default=0)
     train_group.add_argument("--amp", action="store_true")
     parser.add_argument("--compile", action="store_true")

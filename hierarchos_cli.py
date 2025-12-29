@@ -75,7 +75,7 @@ def main():
     train_group.add_argument("--starting-lr", type=float, default=1e-4)
     train_group.add_argument("--min-lr", type=float, default=1e-6)
     train_group.add_argument("--disable-lr-schedule", action="store_true")
-    train_group.add_argument("--ltm_lr", type=float, default=1e-2)
+    train_group.add_argument("--ltm_lr", type=float, default=1e-3)
     train_group.add_argument("--kayla", action="store_true")
     train_group.add_argument("--lora_r", type=int, default=8)
     train_group.add_argument("--lora_alpha", type=int, default=16)

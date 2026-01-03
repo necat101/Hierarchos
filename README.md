@@ -1,6 +1,6 @@
 -----
 
-# Hierarchos v0.15 (alpha): A Hybrid Memory-Reasoning Architecture
+# Hierarchos v0.15.2 (alpha): A Hybrid Memory-Reasoning Architecture
 
 A novel AI architecture that synergistically integrates Google's Titans memory system with a Hierarchical Reasoning Model (HRM) to move beyond the limitations of scale and take a decisive step on the path to AGI.
 
@@ -8,16 +8,24 @@ Due to Amazon's "Chronos" forecasting models (still based on transformers BTW) I
 
 -----
 
+### 🚀 **New in v0.15.2: The "ACT Sensitivity" Update**
+
+> This update fixes a critical issue where the model's Adaptive Computation Time (ACT) would get "stuck" at low ponder values, preventing dynamic adjustment to sequence difficulty.
+>
+> 1.  **Surgical Halt Bias Reset:** 🔧 Added `--reset-halt-bias <value>` to directly reset the `h_halt_proj.bias` on checkpoint load. This immediately fixes "ponder stickiness" by lowering the initial halt probability (e.g., `--reset-halt-bias -2.0` → 12% halt prob).
+> 2.  **Encourage Thinking Mode:** 🧠 Added `--encourage-thinking` flag that inverts the ponder loss to *reward* more thinking. Useful for recovery training when ACT has collapsed to minimal pondering.
+> 3.  **Adaptive Ponder Targeting:** 📊 Added `--adaptive-ponder` with `--ponder-target-scale` that scales the target ponder steps with CE loss. Harder content automatically triggers more thinking.
+> 4.  **Model Stats Display:** 📈 Training now prints parameter count and estimated checkpoint size at startup for better visibility into model size.
+
 ### 🚀 **New in v0.15: The "Modular Architecture" Update**
 
 > This major update refactors Hierarchos into a clean, modular package structure for better maintainability, faster training, and easier development.
 >
-> 1.  **Modular Package Structure:** 📦 Reorganized the monolithic 5,600-line `hierarchos.py` into a clean `hierarchos/` package with separate modules for models, training, and utilities. This improves code organization, reduces import overhead, and enables better `torch.compile` caching.
-> 2.  **New CLI Interface:** 💻 Added `hierarchos_cli.py` as an alternative entry point that uses the modular package. Both the original monolith and the new modular CLI are fully compatible with the same checkpoints.
-> 3.  **Temporal Chunking Fix:** 📊 Fixed a critical training parity issue in the modular trainer. Sequences are now processed in 128-token temporal chunks with proper TBPTT (Truncated Backpropagation Through Time), matching the original training loop behavior exactly.
-> 4.  **Per-Batch State Reset:** 🔄 Fixed state handling to reset RNN states and LTM working memory at the start of each batch by default (matching original behavior). Use `--persist-state` to carry states between batches for long-form training.
-> 5.  **Full Forward Parity:** ✅ The modular `HierarchosCore` now produces *identical* outputs to the original, verified with side-by-side testing. Loss, logits, and all intermediate states match exactly.
-> 6.  **Faster Training:** ⚡ Users report faster training speeds with the modular version due to reduced import overhead, better `torch.compile` caching, and improved memory locality.
+> 1.  **Modular Package Structure:** 📦 Reorganized the monolithic 5,600-line `hierarchos.py` into a clean `hierarchos/` package with separate modules for models, training, and utilities.
+> 2.  **New CLI Interface:** 💻 Added `hierarchos_cli.py` as the recommended entry point. Fully checkpoint-compatible with the original.
+> 3.  **Temporal Chunking Fix:** 📊 Implemented 128-token temporal chunking with proper TBPTT.
+> 4.  **Per-Batch State Reset:** 🔄 Reset RNN/LTM states per batch by default. Use `--persist-state` for long-form training.
+> 5.  **Full Forward Parity:** ✅ Verified identical outputs between modular and original implementations.
 
 ### 🚀 **New in v0.14: The "Global Parity" Update**
 
@@ -168,16 +176,14 @@ This guide covers common scenarios from data preparation to inference.
 
 ### Choosing Your Entry Point
 
-Hierarchos provides **two entry points** with identical functionality:
+> ⚠️ **Important:** The modular CLI (`hierarchos_cli.py`) is the **only supported entry point**. The original `hierarchos.py` is legacy and no longer maintained.
 
-| Entry Point | Description | When to Use |
-|-------------|-------------|-------------|
-| `hierarchos.py` | Original monolithic script (5,600 lines) | If you prefer a single-file solution |
-| `hierarchos_cli.py` | New modular CLI | **Recommended** - faster imports, better `torch.compile` caching |
+| Entry Point | Status | Description |
+|-------------|--------|-------------|
+| `hierarchos_cli.py` | ✅ **Recommended** | Modular CLI - faster, stable, actively maintained |
+| `hierarchos.py` | ⚠️ **Legacy** | Unmaintained monolith (5,600 lines). Kept only as reference for agentic AI workflows. |
 
-Both are fully checkpoint-compatible. You can train with one and resume with the other.
-
-**Example using modular CLI:**
+**Example:**
 ```bash
 python hierarchos_cli.py train \
     --hf_dataset "tatsu-lab/alpaca" \
@@ -185,7 +191,7 @@ python hierarchos_cli.py train \
     --completion_column "output" \
     --out-dir "./my_model" \
     --epochs 3 \
-    --force-compile  # Better torch.compile support in modular version
+    --force-compile
 ```
 
 
@@ -196,7 +202,7 @@ Choose **one** data source option:
 **(A) Local JSON/JSONL File (Fits in RAM):**
 
 ```bash
-python hierarchos.py train \
+python hierarchos_cli.py train \
     --train "path/to/your_data.jsonl" \
     --tokenizer-path "openai-community/gpt2" `# Or your preferred tokenizer` \
     --out-dir "./my_Hierarchos_model" \
@@ -216,7 +222,7 @@ python hierarchos.py train \
 **(B) Hugging Face Dataset (Text Completion):**
 
 ```bash
-python hierarchos.py train \
+python hierarchos_cli.py train \
     --hf_dataset "wikitext" \
     --hf_dataset_config "wikitext-2-raw-v1" \
     --hf_dataset_split "train" \
@@ -234,7 +240,7 @@ python hierarchos.py train \
 **(C) Hugging Face Dataset (Instruction/Kayla Format):**
 
 ```bash
-python hierarchos.py train \
+python hierarchos_cli.py train \
     --hf_dataset "databricks/databricks-dolly-15k" \
     --prompt_column "Instruction" \
     --completion_column "output" \
@@ -264,7 +270,7 @@ python hierarchos.py train \
     ```
   * **Step 2: Train using Chunks**
     ```bash
-    python hierarchos.py train \
+    python hierarchos_cli.py train \
         --pre_pt_dataset `# Enable loading via manifest` \
         --train "./very_large_data_chunked" `# Directory with .pt files & manifest` \
         --max_length 3153 `# MUST match chunker output` \
@@ -280,7 +286,7 @@ python hierarchos.py train \
 **(E) Training on AMD GPU (DirectML/Windows):**
 
 ```bash
-python hierarchos.py train \
+python hierarchos_cli.py train \
     --train "path/to/your_data.jsonl" \
     --tokenizer-path "openai-community/gpt2" \
     --out-dir "./my_amd_model" \
@@ -305,7 +311,7 @@ python hierarchos.py train \
 Adapt a pre-trained model using new data (any supported format).
 
 ```bash
-python hierarchos.py finetune \
+python hierarchos_cli.py finetune \
     --model-path "./my_Hierarchos_model" `# Path to your trained base model` \
     --hf_dataset "squad" `# Example: Use SQuAD for QA fine-tuning` \
     --prompt_column "question" \
@@ -324,7 +330,7 @@ python hierarchos.py finetune \
 Combine the base model and the LoRA adapter into a new, standalone model.
 
 ```bash
-python hierarchos.py merge-lora \
+python hierarchos_cli.py merge-lora \
     --model-path "./my_Hierarchos_model" \
     --lora-adapter-path "./my_squad_lora" \
     --out-dir "./my_model_merged_squad"
@@ -335,7 +341,7 @@ python hierarchos.py merge-lora \
 Convert a full-precision model to a quantized format for faster, lower-resource inference.
 
 ```bash
-python hierarchos.py quantize \
+python hierarchos_cli.py quantize \
     --model-path "./my_model_merged_squad" \
     --out-dir "./my_model_merged_squad-Q4_0" \
     --qtype Q4_0 `# Choose format: INT4, Q4_0, Q8_0, Q2_K`
@@ -348,13 +354,13 @@ Interact with your trained or fine-tuned model.
 **Full Precision:**
 
 ```bash
-python hierarchos.py chat --model-path "./my_model_merged_squad"
+python hierarchos_cli.py chat --model-path "./my_model_merged_squad"
 ```
 
 **Quantized *(Requires Compiled Kernel)*:**
 
 ```bash
-python hierarchos.py chat \
+python hierarchos_cli.py chat \
     --model-path "./my_model_merged_squad-Q4_0" \
     --device cpu `# Or vulkan if compiled with Vulkan support`
 ```
@@ -362,7 +368,7 @@ python hierarchos.py chat \
 **Chat with Online Learning (Quantized Example - Requires Compiled Kernel):**
 
 ```bash
-python hierarchos.py chat \
+python hierarchos_cli.py chat \
     --model-path "./my_model_merged_squad-Q4_0" \
     --enable-quantized-learning \
     --shadow-model-path "./my_model_merged_squad" `# Path to original full-precision model` \
@@ -375,7 +381,7 @@ python hierarchos.py chat \
 Continue a `train` run from a saved checkpoint (`.pt` file).
 
 ```bash
-python hierarchos.py train \
+python hierarchos_cli.py train \
     # Dataset args might be loaded from checkpoint, specify only if needed \
     --out-dir "./my_large_model" \
     --resume-from-ckpt "./my_large_model/Hierarchos_epoch_1.pt" \
@@ -406,7 +412,7 @@ python expand_model.py \
 Start a *new* training session using only the *weights* from an existing model directory (not resuming optimizer/scheduler state).
 
 ```bash
-python hierarchos.py train \
+python hierarchos_cli.py train \
     --hf_dataset "new_dataset_for_larger_model" \
     --text_column "text" \
     --model-path "./expanded_model" `# Load weights from expanded/previous model directory` \
@@ -449,6 +455,10 @@ python hierarchos.py train \
 | `--gradient-checkpointing`     | `train`, `finetune`                 | **Enable gradient checkpointing to save VRAM (trades compute for memory).** | `False`                 |
 | `--grad-clip`                  | `train`, `finetune`                 | Gradient clipping value. Prevents gradient explosion (0 to disable).                                                                     | `1.0`                   |
 | `--ponder-loss-weight`         | `train`, `finetune`                 | Weight for the Ponder Cost auxiliary loss.                                                                                               | `0.01`                  |
+| `--encourage-thinking`         | `train`                             | **Invert ponder loss to REWARD thinking.** Useful for ACT recovery training.                                                              | `False`                 |
+| `--adaptive-ponder`            | `train`                             | **Scale ponder target with CE loss.** Harder content triggers more thinking.                                                              | `False`                 |
+| `--ponder-target-scale`        | `train`                             | Scaling factor for adaptive ponder target (target = loss × scale).                                                                        | `0.5`                   |
+| `--reset-halt-bias`            | `train`                             | **SURGICAL FIX:** Reset `h_halt_proj.bias` to this value on checkpoint load (e.g., `-2.0` for ~12% halt prob).                            | `None`                  |
 | `--commitment-loss-weight`     | `train`, `finetune`                 | Weight for the commitment auxiliary loss to prevent posterior collapse.                                                                  | `0.5`                   |
 | `--commitment-threshold`       | `train`, `finetune`                 | Hinge loss threshold for drift penalty. Drift^2 below this is not penalized.                                                             | `0.05`                  |
 | `--override-scheduling`        | `train`                             | **[If resuming]** Ignore checkpoint's schedule state and use new LR args.                                                                | `False`                 |
@@ -456,9 +466,9 @@ python hierarchos.py train \
 | `--min-lr`                     | `train`, `finetune`                 | Minimum Learning Rate for cosine annealing schedule.                                                                                     | `1e-6`                  |
 | `--disable-lr-schedule`        | `train`, `finetune`                 | Use a fixed Learning Rate (`--starting-lr`) instead of cosine annealing.                                                                 | `False`                 |
 | `--ltm_lr`                     | `train`, `finetune`, `chat`         | Learning Rate for LTM "surprise" updates (or max LR for LTM schedule in chat).                                                         | `0.01`                  |
-| `--compile`                    | `train`, `finetune`                 | **Enable torch.compile for faster training (experimental).** Compiles the Worker (L-RNN) loop for potential speedups on NVIDIA GPUs and CPU. **WARNING:** Known to hang on Windows CPU without `--force-compile`. | `False`                 |
-| `--force-compile`              | `train`, `finetune`                 | Force torch.compile even on Windows CPU (overrides safety check). **Use with caution - may cause system hangs on some configurations.** Requires `--compile`. | `False`                 |
-| `--amp`                        | `train`, `finetune`, `chat`         | **Enable Automatic Mixed Precision (requires CUDA).** Automatically disabled for DirectML and CPU. | `False`                 |
+| `--compile`                    | `train`, `finetune`                 | **Enable torch.compile for faster training (experimental).**                                                                              | `False`                 |
+| `--force-compile`              | `train`, `finetune`                 | Force torch.compile even on Windows CPU (overrides safety check).                                                                         | `False`                 |
+| `--amp`                        | `train`, `finetune`, `chat`         | **Enable Automatic Mixed Precision (requires CUDA).**                                                                                     | `False`                 |
 | `--num_workers`                | `train`, `finetune`                 | Number of CPU workers for data loading (and HF dataset mapping if applicable).                                                         | `0`                     |
 | `--lora_r`                     | `finetune`                          | LoRA rank 'r'.                                                                                                                           | `8`                     |
 | `--lora_alpha`                 | `finetune`                          | LoRA alpha scaling factor.                                                                                                               | `16`                    |\n| `--finetune-unlock-percent`    | `finetune`                          | Target % of params to train (approx.). Overrides `--lora_r` if set.                                                                     | `None`                  |
@@ -544,18 +554,19 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
 
 ## Changelog
 
+### v0.15.2 (alpha)
+
+  * **ACT Sensitivity Fixes**:
+      * **Surgical Halt Bias Reset**: Added `--reset-halt-bias` to directly reset `h_halt_proj.bias` on checkpoint load, immediately fixing "ponder stickiness" where ACT gets stuck at minimal values.
+      * **Encourage Thinking Mode**: Added `--encourage-thinking` flag to invert ponder loss (reward thinking instead of penalize).
+      * **Adaptive Ponder Targeting**: Added `--adaptive-ponder` with `--ponder-target-scale` to automatically scale target ponder with CE loss.
+  * **Training Visibility**:
+      * **Model Stats Display**: Training now prints total/trainable parameter count and estimated checkpoint size at startup.
+
 ### v0.15 (alpha)
 
-  * **Modular Architecture**:
-      * **Package Refactor**: Reorganized monolithic `hierarchos.py` (5,600 lines) into a clean `hierarchos/` package with separate modules for `models/`, `training/`, and `utils/`.
-      * **New CLI**: Added `hierarchos_cli.py` as the recommended entry point. Fully checkpoint-compatible with the original `hierarchos.py`.
-      * **Faster Training**: Reduced import overhead and improved `torch.compile` caching due to better code separation and memory locality.
-  * **Training Loop Parity Fixes**:
-      * **Temporal Chunking**: Implemented 128-token temporal chunking with TBPTT in the modular trainer, matching the original training behavior.
-      * **Per-Batch State Reset**: Fixed state handling to reset RNN states and call `model.reset_memory()` at the start of each batch by default (matching original). Added `--persist-state` flag for long-form training.
-      * **Full Forward Parity**: Ported complete `HierarchosCore.forward()` method (~360 lines) including full ACT pondering, shadow states, LTM updates, and all stability clamping.
-  * **Verification**:
-      * **Side-by-Side Testing**: Verified modular and original produce identical outputs on same inputs (loss, logits, all intermediate states).
+  * **Modular Architecture**: Reorganized `hierarchos.py` into `hierarchos/` package. Added `hierarchos_cli.py` as recommended entry point.
+  * **Training Loop Parity**: Implemented 128-token temporal chunking with TBPTT, per-batch state reset, and full forward parity with original.
 
 ### v0.14 (alpha)
 
@@ -675,95 +686,10 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
 
 ### v0.10.0 (alpha)
 
-  * **Hinge Loss (Free Bit Budget):** Implemented `ReLU(drift - threshold)` to prevent Posterior Collapse in the Worker module.
-  * **Last Batch Fix:** Fixed crash when dataset size isn't perfectly divisible by batch size.
+  * **Hinge Loss:** Implemented `ReLU(drift - threshold)` to prevent Posterior Collapse.
   * **Commitment Control:** Added tunable threshold and weights for drift regularization.
-  * **Robustness:** Improved state slicing and shadow state management during training.
 
-### v0.9.5 (alpha)
-
-  * **Enforced Symmetry**: Removed `h_hidden`/`l_hidden` flags. Both now sync to `context_dim` for stability.
-  * **Context Drift**: Added `context_drift_proj` layer for dynamic context adaptation.
-  * **Hugging Face Integration**: Added native support for HF datasets via `--hf_dataset`.
-  * **Negative Reinforcement**: Chat loop now supports penalizing memory ("No", "Bad").
-  * **Robust Signals**: Improved `Ctrl+C` handling for graceful exits.
-
-### v0.9.0 (alpha)
-
-  * **Architectural Overhaul (RWKV)**: Replaced GRU controllers with **RWKV** cells.
-  * **Positional Embedding Removal**: Removed explicit `pos_emb`.
-  * **Quantization Update**: Updated C++ kernels for RWKV layers.
-
-### v0.8.5 (alpha)
-
-  * **Reworked Kernel Build System**: CPU-only by default, optional `--vulkan` flag.
-
-### v0.7.5 (alpha)
-
-  * **Added Gradient Checkpointing**:
-      * Implemented gradient checkpointing (`torch.utils.checkpoint.checkpoint`) within the `HierarchosCore` model's forward pass, specifically targeting the Adaptive HRM loop (`_adaptive_hrm_step`).
-      * Added the `--gradient-checkpointing` command-line flag for `train` and `finetune` modes to enable this feature.
-      * When enabled, this significantly reduces VRAM usage by recomputing activations during the backward pass instead of storing them, allowing for larger models or batches on memory-constrained GPUs.
-      * Updated `train` function to save the `gradient_checkpointing` state in model config/checkpoints.
-  * **Updated Documentation**: Added comprehensive documentation for gradient checkpointing in README (Features, User Guide, Command-Line Reference, Changelog). Updated version number. Corrected `expand_model.py` usage/arguments. Restored previously removed documentation sections.
-
-### v0.7.0 (alpha)
-
-  * **Added Hugging Face `datasets` Support**:
-      * Integrated `datasets` library to load data directly from the Hub or local paths (CSV, Parquet, JSON, Arrow, text, etc.).
-      * Added new arguments: `--hf_dataset`, `--hf_dataset_config`, `--hf_dataset_split`, `--text_column`, `--prompt_column`, `--completion_column`.
-      * `--train` and `--hf_dataset` are now mutually exclusive sources.
-      * Updated `train`, `finetune`, and `main` functions to handle the new loading mechanism.
-      * Added `HuggingFaceMapStyleDataset` class and refactored dataloader creation.
-      * Added `datasets` to requirements files.
-  * **Clarified HRM Training Cost**: Added explanation in README about the impact of `--max_h_steps` and `--max_l_steps` on training speed and compute requirements due to iterative convergence.
-  * **Updated Documentation**: Modified User Guide examples and Command-Line Reference to include HF dataset usage and arguments. Corrected defaults and argument descriptions based on latest code.
-
-### v0.6.2 (alpha)
-
-  * **Migrated from keyboard to signal**: Now uses Python standard "signal" library for chat interruption.
-
-### v0.6.1 (alpha)
-
-  * **Optimized Pre-Chunked Tensor Loading (`--pre_pt_dataset`)**:
-      * `dataset_chunk_create.py` now saves **consolidated `.pt` files**.
-      * A `manifest.jsonl` file is created for mapping chunks.
-      * `PTChunkedDataset` updated to use manifest and **caching**.
-  * **Documentation**: Updated README for consolidated chunking.
-
-### v0.6 (alpha)
-
-  * **Added Dataset Pre-processing Script (`dataset_chunk_create.py`)**: Chunks large `.jsonl` datasets into `.pt` tensor files.
-  * **Implemented Direct Tensor Dataset Loading (`--pre_pt_dataset`)**: Load from `.pt` files + manifest.
-  * **Implemented Iterable Pre-Chunked JSONL Loading (`--pre_chunked_dataset`)**: Load large JSONL line-by-line.
-  * **Updated Dataloader Logic**: Conditional loading based on flags.
-  * **Refined Training State Saving**: Checkpoints save dataset type flags.
-  * **Documentation**: Updated for new chunking workflow.
-
-### v0.5.2 (alpha)
-
-  * **Added Flexible Training Initiation**: `--model-path` in `train` mode loads weights only for a new session.
-  * **Enhanced `expand_model.py` Script**: Added `max_length` expansion and auto-detection.
-  * **Added Automatic Mixed Precision (AMP)**: `--amp` flag for `train`, `finetune`, `chat`.
-  * **Documentation**: Updated for new features.
-
-### v0.5.1 (alpha)
-
-  * **Added `--override-scheduling` flag**: Force new LR schedule when resuming.
-  * **Documentation**: Updated for `--override-scheduling`.
-
-### v0.5 (alpha)
-
-  * **Implemented Structured Long-Term Memory**: Added timestamps and source metadata.
-  * **Implemented Adaptive Reasoning Depth (Ponder Time)**: Dynamic HRM steps.
-  * **Added Ponder Cost**: Auxiliary loss for efficiency.
-  * **Added Halting Threshold**: Inference control (`--h-halt-thresh`).
-
-### v0.4 (alpha)
-
-  * **Implemented Dynamic LTM Learning Rate**: Default Cosine Annealing schedule in chat.
-  * **Added Static LR Fallback**: `--static-ltm-lr` flag for chat.
-  * **Added Gradient Clipping**: `--grad-clip` for training stability.
+*(Older changelog entries have been archived for brevity. See git history for versions prior to v0.10.)*
 
 -----
 

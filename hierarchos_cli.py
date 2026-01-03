@@ -89,6 +89,7 @@ def main():
     train_group.add_argument("--encourage-thinking", action="store_true", help="Invert ponder loss to REWARD thinking (for recovery training).")
     train_group.add_argument("--adaptive-ponder", action="store_true", help="Scale ponder target based on CE loss (more thinking for harder content).")
     train_group.add_argument("--ponder-target-scale", type=float, default=0.5, help="Scaling factor for adaptive ponder target. Default: 0.5.")
+    train_group.add_argument("--reset-halt-bias", type=float, default=None, metavar="BIAS", help="SURGICAL FIX: Reset h_halt_proj.bias to this value on load (e.g., -2.0 for ~12%% halt prob).")
     train_group.add_argument("--override-scheduling", action="store_true")
     train_group.add_argument("--persist-state", action="store_true", default=False, help="Persist RNN/LTM states between batches. Default: False.")
     train_group.add_argument("--no-persist-state", dest="persist_state", action="store_false", help="Disable state persistence between chunks.")
@@ -107,6 +108,16 @@ def main():
     infer_group.add_argument("--max-new-tokens", type=int, default=512)
     infer_group.add_argument("--device", type=str, default=None, choices=["cuda", "cpu", "dml"])
     infer_group.add_argument("--threads", type=int, default=max(1, os.cpu_count() // 2))
+    
+    # --- Chat-specific (Online Learning) ---
+    chat_group = parser.add_argument_group('Chat Online Learning')
+    chat_group.add_argument("--enable-quantized-learning", action="store_true", help="Enable LTM updates for quantized models.")
+    chat_group.add_argument("--ltm-lora-path", type=str, default=None, help="Path to save/load LTM updates as delta file.")
+    chat_group.add_argument("--static-ltm-lr", action="store_true", help="Disable cosine annealing for LTM updates.")
+    chat_group.add_argument("--ltm-schedule-steps", type=int, default=100, help="Cosine cycle steps for LTM learning.")
+    chat_group.add_argument("--ltm-schedule-min-lr", type=float, default=1e-5, help="Min LR for LTM cosine annealing.")
+    chat_group.add_argument("--finetune-unlock-percent", type=float, default=None, help="Target %% of params to train (overrides lora_r).")
+    chat_group.add_argument("--gradient-checkpointing", action="store_true", help="Enable gradient checkpointing.")
     
     args = parser.parse_args()
 
@@ -185,8 +196,32 @@ def main():
         train(args, pt_device, tokenizer, dataloader, dataloader_len)
     elif args.mode == "chat":
         chat(args, pt_device, tokenizer)
+    elif args.mode == "finetune":
+        # Build dataloader for finetune
+        dataloader = None
+        if args.hf_dataset:
+            from datasets import load_dataset
+            temp_ds = load_dataset(args.hf_dataset, args.hf_dataset_config, split=args.hf_dataset_split)
+            dataset = HuggingFaceMapStyleDataset(temp_ds, tokenizer, args.max_length, args.kayla, 
+                                                  args.text_column, args.prompt_column, args.completion_column)
+            dataloader = create_map_style_dataloader(dataset, args.batch_size, tokenizer.pad_token_id, args.num_workers)
+        elif args.pre_chunked_dataset:
+            dataloader = create_dataloader_for_chunked(args.train, args.max_length, args.batch_size, args.num_workers)
+        elif args.pre_pt_dataset:
+            dataloader = create_dataloader_pt_chunked(args.train, args.max_length, args.batch_size, args.num_workers)
+        elif args.train and isinstance(args.train, str):
+            dataset = OriginalJSONLDataset(args.train, tokenizer, args.max_length, args.kayla)
+            dataloader = create_map_style_dataloader(dataset, args.batch_size, tokenizer.pad_token_id, args.num_workers)
+        
+        if dataloader is None:
+            print("ERROR: No dataset provided for finetuning. Use --train or --hf_dataset."); sys.exit(1)
+
+        try: dataloader_len = len(dataloader)
+        except: dataloader_len = 100000
+
+        finetune(args, pt_device, tokenizer, dataloader, dataloader_len)
     else:
-        print(f"INFO: Mode '{args.mode}' is not yet fully integrated in the CLI, but modular functions are ready.")
+        print(f"INFO: Mode '{args.mode}' is not yet fully integrated in the CLI.")
 
 if __name__ == "__main__":
     main()

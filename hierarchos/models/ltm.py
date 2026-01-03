@@ -50,6 +50,10 @@ class LTMModule(nn.Module):
         self.register_buffer("update_counts", torch.zeros(n_slots, dtype=torch.float32), persistent=False)
         self.register_buffer("update_slots", torch.zeros(n_slots, val_dim, dtype=torch.float32), persistent=False)
 
+        # <<< NEW: Online Learning Accumulator >>>
+        self.register_buffer("ltm_deltas", torch.zeros(n_slots, val_dim), persistent=False)
+        self.accumulate_deltas = False
+
     def reset_working_memory(self):
         """Zeros out the Fast State (Working Memory) and associated momentum buffers."""
         device = self.fast_vals.device

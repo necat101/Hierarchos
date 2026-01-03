@@ -214,7 +214,8 @@ class QuantizedHierarchos:
             
             self.ltm = LTMModule(n_slots=self.config.ltm_slots,
                                  key_dim=self.config.ltm_key_dim,
-                                 val_dim=self.config.ltm_val_dim)
+                                 val_dim=self.config.ltm_val_dim,
+                                 reference_chunk_len=getattr(self.config, 'reference_chunk_len', 128))
                                  
             ltm_state = {}
             for k in ['ltm.keys', 'ltm.vals', 'ltm.timestamps', 'ltm.sources']:
@@ -279,10 +280,20 @@ class QuantizedHierarchos:
         
         B, T = input_ids.shape
         curr_prev_context = prev_context.to(device if device == 'vulkan' else 'cpu')
-        curr_target_context = target_context.to(device if device == 'vulkan' else 'cpu')
-        
         logits = None
         stride = self.config.h_stride
+        
+        # --- [PORT] Context Recovery ---
+        # If we have an existing h_state but contexts are zero, recover them to avoid shock
+        if h_state.abs().sum() > 0:
+            if prev_context.abs().sum() == 0:
+                prev_context = self.h_to_context(h_state[:, :, 0].to(device), device=device).cpu()
+            if target_context.abs().sum() == 0:
+                target_context = self.h_to_context(h_state[:, :, 0].to(device), device=device).cpu()
+                
+        curr_prev_context = prev_context.to(device if device == 'vulkan' else 'cpu')
+        curr_target_context = target_context.to(device if device == 'vulkan' else 'cpu')
+        
         all_topk_vals, all_topk_idx = [], []
 
         for t in range(T):
@@ -314,16 +325,18 @@ class QuantizedHierarchos:
 
             mac_input = torch.cat([token_emb.to(device), p_read.to(device), ltm_summary], dim=-1)
             enc = F.gelu(self.in_proj(mac_input, device=device))
+            enc = torch.clamp(enc, min=-30.0, max=30.0)
 
             if self.l_feedback_proj is not None:
                 l_feedback = self.l_feedback_proj(l_state[:, :, 0].to(device), device=device)
-                enc_with_feedback = enc + torch.clamp(l_feedback, min=-10.0, max=10.0)
+                enc_with_feedback = enc + l_feedback
             else:
                 enc_with_feedback = enc
-            
-            enc_with_feedback = torch.clamp(enc_with_feedback, min=-50.0, max=50.0)
             h_out_real, h_state = self.h_rnn(enc_with_feedback, h_state, device=device)
             h_out_real = torch.clamp(h_out_real, min=-100.0, max=100.0)
+            
+            if torch.isnan(h_out_real).any() or torch.isinf(h_out_real).any():
+                print(f"WARNING: NaN/Inf detected in h_out_real during inference at step {t}")
 
             if abs_t % stride == 0:
                 curr_prev_context = curr_target_context
@@ -336,15 +349,17 @@ class QuantizedHierarchos:
                     h_step_outputs.append(h_out_ponder)
                     h_halt_probs.append(torch.sigmoid(self.h_halt_proj(h_out_ponder, device=device).squeeze(-1)))
 
-                h_stack, halt_stack = torch.stack(h_step_outputs), torch.stack(h_halt_probs)
+                h_stack = torch.stack(h_step_outputs, dim=0)
+                halt_stack = torch.stack(h_halt_probs, dim=0)
                 remain = 1.0 - halt_stack
-                remain_shifted = torch.cat([torch.ones_like(remain[:1]), remain[:-1]])
+                remain_shifted = torch.cat([torch.ones_like(remain[:1]), remain[:-1]], dim=0)
                 cum_remain = torch.cumprod(remain_shifted, dim=0)
                 weights, remainder = halt_stack * cum_remain, cum_remain[-1] * (1.0 - halt_stack[-1])
                 total = weights.sum(dim=0) + remainder + 1e-8
                 weights, remainder = weights / total, remainder / total
                 final_h_out = (weights.unsqueeze(-1) * h_stack).sum(dim=0) + remainder.unsqueeze(-1) * h_stack[-1]
                 curr_target_context = self.h_to_context(final_h_out, device=device)
+                curr_target_context = torch.clamp(curr_target_context, min=-50.0, max=50.0)
             
             alpha = (abs_t % stride) / float(stride)
             static_context = curr_prev_context + (curr_target_context - curr_prev_context) * alpha

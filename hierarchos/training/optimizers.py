@@ -68,18 +68,17 @@ class DirectMLAdamW(Optimizer):
                 param.mul_(1 - group['lr'] * group['weight_decay'])
 
                 # Decay the first and second moment running average coefficient
-                # Use explicit in-place operations instead of lerp
                 exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
                 exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
 
-                step = step_t.item()
-                bias_correction1 = 1 - beta1 ** step
-                bias_correction2 = 1 - beta2 ** step
+                # Tensor-based bias correction (Avoids sync)
+                bias_correction1 = 1 - beta1 ** step_t
+                bias_correction2 = 1 - beta2 ** step_t
+                
+                step_size = group['lr'] / bias_correction1
+                denom = (exp_avg_sq.sqrt() / torch.sqrt(bias_correction2)).add_(group['eps'])
 
-                # step_size = group['lr'] / bias_correction1
-                denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(group['eps'])
-
-                param.addcdiv_(exp_avg, denom, value=-group['lr'] / bias_correction1)
+                param.addcdiv_(exp_avg, denom, value=-step_size)
 
         return loss
 import math

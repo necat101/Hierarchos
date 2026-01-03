@@ -6,6 +6,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 from typing import Optional
 from torch.utils.checkpoint import checkpoint
 
@@ -121,14 +122,26 @@ class HierarchosCore(nn.Module):
         self.config = config
         
         # Tokenizer-dependent
+        if not torch.cuda.is_available():
+            torch.set_flush_denormal(True)
+            
         self.tok_emb = nn.Embedding(config.vocab_size, config.context_dim)
         
         # Global Learnable State
         self.persistent_dim = getattr(config, 'persistent_dim', 128)
-        self.persistent = nn.Parameter(torch.randn(self.persistent_dim))
+        self.persistent = nn.Parameter(torch.randn(self.persistent_dim) * 0.02)
         
+        # Learnable LTM Gate
+        self.ltm_gate_logit = nn.Parameter(torch.tensor(-2.0))
+
         # LTM System
-        self.ltm = LTMModule(n_slots=config.ltm_slots, key_dim=config.ltm_key_dim, val_dim=config.ltm_val_dim)
+        self.ltm = LTMModule(
+            n_slots=config.ltm_slots, 
+            key_dim=config.ltm_key_dim, 
+            val_dim=config.ltm_val_dim,
+            lr=getattr(config, 'ltm_lr', 1e-3),
+            forget_rate=getattr(config, 'ltm_forget_rate', 0.01)
+        )
         self.qproj = nn.Linear(config.context_dim * 2, config.ltm_key_dim, bias=False)
         self.val_proj = nn.Linear(config.context_dim, config.ltm_val_dim, bias=False)
         
@@ -138,6 +151,9 @@ class HierarchosCore(nn.Module):
         
         # Manager Components
         self.l_feedback_proj = nn.Linear(config.l_hidden, config.h_hidden, bias=False)
+        # Initialize with small weights to introduce feedback gradually
+        nn.init.normal_(self.l_feedback_proj.weight, mean=0.0, std=0.01)
+
         self.h_rnn = RWKVCell(config.h_hidden)
         self.h_to_context = nn.Linear(config.h_hidden, config.context_dim)
         self.h_halt_proj = nn.Linear(config.h_hidden, 1)
@@ -145,7 +161,15 @@ class HierarchosCore(nn.Module):
         # Worker Components
         self.l_input_proj = nn.Linear(config.context_dim * 2, config.l_hidden)
         self.l_rnn = RWKVCell(config.l_hidden)
+        
+        # Configure truncated BPTT for RWKV cells
+        detach_freq = getattr(config, 'detach_every_n_steps', 32)
+        self.h_rnn.detach_every_n_steps = detach_freq
+        self.l_rnn.detach_every_n_steps = detach_freq
+
         self.context_drift_proj = nn.Linear(config.l_hidden, config.context_dim, bias=False)
+        nn.init.normal_(self.context_drift_proj.weight, mean=0.0, std=0.01)
+
         self.l_to_out = nn.Linear(config.l_hidden, config.context_dim)
         
         # Output Head
@@ -157,30 +181,56 @@ class HierarchosCore(nn.Module):
         self.worker_loop_module = WorkerLoop(config, self.l_rnn, self.l_input_proj, 
                                              self.context_drift_proj, self.l_to_out)
         
-        # System Meta-parameters
-        self.register_buffer("ltm_gate_logit", torch.tensor(0.0))
-        self.register_buffer("time_freqs", torch.randn(config.ltm_val_dim // 2))
+        # Sinusoidal Encoding for Timestamps
+        half_dim = config.ltm_val_dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, dtype=torch.float) * -emb)
+        self.register_buffer('time_freqs', emb)
 
     def compile(self):
-        """Applies torch.compile to the worker loop if enabled in config."""
+        """Applies torch.compile to the worker loop if enabled in config (Robust Parity)."""
         if not getattr(self.config, 'compile', False):
             return
         
         device = next(self.parameters()).device
-        is_dml = is_directml_device(device)
-        
-        if not is_dml:
-            if os.name == 'nt':
-                setup_msvc_environment()
+        device_type = 'cpu'
+        if device.type == 'cuda': device_type = 'cuda'
+        elif is_directml_device(device): device_type = 'dml'
 
-            import torch._dynamo
-            torch._dynamo.config.suppress_errors = True
-            
-            print("INFO: Compiling WorkerLoop...")
-            try:
-                self.worker_loop_module = torch.compile(self.worker_loop_module, dynamic=True)
-            except Exception as e:
-                print(f"Warning: Compilation failed! {e}")
+        # Check for DirectML (doesn't support torch.compile)
+        if device_type == 'dml':
+            print("INFO: DirectML detected - torch.compile is not supported. Using eager mode.")
+            self.config.compile = False
+            return
+
+        # Check for Windows CPU + Compile (Known Hang Issue)
+        if os.name == 'nt' and device_type == 'cpu' and not getattr(self.config, 'force_compile', False):
+            print("WARNING: torch.compile on Windows CPU is known to hang with complex RNN loops.")
+            print("         Disabling compilation for stability. Use force_compile=True to override.")
+            self.config.compile = False
+            return
+
+        try:
+            if hasattr(torch, "compile"):
+                print("INFO: Compiling WorkerLoop...")
+                if os.name == 'nt' and device_type != 'dml':
+                    setup_msvc_environment()
+
+                import torch._dynamo as dynamo
+                dynamo.config.suppress_errors = True
+                
+                compile_options = {"triton.cudagraphs": False} if device_type == 'cuda' else {}
+                
+                self.worker_loop_module = torch.compile(
+                    self.worker_loop_module, 
+                    dynamic=True,
+                    fullgraph=False,
+                    options=compile_options
+                )
+                print("INFO: WorkerLoop compiled successfully.")
+        except Exception as e:
+            print(f"Warning: Compilation failed! Falling back to eager mode. {e}")
+            self.config.compile = False
 
     def forward(self, input_ids, attention_mask=None, labels=None, 
                 h_state=None, l_state=None, 
@@ -225,6 +275,9 @@ class HierarchosCore(nn.Module):
             curr_mom_vals = self.ltm._mom_vals
         else:
             curr_fast_vals, curr_mom_vals = ltm_memory_state
+            # Ensure they are on the correct device
+            curr_fast_vals = curr_fast_vals.to(device)
+            curr_mom_vals = curr_mom_vals.to(device)
 
         final_embs = []
         ponder_costs = []
@@ -272,11 +325,14 @@ class HierarchosCore(nn.Module):
             # ==================================================================
             # 3. HIERARCHICAL MANAGER (Continuous Watch, Strided Plan)
             # ==================================================================
-            l_feedback = self.l_feedback_proj(l_state[:, :, 0])
+            l_feedback = self.l_feedback_proj(l_state[:, :, 0].to(device))
             enc_with_feedback = enc + l_feedback
             
             h_out_real, h_state = self.h_rnn(enc_with_feedback, h_state, timestep=t)
             h_out_real = torch.clamp(h_out_real, min=-100.0, max=100.0)
+            
+            if torch.isnan(h_out_real).any() or torch.isinf(h_out_real).any():
+                print(f"WARNING: NaN/Inf detected in h_out_real at step {t}")
             
             step_ponder_cost = torch.tensor(0.0, device=device)
             
@@ -328,7 +384,7 @@ class HierarchosCore(nn.Module):
             # 4. WORKER STEP
             # ==================================================================
             if self.context_drift_proj is not None:
-                prev_worker_h = l_state[:, :, 0]
+                prev_worker_h = l_state[:, :, 0].to(device)
                 initial_drift = torch.tanh(self.context_drift_proj(prev_worker_h))
                 initial_drift = torch.clamp(initial_drift, min=-5.0, max=5.0)
             else:

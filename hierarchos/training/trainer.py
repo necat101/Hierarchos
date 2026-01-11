@@ -438,7 +438,15 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     model.compile()
 
     # Scheduler
-    num_update_steps = (dataloader_len // args.accumulation_steps) * args.epochs
+    # When override_scheduling is used during resume, calculate T_max based on REMAINING epochs
+    # so that the LR decays properly to min_lr by the final epoch.
+    if getattr(args, 'override_scheduling', False) and args.resume_from_ckpt:
+        remaining_epochs = args.epochs - start_epoch
+        num_update_steps = (dataloader_len // args.accumulation_steps) * remaining_epochs
+        print(f"INFO: --override-scheduling: Calculating LR schedule for REMAINING {remaining_epochs} epochs ({num_update_steps} update steps)")
+    else:
+        num_update_steps = (dataloader_len // args.accumulation_steps) * args.epochs
+    
     if not getattr(args, 'disable_lr_schedule', False) and num_update_steps > 0:
         scheduler = CosineAnnealingLR(optimizer, T_max=num_update_steps, eta_min=args.min_lr)
         if args.resume_from_ckpt and not getattr(args, 'override_scheduling', False) and 'scheduler_state_dict' in checkpoint:

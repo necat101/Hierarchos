@@ -1,12 +1,23 @@
 -----
 
-# Hierarchos v0.15.2 (alpha): A Hybrid Memory-Reasoning Architecture
+# Hierarchos v0.16.0 (alpha): A Hybrid Memory-Reasoning Architecture
+
+**🎉 First Coherent Release!** — Hierarchos has successfully trained a 25M parameter model from scratch on Alpaca data, producing coherent instruction-following responses. See "Using Your Trained Model" below. (warning, no pretraining used, the model is very rigid and only responds well to instruction requests for the time being until i can get funding to train it on a larger dataset with more hardware)
 
 A novel AI architecture that synergistically integrates Google's Titans memory system with a Hierarchical Reasoning Model (HRM) to move beyond the limitations of scale and take a decisive step on the path to AGI.
 
 Due to Amazon's "Chronos" forecasting models (still based on transformers BTW) I've decided to rename the project to "Hierarchos" from this point forward. This should prevent any naming confusion that may occur.
 
 -----
+
+### 🚀 **New in v0.16: The "First Coherent Release" Update**
+
+> This milestone update marks the first coherent, instruction-following model trained entirely from scratch using the Hierarchos architecture!
+>
+> 1.  **🎉 First Successful Training:** A 25M parameter model trained for 60 epochs on the Asus rog ally 1 extreme for ~1.5 months on Alpaca produces coherent, on-topic responses to instruction-formatted prompts.
+> 2.  **Checkpoint-to-Inference Converter:** 🔄 Added `ckpt-2-inf` mode to convert training checkpoints to inference-ready model directories. Creates a HuggingFace-style folder with tokenizer files, clean model weights (66% smaller!), and config JSON.
+> 3.  **Smart LR Scheduling on Resume:** 📉 When using `--override-scheduling` during resumed training, the LR schedule now calculates based on *remaining* epochs, ensuring proper cosine decay to `min_lr` by the final epoch.
+> 4.  **Final Model Auto-Export Restoration:** 💾 Training now automatically exports a clean `hierarchos_final.pt` inference model after the final epoch completes. this was implemented in the original monolith but had a bit of a bug/regression in the new faster modular implementation
 
 ### 🚀 **New in v0.15.2: The "ACT Sensitivity" Update**
 
@@ -357,6 +368,8 @@ Interact with your trained or fine-tuned model.
 python hierarchos_cli.py chat --model-path "./my_model_merged_squad"
 ```
 
+> ⚠️ **Important for Alpaca-Trained Models:** If you trained on instruction datasets like Alpaca, your model expects **instruction-formatted prompts**, not casual conversation. See "Using Your Trained Model" section below.
+
 **Quantized *(Requires Compiled Kernel)*:**
 
 ```bash
@@ -423,6 +436,69 @@ python hierarchos_cli.py train \
     --amp \
     --gradient-checkpointing # Add if VRAM is limited
 ```
+
+### Workflow 9: Converting Checkpoints to Inference Models
+
+Convert a training checkpoint to a clean, inference-ready model directory.
+
+```bash
+python hierarchos_cli.py ckpt-2-inf \
+    --ckpt-input "./my_model/hierarchos_epoch_60.pt" \
+    --inf-output "./my_inference_model" \
+    --ckpt-tok-path "openai-community/gpt2"  # Tokenizer used during training
+```
+
+This creates a HuggingFace-style directory:
+```
+my_inference_model/
+├── model.pt              # Clean model weights (~66% smaller than checkpoint)
+├── hierarchos_config.json # Model configuration
+├── tokenizer.json         # Tokenizer files
+├── vocab.json
+└── merges.txt
+```
+
+-----
+
+## 🎯 Using Your Trained Model
+
+### Instruction-Trained Models (Alpaca, Dolly, etc.)
+
+If you trained on **instruction-following datasets** like Alpaca, your model expects prompts formatted as instructions, not casual conversation.
+
+**❌ This won't work well:**
+```
+>>> hello!
+hierarchos: Journey.  (incoherent)
+```
+
+**✅ Use instruction-style prompts:**
+```
+>>> Explain what machine learning is in simple terms.
+hierarchos: Machine learning is a type of artificial intelligence that uses 
+algorithms to learn from data and improve performance...
+```
+
+**Good prompt examples:**
+```
+>>> Write a short poem about learning.
+>>> List 3 benefits of exercise.
+>>> What is the capital of France?
+>>> Explain photosynthesis to a 5-year-old.
+```
+
+### Sampling Parameters
+
+Adjust generation quality with:
+```bash
+python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.5 --top-k 40 --top-p 0.9
+```
+
+| Parameter | Effect | Recommended |
+|-----------|--------|-------------|
+| `--temperature` | Lower = more focused, higher = more creative | 0.5-0.7 |
+| `--top-k` | Limit vocab to top K tokens | 40 |
+| `--top-p` | Nucleus sampling threshold | 0.9 |
 
 -----
 
@@ -553,6 +629,23 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
   * **DirectML/ZLUDA communities** for enabling AMD GPU acceleration on Windows.
 
 ## Changelog
+
+### v0.16.0 (alpha)
+
+  * **🎉 First Coherent Release**:
+      * Successfully trained a 25M parameter model from scratch on Alpaca dataset (60 epochs)
+      * Model produces coherent, on-topic responses to instruction-formatted prompts
+      * Demonstrates viability of RWKV+Titans+HRM architecture for instruction-following
+  * **Checkpoint-to-Inference Converter**:
+      * Added `ckpt-2-inf` mode with `--ckpt-input`, `--inf-output`, and `--ckpt-tok-path` arguments
+      * Creates HuggingFace-style directory with tokenizer files, clean model weights, and config JSON
+      * Strips optimizer/scheduler state for ~66% file size reduction
+  * **LR Scheduling Fix**:
+      * `--override-scheduling` now calculates `T_max` based on *remaining* epochs when resuming
+      * Ensures proper cosine decay to `min_lr` by the final epoch
+  * **Final Model Auto-Export**:
+      * Training automatically exports `hierarchos_final.pt` after the final epoch
+      * Includes clean state dict, config, and usage instructions
 
 ### v0.15.2 (alpha)
 
@@ -693,4 +786,4 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
 
 -----
 
-© 2025 Makhi Burroughs
+© 2026 Makhi Burroughs

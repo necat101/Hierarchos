@@ -29,7 +29,7 @@ from hierarchos import (
 
 def main():
     parser = argparse.ArgumentParser(description="hierarchos: A Hybrid Memory-Reasoning Architecture")
-    parser.add_argument("mode", type=str, choices=["train", "finetune", "chat", "quantize", "merge-lora"], help="Operation mode.")
+    parser.add_argument("mode", type=str, choices=["train", "finetune", "chat", "quantize", "merge-lora", "ckpt-2-inf"], help="Operation mode.")
 
     # --- Data and Path Arguments ---
     path_group = parser.add_argument_group('Paths and Data')
@@ -118,6 +118,12 @@ def main():
     chat_group.add_argument("--ltm-schedule-min-lr", type=float, default=1e-5, help="Min LR for LTM cosine annealing.")
     chat_group.add_argument("--finetune-unlock-percent", type=float, default=None, help="Target %% of params to train (overrides lora_r).")
     chat_group.add_argument("--gradient-checkpointing", action="store_true", help="Enable gradient checkpointing.")
+    
+    # --- Utility Arguments ---
+    util_group = parser.add_argument_group('Utilities')
+    util_group.add_argument("--ckpt-input", type=str, default=None, help="Input checkpoint path for ckpt-2-inf mode.")
+    util_group.add_argument("--inf-output", type=str, default=None, help="Output inference model path for ckpt-2-inf mode.")
+    util_group.add_argument("--ckpt-tok-path", type=str, default=None, help="HuggingFace tokenizer name/path to embed in the inference model (e.g., 'gpt2', 'openai-community/gpt2').")
     
     args = parser.parse_args()
 
@@ -220,6 +226,110 @@ def main():
         except: dataloader_len = 100000
 
         finetune(args, pt_device, tokenizer, dataloader, dataloader_len)
+    elif args.mode == "ckpt-2-inf":
+        # Convert checkpoint to inference model (HuggingFace-style directory)
+        ckpt_path = args.ckpt_input or args.resume_from_ckpt or args.model_path
+        if not ckpt_path:
+            print("ERROR: No checkpoint specified. Use --ckpt-input, --resume-from-ckpt, or --model-path.")
+            sys.exit(1)
+        
+        # Determine output directory (strip .pt extension if provided)
+        if args.inf_output:
+            output_dir = args.inf_output.replace('.pt', '')
+        else:
+            base_dir = os.path.dirname(ckpt_path)
+            output_dir = os.path.join(base_dir, "hierarchos_final")
+        
+        print(f"Converting checkpoint to inference model...")
+        print(f"  Input:  {ckpt_path}")
+        print(f"  Output: {output_dir}/")
+        
+        try:
+            checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+        except Exception as e:
+            print(f"ERROR: Failed to load checkpoint: {e}")
+            sys.exit(1)
+        
+        # Extract and clean state dict
+        state_dict = checkpoint.get('model_state_dict', checkpoint)
+        clean_state_dict = {}
+        for k, v in state_dict.items():
+            # Remove _orig_mod. prefix from compiled models
+            clean_key = k.replace('_orig_mod.', '')
+            clean_state_dict[clean_key] = v
+        
+        # Extract config
+        config = checkpoint.get('config', {})
+        completed_epoch = checkpoint.get('completed_epoch', checkpoint.get('epoch', 'unknown'))
+        
+        # Handle tokenizer
+        tokenizer_name = args.ckpt_tok_path or config.get('tokenizer_name', 'openai-community/gpt2')
+        print(f"  Tokenizer: {tokenizer_name}")
+        
+        # Load and verify tokenizer
+        try:
+            inf_tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
+            vocab_size = len(inf_tokenizer)
+            print(f"  Vocab size: {vocab_size}")
+            
+            # Verify vocab size matches model
+            model_vocab = config.get('vocab_size')
+            if model_vocab and model_vocab != vocab_size:
+                print(f"  WARNING: Model vocab_size ({model_vocab}) != tokenizer vocab_size ({vocab_size})")
+                print(f"           Make sure you're using the same tokenizer as training!")
+        except Exception as e:
+            print(f"ERROR: Failed to load tokenizer '{tokenizer_name}': {e}")
+            sys.exit(1)
+        
+        # Create output directory
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Save tokenizer files
+        print(f"  Saving tokenizer files...")
+        inf_tokenizer.save_pretrained(output_dir)
+        
+        # Create inference-ready checkpoint
+        model_path = os.path.join(output_dir, "model.pt")
+        inference_checkpoint = {
+            'model_state_dict': clean_state_dict,
+            'config': config,
+            'completed_epoch': completed_epoch,
+            'training_complete': True,
+            'converted_from': os.path.basename(ckpt_path),
+            'tokenizer_name': tokenizer_name,
+        }
+        torch.save(inference_checkpoint, model_path)
+        
+        # Save config as JSON for easy inspection
+        config_path = os.path.join(output_dir, "hierarchos_config.json")
+        import json as json_module
+        config_to_save = dict(config)
+        config_to_save['completed_epoch'] = completed_epoch
+        config_to_save['tokenizer_name'] = tokenizer_name
+        config_to_save['converted_from'] = os.path.basename(ckpt_path)
+        with open(config_path, 'w') as f:
+            json_module.dump(config_to_save, f, indent=2, default=str)
+        
+        # Report
+        input_size = os.path.getsize(ckpt_path)
+        output_size = os.path.getsize(model_path)
+        reduction = (1 - output_size / input_size) * 100
+        
+        # Count all files in output dir
+        total_output_size = sum(os.path.getsize(os.path.join(output_dir, f)) for f in os.listdir(output_dir))
+        
+        print(f"\n" + "="*60)
+        print(f"CONVERSION COMPLETE!")
+        print(f"="*60)
+        print(f"Input checkpoint: {input_size / 1e6:.2f} MB")
+        print(f"Output directory: {output_dir}/")
+        print(f"  - model.pt:     {output_size / 1e6:.2f} MB  ({reduction:.1f}% reduction)")
+        print(f"  - Total size:   {total_output_size / 1e6:.2f} MB")
+        print(f"  - Epoch:        {completed_epoch}")
+        print(f"  - Tokenizer:    {tokenizer_name}")
+        print(f"\nTo use the model for inference:")
+        print(f"  python hierarchos_cli.py chat --model-path \"{output_dir}\"")
+        print(f"="*60)
     else:
         print(f"INFO: Mode '{args.mode}' is not yet fully integrated in the CLI.")
 

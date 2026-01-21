@@ -509,6 +509,42 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
             'config': dict(model.config),
         }, os.path.join(args.out_dir, f"hierarchos_epoch_{epoch+1}.pt"))
 
+    # --- FINAL INFERENCE MODEL EXPORT ---
+    print("\n" + "="*60)
+    print("TRAINING COMPLETE!")
+    print("="*60)
+    
+    # Save inference-ready model (no optimizer/scheduler state = smaller file)
+    final_model_path = os.path.join(args.out_dir, "hierarchos_final.pt")
+    print(f"Saving final inference model to: {final_model_path}")
+    
+    # Clean state dict (remove _orig_mod. prefix from compiled models)
+    clean_state_dict = {}
+    for k, v in model.state_dict().items():
+        clean_key = k.replace('_orig_mod.', '')
+        clean_state_dict[clean_key] = v
+    
+    final_checkpoint = {
+        'model_state_dict': clean_state_dict,
+        'config': dict(model.config),
+        'completed_epoch': args.epochs,
+        'training_complete': True,
+    }
+    save_checkpoint_safely(final_checkpoint, final_model_path)
+    
+    # Calculate final model size
+    model_size_bytes = os.path.getsize(final_model_path)
+    if model_size_bytes >= 1e9:
+        size_str = f"{model_size_bytes / 1e9:.2f} GB"
+    else:
+        size_str = f"{model_size_bytes / 1e6:.2f} MB"
+    
+    print(f"Final model size: {size_str}")
+    print(f"Total epochs completed: {args.epochs}")
+    print(f"\nTo use the model for inference, run:")
+    print(f"  python hierarchos_cli.py chat --model-path \"{final_model_path}\"")
+    print("="*60 + "\n")
+
 def finetune(args, device, tokenizer, dataloader, dataloader_len):
     """
     LoRA-based fine-tuning with PEFT support.

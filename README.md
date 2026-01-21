@@ -2,7 +2,7 @@
 
 # Hierarchos v0.16.1 (alpha): A Hybrid Memory-Reasoning Architecture
 
-**🎉 First Coherent Release!** — Hierarchos has successfully trained a 25M parameter model from scratch on Alpaca data, producing coherent instruction-following responses. See "Using Your Trained Model" below. (warning, no pretraining used, the model is very rigid and only responds well to instruction requests for the time being until i can get funding to train it on a larger dataset with more hardware)
+**🎉 First Coherent Release!** — Hierarchos has successfully trained a 25M parameter model from scratch on Alpaca data, producing decently coherent instruction-following responses for its size and training data (and hardware). See "Using Your Trained Model" below. (warning, no pretraining used, the model is very rigid and only responds well to instruction requests for the time being until i can get funding to train it on a larger dataset with more hardware)
 
 A novel AI architecture that synergistically integrates Google's Titans memory system with a Hierarchical Reasoning Model (HRM) to move beyond the limitations of scale and take a decisive step on the path to AGI.
 

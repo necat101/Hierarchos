@@ -19,56 +19,6 @@ Due to Amazon's "Chronos" forecasting models (still based on transformers BTW) I
 > 3.  **Smart LR Scheduling on Resume:** 📉 When using `--override-scheduling` during resumed training, the LR schedule now calculates based on *remaining* epochs, ensuring proper cosine decay to `min_lr` by the final epoch.
 > 4.  **Final Model Auto-Export Restoration:** 💾 Training now automatically exports a clean `hierarchos_final.pt` inference model after the final epoch completes. this was implemented in the original monolith but had a bit of a bug/regression in the new faster modular implementation
 
-### 🚀 **New in v0.15.2: The "ACT Sensitivity" Update**
-
-> This update fixes a critical issue where the model's Adaptive Computation Time (ACT) would get "stuck" at low ponder values, preventing dynamic adjustment to sequence difficulty.
->
-> 1.  **Surgical Halt Bias Reset:** 🔧 Added `--reset-halt-bias <value>` to directly reset the `h_halt_proj.bias` on checkpoint load. This immediately fixes "ponder stickiness" by lowering the initial halt probability (e.g., `--reset-halt-bias -2.0` → 12% halt prob).
-> 2.  **Encourage Thinking Mode:** 🧠 Added `--encourage-thinking` flag that inverts the ponder loss to *reward* more thinking. Useful for recovery training when ACT has collapsed to minimal pondering.
-> 3.  **Adaptive Ponder Targeting:** 📊 Added `--adaptive-ponder` with `--ponder-target-scale` that scales the target ponder steps with CE loss. Harder content automatically triggers more thinking.
-> 4.  **Model Stats Display:** 📈 Training now prints parameter count and estimated checkpoint size at startup for better visibility into model size.
-
-### 🚀 **New in v0.15: The "Modular Architecture" Update**
-
-> This major update refactors Hierarchos into a clean, modular package structure for better maintainability, faster training, and easier development.
->
-> 1.  **Modular Package Structure:** 📦 Reorganized the monolithic 5,600-line `hierarchos.py` into a clean `hierarchos/` package with separate modules for models, training, and utilities.
-> 2.  **New CLI Interface:** 💻 Added `hierarchos_cli.py` as the recommended entry point. Fully checkpoint-compatible with the original.
-> 3.  **Temporal Chunking Fix:** 📊 Implemented 128-token temporal chunking with proper TBPTT.
-> 4.  **Per-Batch State Reset:** 🔄 Reset RNN/LTM states per batch by default. Use `--persist-state` for long-form training.
-> 5.  **Full Forward Parity:** ✅ Verified identical outputs between modular and original implementations.
-
-### 🚀 **New in v0.14: The "Global Parity" Update**
-
-> This update resolves a critical "Positional Jitter" bug in the training loop that was causing loss plateaus and improves chat recovery.
->
-> 1.  **Fixed Training Loss Plateau:** 📉 Discovered and fixed a bug where `global_pos_offset` was missing in the training loop. This caused the hierarchical manager to reset its stride logic at every chunk boundary, preventing the model from learning long-term dependencies. Loss can now finally break through the 1.92 floor.
-> 2.  **Differentiable Ponder Cost:** 🧠 Replaced the static ponder cost calculation with a differentiable ACT sum. This allows the model to *learn* to be efficient, significantly reducing computation time during inference.
-> 3.  **New Chat Recovery Commands:** 🛠️ Added `/reset` to clear all RNN and Hierarchical states, allowing you to flush "story mode" hallucinations instantly. Improved `/reset_ltm` to perform a thorough memory wipe (clearing fast weights, timestamps, and sources).
-> 4.  **Incremental Generation:** 💬 Refactored the chat loop to use state-of-the-art incremental generation (prefill + single token steps), preventing RNN state corruption and ensuring perfect coherence across long turns.
-
-### 🚀 **New in v0.13.10: The "Ponder Cost" Fix (Legacy)**
-
-
-### 🚀 **New in v0.13.5: The "Coherence & Stability" Update**
-
-> This update resolves subtle architectural discrepancies between training and inference, ensuring the model's reasoning is mathematically consistent in all modes.
->
-> 1.  **Fixed Coherence Drift:** 🎯 Eliminated a critical drift issue where the Manager's long-term planning (strided updates) diverged between parallel training and sequential inference. By unifying the timestep logic (`global_pos_offset`), the model now behaves identically in both modes.
-> 2.  **LTM Persistence Fix:** 🧠 Confirmed and fixed an issue where Long-Term Memory updates (both Hebbian and Gradient-based) were not correctly persisting across inference steps. The model now reliably "remembers" its interactions.
-> 3.  **Chat Coherence:** 💬 Updated the `chat` engine to fully utilize the new coherence fixes, ensuring that long conversations maintain consistent context and reasoning.
-
-### 🚀 **New in v0.13.0: The "Interactive Control" Update**
-
-> This update introduces dynamic sampling controls for chat and resolves deep-seated gradient flow issues in the memory system.
->
-> 1.  **Tunable Sampling:** 🎛️ You can now adjust Temperature, Top-K, and Top-P on the fly during chat using `/temp`, `/topk`, and `/topp` commands.
-> 2.  **LTM Gradient Fix:** 🧠 Fixed a critical bug where gradients weren't flowing back to the LTM module, ensuring the model actually *learns* to use its memory.
-> 3.  **Stability Fixes:** 🛠️ Resolved crashes and logic errors in the chat loop, ensuring smooth, uninterrupted conversations.
-
-
-
-
 ## About The Project
 
 The field of AI has been dominated by a paradigm of unprecedented scale, yet fundamental limitations in today's Transformer models are becoming apparent. The path to Artificial General Intelligence (AGI) may not be paved with scale alone. Hierarchos challenges this paradigm by focusing on **architectural intelligence**.

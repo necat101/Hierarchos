@@ -239,13 +239,15 @@ def chat(args, device, tokenizer):
     # =================================================================
     # 4. LOCAL HELPER FOR LTM UPDATE
     # =================================================================
-    def perform_ltm_update(input_ids_tensor, label_ids_tensor, source_id, penalty=False):
+    def perform_ltm_update(input_ids_tensor, label_ids_tensor, source_id, penalty=False, lr_override=None, silent=False):
+        """Performs LTM update. Returns loss value if successful, else None."""
         nonlocal ltm_has_been_updated
         
         update_model = shadow_model if is_quantized else model
         if update_model is None:
-            print(" (No updatable model available)")
-            return
+            if not silent:
+                print(" (No updatable model available)")
+            return None
             
         target_device = device
 
@@ -310,8 +312,8 @@ def chat(args, device, tokenizer):
             if ltm_grads is not None:
                 ltm_grads_copy = ltm_grads.detach().clone()
                 
-                current_ltm_lr = ltm_lr
-                if ltm_scheduler:
+                current_ltm_lr = lr_override if lr_override is not None else ltm_lr
+                if ltm_scheduler and lr_override is None:
                     current_ltm_lr = ltm_scheduler.get_last_lr()[0]
                     ltm_scheduler.step()
 
@@ -342,13 +344,19 @@ def chat(args, device, tokenizer):
                     model.ltm.load_state_dict(update_model.ltm.state_dict())
 
                 if penalty:
-                    print(f" Done. (Unlikelihood | Loss: {loss.item():.3f})")
+                    if not silent:
+                        print(f" Done. (Unlikelihood | Loss: {loss.item():.3f})")
                 else:
-                    print(f" Done. (Reinforced | Loss: {loss.item():.3f})")
+                    if not silent:
+                        print(f" Done. (Reinforced | Loss: {loss.item():.3f})")
+                return loss.item()
             else:
-                print(" (No LTM gradients generated)")
+                if not silent:
+                    print(" (No LTM gradients generated)")
+                return None
 
         update_model.eval()
+        return None
 
     # =================================================================
     # 5. PRINT WELCOME MESSAGE
@@ -710,6 +718,30 @@ def chat(args, device, tokenizer):
                     'prompt_ids': prompt_ids,
                     'response_ids': torch.tensor(response_ids, device=device)
                 }
+                
+                # =================================================================
+                # D. PASSIVE LEARNING (if enabled)
+                # =================================================================
+                passive_learning = getattr(args, 'passive_learning', False)
+                passive_lr = getattr(args, 'passive_lr', 1e-5)
+                surprise_threshold = getattr(args, 'surprise_threshold', 0.5)
+                
+                if passive_learning and learning_enabled:
+                    # Compute loss first to check surprise threshold
+                    loss_val = perform_ltm_update(
+                        pending_training_data['prompt_ids'][0],
+                        pending_training_data['response_ids'],
+                        LTMModule.SRC_TRAINING_DATA,
+                        penalty=False,
+                        lr_override=passive_lr,
+                        silent=True  # Don't print during passive updates
+                    )
+                    
+                    if loss_val is not None:
+                        if loss_val > surprise_threshold:
+                            print(f"[Passive LTM update | Loss: {loss_val:.3f} > {surprise_threshold:.2f} threshold]")
+                        else:
+                            pass  # Below threshold - no indication needed
 
     except KeyboardInterrupt:
         print("\n\n[Ctrl+C detected. Exiting chat.]")

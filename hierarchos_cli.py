@@ -118,6 +118,10 @@ def main():
     chat_group.add_argument("--ltm-schedule-min-lr", type=float, default=1e-5, help="Min LR for LTM cosine annealing.")
     chat_group.add_argument("--finetune-unlock-percent", type=float, default=None, help="Target %% of params to train (overrides lora_r).")
     chat_group.add_argument("--gradient-checkpointing", action="store_true", help="Enable gradient checkpointing.")
+    chat_group.add_argument("--passive-learning", action="store_true", default=True, help="Enable passive LTM learning after each generation turn (ON by default).")
+    chat_group.add_argument("--no-passive-learning", dest="passive_learning", action="store_false", help="Disable passive LTM learning.")
+    chat_group.add_argument("--passive-lr", type=float, default=5e-6, help="Learning rate for passive LTM updates (default: 5e-6, very conservative).")
+    chat_group.add_argument("--surprise-threshold", type=float, default=1.0, help="Only learn when loss > threshold (default: 1.0 for conservative learning).")
     
     # --- Utility Arguments ---
     util_group = parser.add_argument_group('Utilities')

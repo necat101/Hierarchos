@@ -1,6 +1,6 @@
 -----
 
-# Hierarchos v0.16.0 (alpha): A Hybrid Memory-Reasoning Architecture
+# Hierarchos v0.16.1 (alpha): A Hybrid Memory-Reasoning Architecture
 
 **🎉 First Coherent Release!** — Hierarchos has successfully trained a 25M parameter model from scratch on Alpaca data, producing coherent instruction-following responses. See "Using Your Trained Model" below. (warning, no pretraining used, the model is very rigid and only responds well to instruction requests for the time being until i can get funding to train it on a larger dataset with more hardware)
 
@@ -9,6 +9,15 @@ A novel AI architecture that synergistically integrates Google's Titans memory s
 Due to Amazon's "Chronos" forecasting models (still based on transformers BTW) I've decided to rename the project to "Hierarchos" from this point forward. This should prevent any naming confusion that may occur.
 
 -----
+
+### 🚀 **New in v0.16.1: The "LTM Default Learning Rate Fix" Update**
+
+> This update makes passive LTM learning work out of the box with safe, conservative defaults for campus deployments.
+>
+> 1.  **Passive Learning ON by Default:** 🧠 LTM now learns from every conversation turn automatically — no flags needed.
+> 2.  **Conservative Learning Rate:** 📉 Default passive LR reduced to `5e-6` for stability.
+> 3.  **Higher Surprise Threshold:** 🎯 Default threshold raised to `1.0` — only highly novel content triggers updates.
+> 4.  **Disable Flag:** ⛔ Added `--no-passive-learning` to disable if needed.
 
 ### 🚀 **New in v0.16: The "First Coherent Release" Update**
 
@@ -579,6 +588,14 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
   * **DirectML/ZLUDA communities** for enabling AMD GPU acceleration on Windows.
 
 ## Changelog
+
+### v0.16.1 (alpha)
+
+  * **LTM Default Learning Rate Fix**:
+      * Passive learning now **enabled by default** for seamless campus deployments
+      * Conservative default LR (`5e-6`) prevents catastrophic forgetting
+      * Higher surprise threshold (`1.0`) ensures only novel content triggers updates
+      * Added `--no-passive-learning` flag to disable if needed
 
 ### v0.16.0 (alpha)
 

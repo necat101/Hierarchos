@@ -105,6 +105,7 @@ def main():
     infer_group.add_argument("--temperature", type=float, default=0.7)
     infer_group.add_argument("--top-k", type=int, default=40)
     infer_group.add_argument("--top-p", type=float, default=0.9)
+    infer_group.add_argument("--repetition-penalty", type=float, default=1.2, help="Penalty for repeating tokens (1.0=none, >1.0=discourage). Default: 1.2.")
     infer_group.add_argument("--max-new-tokens", type=int, default=512)
     infer_group.add_argument("--device", type=str, default=None, choices=["cuda", "cpu", "dml"])
     infer_group.add_argument("--threads", type=int, default=max(1, os.cpu_count() // 2))

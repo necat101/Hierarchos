@@ -1,14 +1,22 @@
 -----
 
-# Hierarchos v0.16.1 (alpha): A Hybrid Memory-Reasoning Architecture
+# Hierarchos v0.16.2 (alpha): A Hybrid Memory-Reasoning Architecture
 
-**🎉 First Coherent Release!** — Hierarchos has successfully trained a 25M parameter model from scratch on Alpaca data, producing decently coherent instruction-following responses for its size and training data (and hardware). See "Using Your Trained Model" below. (warning, no pretraining used, the model is very rigid and only responds well to instruction requests for the time being until i can get funding to train it on a larger dataset with more hardware)
+**🎉 First Coherent Release!** — Hierarchos has successfully trained a 25M parameter model from scratch on Alpaca data, producing coherent instruction-following responses. See "Using Your Trained Model" below. (warning, no pretraining used, the model is very rigid and only responds well to instruction requests for the time being until i can get funding to train it on a larger dataset with more hardware)
 
 A novel AI architecture that synergistically integrates Google's Titans memory system with a Hierarchical Reasoning Model (HRM) to move beyond the limitations of scale and take a decisive step on the path to AGI.
 
 Due to Amazon's "Chronos" forecasting models (still based on transformers BTW) I've decided to rename the project to "Hierarchos" from this point forward. This should prevent any naming confusion that may occur.
 
 -----
+
+### 🚀 **New in v0.16.2: The "Repetition Penalty" Update**
+
+> This update adds repetition penalty to prevent output loops like "Visit a museum, Visit a museum..." — works with existing models, no retraining needed!
+>
+> 1.  **Repetition Penalty:** 🔁 Added `--repetition-penalty` flag (default: 1.2) to discourage repeated tokens.
+> 2.  **Works Instantly:** ⚡ Pure inference-time technique — works with any existing trained model.
+> 3.  **Adjustable:** 🏚️ Use `--repetition-penalty 1.5` for stronger effect, or `1.0` to disable.
 
 ### 🚀 **New in v0.16.1: The "LTM Default Learning Rate Fix" Update**
 
@@ -450,7 +458,7 @@ algorithms to learn from data and improve performance...
 
 Adjust generation quality with:
 ```bash
-python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.5 --top-k 40 --top-p 0.9
+python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.5 --top-k 40 --top-p 0.9 --repetition-penalty 1.2
 ```
 
 | Parameter | Effect | Recommended |
@@ -458,6 +466,7 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.5 --top-
 | `--temperature` | Lower = more focused, higher = more creative | 0.5-0.7 |
 | `--top-k` | Limit vocab to top K tokens | 40 |
 | `--top-p` | Nucleus sampling threshold | 0.9 |
+| `--repetition-penalty` | Penalize repeated tokens (1.0=off, >1.0=stronger) | 1.2 |
 
 -----
 
@@ -588,6 +597,13 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
   * **DirectML/ZLUDA communities** for enabling AMD GPU acceleration on Windows.
 
 ## Changelog
+
+### v0.16.2 (alpha)
+
+  * **Repetition Penalty**:
+      * Added `--repetition-penalty` flag (default: 1.2) to prevent output loops
+      * Works with existing models — no retraining needed
+      * Adjustable: higher values = stronger penalty, `1.0` = disabled
 
 ### v0.16.1 (alpha)
 

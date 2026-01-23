@@ -587,6 +587,15 @@ def chat(args, device, tokenizer):
                 logits = outputs["logits"].to(device)
                 next_token_logits = logits[:, -1, :]
 
+                # Apply repetition penalty
+                rep_penalty = getattr(args, 'repetition_penalty', 1.2)
+                if rep_penalty != 1.0 and len(response_ids) > 0:
+                    for prev_token in set(response_ids):
+                        if next_token_logits[0, prev_token] > 0:
+                            next_token_logits[0, prev_token] /= rep_penalty
+                        else:
+                            next_token_logits[0, prev_token] *= rep_penalty
+
                 # Apply sampling
                 if args.temperature > 0:
                     next_token_logits = next_token_logits / args.temperature
@@ -672,6 +681,15 @@ def chat(args, device, tokenizer):
 
                         logits = outputs["logits"].to(device)
                         next_token_logits = logits[:, -1, :]
+
+                        # Apply repetition penalty
+                        rep_penalty = getattr(args, 'repetition_penalty', 1.2)
+                        if rep_penalty != 1.0 and len(response_ids) > 0:
+                            for prev_token in set(response_ids):
+                                if next_token_logits[0, prev_token] > 0:
+                                    next_token_logits[0, prev_token] /= rep_penalty
+                                else:
+                                    next_token_logits[0, prev_token] *= rep_penalty
 
                         if args.temperature > 0:
                             next_token_logits = next_token_logits / args.temperature

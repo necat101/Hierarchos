@@ -408,7 +408,7 @@ my_inference_model/
 
 ### Workflow 10: Benchmark Evaluation (lm-eval)
 
-Run standardized LLM benchmarks on your model. Requires `pip install lm-eval`.
+Run standardized LLM benchmarks on your model. Requires `pip install lm-eval` (automatically installed through the setup script if you used it).
 
 **During Training (End of Epoch):**
 ```bash

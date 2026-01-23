@@ -239,8 +239,9 @@ def chat(args, device, tokenizer):
     # =================================================================
     # 4. LOCAL HELPER FOR LTM UPDATE
     # =================================================================
-    def perform_ltm_update(input_ids_tensor, label_ids_tensor, source_id, penalty=False, lr_override=None, silent=False):
-        """Performs LTM update. Returns loss value if successful, else None."""
+    def perform_ltm_update(input_ids_tensor, label_ids_tensor, source_id, penalty=False, lr_override=None, silent=False, compute_only=False):
+        """Performs LTM update. Returns loss value if successful, else None.
+        If compute_only=True, only computes loss without updating LTM."""
         nonlocal ltm_has_been_updated
         
         update_model = shadow_model if is_quantized else model
@@ -295,6 +296,12 @@ def chat(args, device, tokenizer):
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
+
+            # If compute_only, return loss without updating
+            if compute_only:
+                update_model.zero_grad(set_to_none=True)
+                update_model.eval()
+                return loss.item()
 
             # Extract and apply LTM gradients
             ltm_grads = None
@@ -745,21 +752,29 @@ def chat(args, device, tokenizer):
                 surprise_threshold = getattr(args, 'surprise_threshold', 0.5)
                 
                 if passive_learning and learning_enabled:
-                    # Compute loss first to check surprise threshold
+                    # First compute loss WITHOUT updating to check surprise threshold
                     loss_val = perform_ltm_update(
                         pending_training_data['prompt_ids'][0],
                         pending_training_data['response_ids'],
                         LTMModule.SRC_TRAINING_DATA,
                         penalty=False,
                         lr_override=passive_lr,
-                        silent=True  # Don't print during passive updates
+                        silent=True,
+                        compute_only=True  # Only compute, don't update yet
                     )
                     
-                    if loss_val is not None:
-                        if loss_val > surprise_threshold:
-                            print(f"[Passive LTM update | Loss: {loss_val:.3f} > {surprise_threshold:.2f} threshold]")
-                        else:
-                            pass  # Below threshold - no indication needed
+                    # Only perform actual update if loss exceeds threshold
+                    if loss_val is not None and loss_val > surprise_threshold:
+                        perform_ltm_update(
+                            pending_training_data['prompt_ids'][0],
+                            pending_training_data['response_ids'],
+                            LTMModule.SRC_TRAINING_DATA,
+                            penalty=False,
+                            lr_override=passive_lr,
+                            silent=True,
+                            compute_only=False  # Actually update
+                        )
+                        print(f"[Passive LTM update | Loss: {loss_val:.3f} > {surprise_threshold:.2f} threshold]")
 
     except KeyboardInterrupt:
         print("\n\n[Ctrl+C detected. Exiting chat.]")

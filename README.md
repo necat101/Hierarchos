@@ -1,6 +1,6 @@
 -----
 
-# Hierarchos v0.16.2 (alpha): A Hybrid Memory-Reasoning Architecture
+# Hierarchos v0.16.2.1 (alpha): A Hybrid Memory-Reasoning Architecture
 
 **🎉 First Coherent Release!** — Hierarchos has successfully trained a 25M parameter model from scratch on Alpaca data, producing coherent instruction-following responses. See "Using Your Trained Model" below. (warning, no pretraining used, the model is very rigid and only responds well to instruction requests for the time being until i can get funding to train it on a larger dataset with more hardware)
 
@@ -10,14 +10,15 @@ Due to Amazon's "Chronos" forecasting models (still based on transformers BTW) I
 
 -----
 
-### 🚀 **New in v0.16.2: The "Repetition Penalty" Update**
+### 🚀 **New in v0.16.2.1: The "Critical LTM Threshold Fix" Update**
 
-> This update adds repetition penalty to prevent output loops like "Visit a museum, Visit a museum..." — works with existing models, no retraining needed!
+> **⚠️ CRITICAL BUGFIX**: Fixed a bug where passive learning updated LTM on *every* turn, regardless of the surprise threshold. This could corrupt model weights over time. **If you used v0.16.1-v0.16.2, and experienced LTM corruption, restore your model from a backup. If you haven't experienced LTM corruption, you can safely ignore this warning and continue using your models. It is still highly recommended to update to this version to prevent future LTM corruption.**
 >
-> 1.  **Repetition Penalty:** 🔁 Added `--repetition-penalty` flag (default: 1.2) to discourage repeated tokens.
-> 2.  **Works Instantly:** ⚡ Pure inference-time technique — works with any existing trained model.
-> 3.  **Adjustable:** 🏚️ Use `--repetition-penalty 1.5` for stronger effect, or `1.0` to disable.
-
+> **Other v0.16.x features:**
+> - **Repetition Penalty**: `--repetition-penalty` (default 1.2) prevents output loops
+> - **Passive Learning**: LTM learns from conversations automatically (now threshold-gated correctly)
+> - **Checkpoint Converter**: `ckpt-2-inf` mode for HuggingFace-style inference directories
+> - **Smart LR Scheduling**: Cosine decay calculates correctly when resuming training
 
 
 ## About The Project
@@ -582,37 +583,16 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
 
 ## Changelog
 
-### v0.16.2 (alpha)
+### v0.16.2.1 (alpha)
 
-  * **Repetition Penalty**:
-      * Added `--repetition-penalty` flag (default: 1.2) to prevent output loops
-      * Works with existing models — no retraining needed
-      * Adjustable: higher values = stronger penalty, `1.0` = disabled
-
-### v0.16.1 (alpha)
-
-  * **LTM Default Learning Rate Fix**:
-      * Passive learning now **enabled by default** for seamless campus deployments
-      * Conservative default LR (`5e-6`) prevents catastrophic forgetting
-      * Higher surprise threshold (`1.0`) ensures only novel content triggers updates
-      * Added `--no-passive-learning` flag to disable if needed
-
-### v0.16.0 (alpha)
-
-  * **🎉 First Coherent Release**:
-      * Successfully trained a 25M parameter model from scratch on Alpaca dataset (60 epochs)
-      * Model produces coherent, on-topic responses to instruction-formatted prompts
-      * Demonstrates viability of RWKV+Titans+HRM architecture for instruction-following
-  * **Checkpoint-to-Inference Converter**:
-      * Added `ckpt-2-inf` mode with `--ckpt-input`, `--inf-output`, and `--ckpt-tok-path` arguments
-      * Creates HuggingFace-style directory with tokenizer files, clean model weights, and config JSON
-      * Strips optimizer/scheduler state for ~66% file size reduction
-  * **LR Scheduling Fix**:
-      * `--override-scheduling` now calculates `T_max` based on *remaining* epochs when resuming
-      * Ensures proper cosine decay to `min_lr` by the final epoch
-  * **Final Model Auto-Export**:
-      * Training automatically exports `hierarchos_final.pt` after the final epoch
-      * Includes clean state dict, config, and usage instructions
+  * **⚠️ CRITICAL: LTM Threshold Bugfix**:
+      * Fixed bug where passive learning updated LTM on *every* turn, regardless of threshold
+      * Could corrupt model weights over time — **restore from backup if you used v0.16.1-v0.16.2**
+      * Added `compute_only` parameter to separate loss computation from actual updates
+  * **Repetition Penalty**: `--repetition-penalty` (default 1.2) prevents output loops
+  * **Passive Learning**: LTM learns from conversations automatically (threshold-gated)
+  * **Checkpoint Converter**: `ckpt-2-inf` mode for HuggingFace-style directories
+  * **First Coherent Release**: 25M model trained on Alpaca produces coherent output
 
 ### v0.15.2 (alpha)
 

@@ -4,3 +4,4 @@ transformers
 datasets
 numpy
 tqdm
+lm-eval

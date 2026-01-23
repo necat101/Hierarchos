@@ -18,23 +18,7 @@ Due to Amazon's "Chronos" forecasting models (still based on transformers BTW) I
 > 2.  **Works Instantly:** ⚡ Pure inference-time technique — works with any existing trained model.
 > 3.  **Adjustable:** 🏚️ Use `--repetition-penalty 1.5` for stronger effect, or `1.0` to disable.
 
-### 🚀 **New in v0.16.1: The "LTM Default Learning Rate Fix" Update**
 
-> This update makes passive LTM learning work out of the box with safe, conservative defaults for campus deployments.
->
-> 1.  **Passive Learning ON by Default:** 🧠 LTM now learns from every conversation turn automatically — no flags needed.
-> 2.  **Conservative Learning Rate:** 📉 Default passive LR reduced to `5e-6` for stability.
-> 3.  **Higher Surprise Threshold:** 🎯 Default threshold raised to `1.0` — only highly novel content triggers updates.
-> 4.  **Disable Flag:** ⛔ Added `--no-passive-learning` to disable if needed.
-
-### 🚀 **New in v0.16: The "First Coherent Release" Update**
-
-> This milestone update marks the first coherent, instruction-following model trained entirely from scratch using the Hierarchos architecture!
->
-> 1.  **🎉 First Successful Training:** A 25M parameter model trained for 60 epochs on the Asus rog ally 1 extreme for ~1.5 months on Alpaca produces coherent, on-topic responses to instruction-formatted prompts.
-> 2.  **Checkpoint-to-Inference Converter:** 🔄 Added `ckpt-2-inf` mode to convert training checkpoints to inference-ready model directories. Creates a HuggingFace-style folder with tokenizer files, clean model weights (66% smaller!), and config JSON.
-> 3.  **Smart LR Scheduling on Resume:** 📉 When using `--override-scheduling` during resumed training, the LR schedule now calculates based on *remaining* epochs, ensuring proper cosine decay to `min_lr` by the final epoch.
-> 4.  **Final Model Auto-Export Restoration:** 💾 Training now automatically exports a clean `hierarchos_final.pt` inference model after the final epoch completes. this was implemented in the original monolith but had a bit of a bug/regression in the new faster modular implementation
 
 ## About The Project
 

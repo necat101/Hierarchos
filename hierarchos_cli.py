@@ -100,6 +100,19 @@ def main():
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--force-compile", action="store_true")
 
+    # --- Evaluation Arguments (lm-evaluation-harness) ---
+    eval_group = parser.add_argument_group('Evaluation')
+    eval_group.add_argument("--eval-tasks", type=str, nargs='+', default=None,
+        help="Benchmark tasks to run during training (e.g., 'hellaswag arc_easy'). Disabled by default. Requires: pip install lm-eval")
+    eval_group.add_argument("--eval-every-epoch", type=int, default=1,
+        help="Run evaluation every N epochs (default: 1).")
+    eval_group.add_argument("--eval-batch-size", type=int, default=1,
+        help="Batch size for evaluation (default: 1).")
+    eval_group.add_argument("--eval-limit", type=int, default=None,
+        help="Limit samples per task for fast evaluation runs (e.g., 10 for quick tests).")
+    eval_group.add_argument("--eval-steps", type=int, default=None,
+        help="Run evaluation every N training steps (for quick testing). Triggers periodically.")
+
     # --- Inference & Sampling ---
     infer_group = parser.add_argument_group('Inference')
     infer_group.add_argument("--temperature", type=float, default=0.7)

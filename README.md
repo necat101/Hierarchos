@@ -1,24 +1,19 @@
 -----
 
-# Hierarchos v0.16.2.1 (alpha): A Hybrid Memory-Reasoning Architecture
+# Hierarchos v0.17 (alpha): A Hybrid Memory-Reasoning Architecture
 
-**🎉 First Coherent Release!** — Hierarchos has successfully trained a 25M parameter model from scratch on Alpaca data, producing coherent instruction-following responses. See "Using Your Trained Model" below. (warning, no pretraining used, the model is very rigid and only responds well to instruction requests for the time being until i can get funding to train it on a larger dataset with more hardware)
+**🎉 First Coherent Release!** — Hierarchos has successfully trained a 25M parameter model from scratch on Alpaca data, producing coherent instruction-following responses. See "Using Your Trained Model" below.
 
 A novel AI architecture that synergistically integrates Google's Titans memory system with a Hierarchical Reasoning Model (HRM) to move beyond the limitations of scale and take a decisive step on the path to AGI.
 
-Due to Amazon's "Chronos" forecasting models (still based on transformers BTW) I've decided to rename the project to "Hierarchos" from this point forward. This should prevent any naming confusion that may occur.
-
 -----
 
-### 🚀 **New in v0.16.2.1: The "Critical LTM Threshold Fix" Update**
+### 🚀 **New in v0.17: The "Standardized Evaluation" Update**
 
-> **⚠️ CRITICAL BUGFIX**: Fixed a bug where passive learning updated LTM on *every* turn, regardless of the surprise threshold. This could corrupt model weights over time. **If you used v0.16.1-v0.16.2, and experienced LTM corruption, restore your model from a backup. If you haven't experienced LTM corruption, you can safely ignore this warning and continue using your models. It is still highly recommended to update to this version to prevent future LTM corruption.**
->
-> **Other v0.16.x features:**
-> - **Repetition Penalty**: `--repetition-penalty` (default 1.2) prevents output loops
-> - **Passive Learning**: LTM learns from conversations automatically (now threshold-gated correctly)
-> - **Checkpoint Converter**: `ckpt-2-inf` mode for HuggingFace-style inference directories
-> - **Smart LR Scheduling**: Cosine decay calculates correctly when resuming training
+- **LM-Evaluation-Harness Integration**: Run benchmarks like HellaSwag or ARC-Easy directly during training or after.
+- **Optional Dependency**: `lm-eval` is not required for core training, keeping the environment lightweight.
+- **Periodic Evaluation**: Use `--eval-steps` or `--eval-every-epoch` to track model logic progress throughout training.
+- **Step-Based Progress**: Trigger benchmarks every N steps (e.g., every 500 steps) for high-granularity progress tracking.
 
 
 ## About The Project
@@ -39,6 +34,7 @@ A powerful, data-efficient, and deep reasoning engine. Its dual-module design (a
 
 ## Features ✨
 
+  * 📊 **Integrated Benchmarking**: Optional support for `lm-evaluation-harness`. Track model accuracy on standard benchmarks (HellaSwag, ARC, etc.) during or after training with `--eval-tasks`.
   * 🎮 **AMD GPU Support (DirectML/ZLUDA)**: Train on AMD Radeon GPUs using DirectML backend on Windows. Opt-in via `--device dml` with automatic compatibility handling and optimized fallbacks.
   * 🎓 **Proper Temporal Learning**: Configurable truncated BPTT (`--detach-every-n-steps`) enables learning across multiple timesteps while managing memory. Default 32-step gradients flow allows the model to **learn temporal dependencies** effectively.
   * 🔗 **End-to-End Gradient Flow**: All architectural components (Manager, Worker, LTM) receive proper gradients during training. No more detachment-induced coherence problems or NaN errors.
@@ -410,6 +406,28 @@ my_inference_model/
 └── merges.txt
 ```
 
+### Workflow 10: Benchmark Evaluation (lm-eval)
+
+Run standardized LLM benchmarks on your model. Requires `pip install lm-eval`.
+
+**During Training (End of Epoch):**
+```bash
+python hierarchos_cli.py train \
+    --hf_dataset "tatsu-lab/alpaca" \
+    --eval-tasks hellaswag arc_easy \
+    --eval-every-epoch 1 \
+    --eval-limit 100 # Optional: test on only 100 samples for speed
+```
+
+**Step-Based Evaluation (Frequent tracking):**
+```bash
+python hierarchos_cli.py train \
+    --hf_dataset "tatsu-lab/alpaca" \
+    --eval-tasks arc_easy \
+    --eval-steps 500 # Runs every 500 steps
+    --eval-limit 10
+```
+
 -----
 
 ## 🎯 Using Your Trained Model
@@ -582,6 +600,14 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
   * **DirectML/ZLUDA communities** for enabling AMD GPU acceleration on Windows.
 
 ## Changelog
+
+### v0.17 (alpha)
+
+  * **LM-Evaluation-Harness Integration**: Added optional benchmarking during/after training.
+  * **HierarchosLM Wrapper**: Custom implementation of `loglikelihood`, `loglikelihood_rolling`, and `generate_until` for full compatibility with `lm-eval`.
+  * **Periodic Step-Based Eval**: Added `--eval-steps` to trigger evaluation every N steps for high-granularity progress tracking.
+  * **Configurable Eval**: Added `--eval-every-epoch`, `--eval-batch-size`, and `--eval-limit` control flags.
+  * **Startup Confirmation**: Training now confirms if evaluation is enabled at launch.
 
 ### v0.16.2.1 (alpha)
 

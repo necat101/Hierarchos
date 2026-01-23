@@ -454,6 +454,12 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
             except: pass
     start_step = checkpoint.get('mid_epoch_step', 0) if checkpoint else 0
     
+    # --- Evaluation Confirmation ---
+    eval_tasks = getattr(args, 'eval_tasks', None)
+    if eval_tasks:
+        eval_every = getattr(args, 'eval_every_epoch', 1)
+        print(f"INFO: Evaluation ENABLED - will run {eval_tasks} every {eval_every} epoch(s)")
+    
     # --- Training Loop ---
     for epoch in range(start_epoch, args.epochs):
         model.train()
@@ -499,6 +505,40 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                     'scaler_state_dict': scaler.state_dict() if scaler else None,
                     'config': dict(model.config),
                 }, os.path.join(args.out_dir, f"hierarchos_epoch_{epoch+1}_step_{step+1}.pt"))
+            
+            # --- STEP-BASED EVALUATION (runs every N steps) ---
+            eval_steps = getattr(args, 'eval_steps', None)
+            if eval_steps and eval_tasks and (step + 1) % eval_steps == 0:
+                try:
+                    from ..evaluation import run_eval, format_results, is_lm_eval_available
+                    
+                    if is_lm_eval_available():
+                        print(f"\n[Step {step+1}] Running evaluation (--eval-steps triggered)...")
+                        model.eval()
+                        
+                        eval_results = run_eval(
+                            model=model,
+                            tokenizer=tokenizer,
+                            device=device,
+                            tasks=eval_tasks,
+                            batch_size=getattr(args, 'eval_batch_size', 1),
+                            limit=getattr(args, 'eval_limit', None),
+                            verbosity="WARNING"
+                        )
+                        
+                        if eval_results:
+                            print(format_results(eval_results, tasks=eval_tasks))
+                            
+                            eval_path = os.path.join(args.out_dir, f"eval_epoch_{epoch+1}_step_{step+1}.json")
+                            from ..evaluation import save_results
+                            save_results(eval_results, eval_path)
+                        
+                        model.train()
+                    else:
+                        print("WARNING: lm-eval not installed. Install with: pip install lm-eval>=0.4.0")
+                except Exception as e:
+                    print(f"WARNING: Step-based evaluation failed: {e}")
+                    model.train()
         
         save_checkpoint_safely({
             'completed_epoch': epoch + 1,
@@ -508,6 +548,43 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
             'scaler_state_dict': scaler.state_dict() if scaler else None,
             'config': dict(model.config),
         }, os.path.join(args.out_dir, f"hierarchos_epoch_{epoch+1}.pt"))
+        
+        # --- OPTIONAL EVALUATION (lm-evaluation-harness) ---
+        eval_tasks = getattr(args, 'eval_tasks', None)
+        if eval_tasks:
+            eval_every = getattr(args, 'eval_every_epoch', 1)
+            if (epoch + 1) % eval_every == 0:
+                try:
+                    from ..evaluation import run_eval, format_results, is_lm_eval_available
+                    
+                    if is_lm_eval_available():
+                        print(f"\n[Epoch {epoch+1}] Running evaluation on: {eval_tasks}")
+                        model.eval()
+                        
+                        eval_results = run_eval(
+                            model=model,
+                            tokenizer=tokenizer,
+                            device=device,
+                            tasks=eval_tasks,
+                            batch_size=getattr(args, 'eval_batch_size', 1),
+                            limit=getattr(args, 'eval_limit', None),
+                            verbosity="WARNING"  # Reduce lm-eval verbosity
+                        )
+                        
+                        if eval_results:
+                            print(format_results(eval_results, tasks=eval_tasks))
+                            
+                            # Save results to file
+                            eval_path = os.path.join(args.out_dir, f"eval_epoch_{epoch+1}.json")
+                            from ..evaluation import save_results
+                            save_results(eval_results, eval_path)
+                        
+                        model.train()  # Back to training mode
+                    else:
+                        print("WARNING: lm-eval not installed. Install with: pip install lm-eval>=0.4.0")
+                except Exception as e:
+                    print(f"WARNING: Evaluation failed: {e}")
+                    model.train()  # Ensure model is back in training mode
 
     # --- FINAL INFERENCE MODEL EXPORT ---
     print("\n" + "="*60)

@@ -15,3 +15,13 @@ from .training.datasets import (
 from .utils.device import pick_device, set_threads, is_directml_device, setup_msvc_environment
 from .utils.checkpoint import AttrDict, load_full_model_with_config, save_checkpoint_safely
 from .inference.chat import chat
+
+# Optional evaluation support (requires: pip install lm-eval)
+try:
+    from .evaluation import run_eval, is_lm_eval_available, format_results, HierarchosLM
+except ImportError:
+    # lm-eval not installed - evaluation features not available
+    run_eval = None
+    is_lm_eval_available = lambda: False
+    format_results = None
+    HierarchosLM = None

@@ -12,3 +12,7 @@ cmake
 peft
 accelerate
 bitsandbytes
+
+# Optional: lm-evaluation-harness for benchmark evaluation during training
+# Install with: pip install lm-eval
+lm-eval

@@ -288,7 +288,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     # =================================================================
     if device.type == 'cuda':
         gpu_name = torch.cuda.get_device_name(device)
-        gpu_mem = torch.cuda.get_device_properties(device).total_mem / (1024**3)
+        gpu_mem = torch.cuda.get_device_properties(device).total_memory / (1024**3)
         gpu_capability = torch.cuda.get_device_capability(device)
         print(f"INFO: CUDA GPU: {gpu_name} ({gpu_mem:.1f} GB, SM {gpu_capability[0]}.{gpu_capability[1]})")
 

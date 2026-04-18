@@ -159,13 +159,23 @@ class OriginalJSONLDataset(Dataset):
     def __init__(self, path, tokenizer, max_length, kayla_mode=False):
         super().__init__()
         self.tokenizer, self.max_length, self.kayla_mode, self.samples = tokenizer, max_length, kayla_mode, []
+        skipped = 0
         with open(path, "r", encoding="utf-8") as f:
-            for line in tqdm(f, desc="Loading JSONL"):
+            for line_num, line in enumerate(tqdm(f, desc="Loading JSONL"), 1):
                 line = line.strip()
                 if not line: continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    skipped += 1
+                    if skipped <= 5:
+                        print(f"WARNING: Skipping malformed JSON at line {line_num} (char preview: {line[:80]}...)")
+                    continue
                 # Pass kwargs explicitly to allow overriding in the CLI
-                processed = process_text_sample(tokenizer, json.loads(line), max_length, kayla_mode, prompt_column='instruction', completion_column='output')
+                processed = process_text_sample(tokenizer, data, max_length, kayla_mode, prompt_column='instruction', completion_column='output')
                 if processed: self.samples.append(processed)
+        if skipped:
+            print(f"WARNING: Skipped {skipped} malformed JSONL lines out of {line_num} total.")
     def __len__(self): return len(self.samples)
     def __getitem__(self, idx): return self.samples[idx]
 

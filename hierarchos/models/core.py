@@ -426,7 +426,7 @@ class HierarchosCore(nn.Module):
             # LERP (Interpolation)
             step_in_stride = abs_t % stride
             alpha = step_in_stride / float(stride)
-            sliding_context = torch.lerp(prev_context, target_context, alpha)
+            sliding_context = torch.lerp(prev_context, target_context, torch.tensor(alpha, dtype=prev_context.dtype, device=device))
 
             # ==================================================================
             # 4. WORKER STEP

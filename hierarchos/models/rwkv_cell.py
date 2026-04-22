@@ -59,6 +59,9 @@ class RWKVCell(nn.Module):
 
         # Unbind state: Slot 0 (sx) is the previous timestep's input
         sx, aa, bb, pp, sx_cm = state.unbind(dim=-1)
+        # State is kept in float32 for stability; cast shift-mixers to match input dtype
+        sx = sx.to(dtype=x.dtype)
+        sx_cm = sx_cm.to(dtype=x.dtype)
 
         # Time mixing
         xk = x_norm * tm_k + sx * (1 - tm_k)
@@ -94,9 +97,9 @@ class RWKVCell(nn.Module):
             p = torch.maximum(ww, k_f)
             e1 = torch.exp(ww - p)
             e2 = torch.exp(k_f - p)
-            aa = (e1 * aa_f + e2 * v_f).to(dtype=x.dtype)
-            bb = (e1 * bb_f + e2).to(dtype=x.dtype)
-            pp = p.to(dtype=x.dtype)
+            aa = e1 * aa_f + e2 * v_f
+            bb = e1 * bb_f + e2
+            pp = p
 
         x = x_resid_tm + self.output(r * wkv)
         
@@ -115,7 +118,7 @@ class RWKVCell(nn.Module):
             
         x = x_resid_cm + r * self.value_cm(k)
 
-        new_state = torch.stack([x_in, aa, bb, pp, x_norm2], dim=-1)
+        new_state = torch.stack([x_in.float(), aa, bb, pp, x_norm2.float()], dim=-1)
         new_state = torch.clamp(new_state, min=-50.0, max=50.0)
 
         return x, new_state

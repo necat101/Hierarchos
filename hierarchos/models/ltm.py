@@ -84,7 +84,8 @@ class LTMModule(nn.Module):
                     valid_mask &= (self.sources == source_filter)
 
                 sim = torch.nan_to_num(sim, nan=-torch.inf, posinf=torch.finfo(sim.dtype).max, neginf=-torch.inf)
-                sim = torch.where(valid_mask, sim, self.neg_inf)
+                # AMP FIX: Cast neg_inf to match sim dtype to prevent masked_scatter_ dtype mismatch
+                sim = torch.where(valid_mask, sim, self.neg_inf.to(dtype=sim.dtype))
 
         num_valid_slots_per_query = sim.isfinite().sum(dim=-1)
         num_valid_slots = num_valid_slots_per_query.min().item()
@@ -113,12 +114,17 @@ class LTMModule(nn.Module):
         view_shape = [1] * idx.ndim + [-1]
         range_tensor = range_tensor.view(*view_shape)
         
-        one_hot = (idx_clamped.unsqueeze(-1) == range_tensor).to(dtype=sim.dtype)
+        # AMP FIX: Use float32 for one_hot and subsequent ops to prevent
+        # masked_scatter_ dtype mismatch (BFloat16 vs Float) during backward.
+        # Under BFloat16 AMP, sim is BFloat16 but softmax promotes to float32,
+        # creating a dtype split that crashes in backward's masked_scatter_.
+        one_hot = (idx_clamped.unsqueeze(-1) == range_tensor).float()
         
-        sim_expanded = sim.unsqueeze(-2)
+        sim_f32 = sim.float()
+        sim_expanded = sim_f32.unsqueeze(-2)
         sim_topk = (one_hot * sim_expanded).sum(dim=-1)
         
-        gathered_vals = torch.matmul(one_hot, effective_memory)
+        gathered_vals = torch.matmul(one_hot, effective_memory.float())
         attn_weights = F.softmax(sim_topk, dim=-1)
         
         if torch.isnan(attn_weights).any():
@@ -167,13 +173,22 @@ class LTMModule(nn.Module):
         if not valid_mask.any(): 
             return curr_fast, curr_mom
 
+        # AMP FIX: Cast grads_tensor to float32 BEFORE boolean indexing.
+        # Under BFloat16 AMP, grads_tensor arrives as BFloat16 but downstream
+        # computations promote to float32. The backward pass of boolean indexing
+        # uses masked_scatter_ which requires self and source to have the same dtype.
+        # If grads_tensor is BFloat16 but the incoming gradient is float32, it crashes.
+        grads_tensor = grads_tensor.float()
+        curr_fast = curr_fast.float()
+        curr_mom = curr_mom.float()
+
         idx_flat = topk_idx[valid_mask].view(-1)
         grads_flat = grads_tensor[valid_mask].view(-1, self.vals.size(1))
         grads_flat = grads_flat.contiguous()
 
         num_classes = self.vals.size(0)
         range_tensor = torch.arange(num_classes, device=device).unsqueeze(0)
-        one_hot = (idx_flat.unsqueeze(1) == range_tensor).to(dtype=grads_flat.dtype)
+        one_hot = (idx_flat.unsqueeze(1) == range_tensor).float()
         
         torch.sum(one_hot, dim=0, out=self.update_counts)
         counts = self.update_counts
@@ -216,7 +231,10 @@ class LTMModule(nn.Module):
             update_step = update_delta * (-current_lr)
             decayed_fast = curr_fast * retention_rate
             
-            update_mask = torch.zeros_like(decayed_fast)
+            # AMP FIX: Ensure both torch.where operands are the same dtype (float32)
+            # to prevent masked_scatter_ dtype mismatch in backward pass
+            update_mask = torch.zeros_like(decayed_fast)  # Already float32 from curr_fast.float() above
+            update_step = update_step.to(dtype=update_mask.dtype)  # Guarantee match
             nonzero_mask_expanded = nonzero_mask.unsqueeze(-1).expand_as(update_mask)
             update_mask = torch.where(nonzero_mask_expanded, update_step, update_mask)
             

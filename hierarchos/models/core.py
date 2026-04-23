@@ -524,14 +524,11 @@ class HierarchosCore(nn.Module):
                     z_loss = torch.logsumexp(valid_logits, dim=-1).pow(2).mean() * z_loss_weight
                     loss = loss + z_loss
             
+            # Compute auxiliary costs for reporting (trainer handles loss composition)
             if ponder_costs: 
                 ponder_cost_out = torch.stack(ponder_costs).mean()
-                if self.training:
-                    loss = loss + ponder_cost_out * getattr(self.config, 'ponder_loss_weight', 0.01)
             if commitment_costs: 
                 commitment_cost_out = torch.stack(commitment_costs).mean()
-                if self.training:
-                    loss = loss + commitment_cost_out * getattr(self.config, 'commitment_loss_weight', 0.05)
 
         return {
             "loss": loss, 

@@ -362,6 +362,7 @@ def chat(args, device, tokenizer):
                 if is_quantized and shadow_model:
                     model.ltm.load_state_dict(update_model.ltm.state_dict())
 
+                update_model.eval()
                 if penalty:
                     if not silent:
                         print(f" Done. (Unlikelihood | Loss: {loss.item():.3f})")
@@ -370,6 +371,7 @@ def chat(args, device, tokenizer):
                         print(f" Done. (Reinforced | Loss: {loss.item():.3f})")
                 return loss.item()
             else:
+                update_model.eval()
                 if not silent:
                     print(" (No LTM gradients generated)")
                 return None

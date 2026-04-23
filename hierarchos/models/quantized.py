@@ -274,7 +274,8 @@ class QuantizedHierarchos:
                  h_state: torch.Tensor, l_state: torch.Tensor, 
                  prev_context: torch.Tensor, target_context: torch.Tensor,
                  global_pos_offset: int = 0,
-                 device: str = "cpu", min_timestamp: float = 0.0, source_filter: int = None):
+                 device: str = "cpu", min_timestamp: float = 0.0, source_filter: int = None,
+                 drift_state=None, ltm_memory_state=None, **kwargs):
         
         B, T = input_ids.shape
         curr_prev_context = prev_context.to(device if device == 'vulkan' else 'cpu')

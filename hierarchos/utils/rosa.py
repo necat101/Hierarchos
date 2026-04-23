@@ -501,6 +501,10 @@ def rosa_async_pipeline(
 
     # Build full context
     if past_tokens is not None:
+        # past_tokens is stored on CPU between chunks to save GPU memory (see core.py).
+        # Move it to the same device as input_ids before concatenation.
+        if past_tokens.device != input_ids.device:
+            past_tokens = past_tokens.to(input_ids.device, non_blocking=is_cuda)
         full_input_ids = torch.cat([past_tokens, input_ids], dim=1)
     else:
         full_input_ids = input_ids

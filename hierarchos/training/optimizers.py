@@ -81,4 +81,4 @@ class DirectMLAdamW(Optimizer):
                 param.addcdiv_(exp_avg, denom, value=-step_size)
 
         return loss
-import math
+

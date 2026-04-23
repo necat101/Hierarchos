@@ -7,13 +7,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import numpy as np
 from typing import Optional
 from torch.utils.checkpoint import checkpoint
 
 from .rwkv_cell import RWKVCell
 from .ltm import LTMModule
 from ..utils.device import setup_msvc_environment, is_directml_device
-from ..utils.rosa import ROSA
+from ..utils.rosa import ROSA, rosa_async_pipeline, ROSAState
 
 class WorkerLoop:
     """
@@ -83,11 +84,13 @@ class WorkerLoop:
                 hinge_cost = torch.clamp(hinge_cost, max=100.0)
                 drift_costs.append(hinge_cost)
                 
-                if torch.mean(torch.abs(drift_delta)) < self.l_conv_atol:
-                   break
+                # Update dynamic_context BEFORE convergence check (matches inference path)
                 dynamic_context = static_context + current_drift
                 l_input_vec = torch.cat([current_enc, dynamic_context], dim=-1)
                 l_input = self.l_input_proj(l_input_vec)
+                
+                if torch.mean(torch.abs(drift_delta)) < self.l_conv_atol:
+                   break
 
         # Use original l_state (not shadow) for the actual state update
         ts = timestep if timestep is not None else 0
@@ -101,7 +104,7 @@ class WorkerLoop:
         next_l_state = torch.clamp(next_l_state, min=-50.0, max=50.0)
         
         final_enc = current_enc + self.l_to_out(final_l_out)
-        commitment_cost = torch.tensor(0.0, device=enc.device)
+        commitment_cost = torch.tensor(0.0, device=enc.device, dtype=enc.dtype)
         if len(drift_costs) > 0:
             commitment_cost = torch.stack(drift_costs).mean()
 
@@ -137,6 +140,8 @@ class HierarchosCore(nn.Module):
         self.use_rosa = getattr(config, 'use_rosa', True)
         if self.use_rosa:
             self.rosa_emb = nn.Embedding(config.vocab_size + 1, config.context_dim)
+            # Learnable gate: sigmoid(-1.0) ≈ 0.27 initial injection strength
+            self.rosa_gate_logit = nn.Parameter(torch.tensor(-1.0))
         
         # Global Learnable State
         self.persistent_dim = getattr(config, 'persistent_dim', 128)
@@ -256,38 +261,50 @@ class HierarchosCore(nn.Module):
 
         x = self.tok_emb(input_ids)
 
-        # Unpack LTM Memory State early so we can use past_tokens
+        # Unpack LTM Memory State early so we can use past_tokens + ROSA states
+        rosa_states = None
         if ltm_memory_state is None:
             curr_fast_vals = self.ltm.fast_vals
             curr_mom_vals = self.ltm._mom_vals
             past_tokens = None
         else:
-            if len(ltm_memory_state) >= 3:
+            if len(ltm_memory_state) >= 4:
+                curr_fast_vals, curr_mom_vals, past_tokens, rosa_states = ltm_memory_state[:4]
+            elif len(ltm_memory_state) >= 3:
                 curr_fast_vals, curr_mom_vals, past_tokens = ltm_memory_state[:3]
             else:
                 curr_fast_vals, curr_mom_vals = ltm_memory_state
                 past_tokens = None
 
         # V8 ROSA Precomputation (only when enabled)
+        new_rosa_states = None
         if self.use_rosa:
-            if past_tokens is not None:
-                full_input_ids = torch.cat([past_tokens, input_ids], dim=1)
-            else:
-                full_input_ids = input_ids
-                
-            input_ids_cpu = full_input_ids.cpu().tolist()
-            rosa_batch = []
-            for b in range(B):
-                y = ROSA(input_ids_cpu[b])
-                # Only take the ROSA outputs for the CURRENT input sequence
-                y_current = y[-T:]
-                y_current = [val if val != -1 else self.config.vocab_size for val in y_current]
-                rosa_batch.append(torch.tensor(y_current, device=device))
-            
-            rosa_batch_tensor = torch.stack(rosa_batch, dim=0)
+            rosa_max_ctx = getattr(self.config, 'rosa_max_context', 512)
+
+            # --- Datacenter-Optimized Async ROSA Pipeline ---
+            # Launch CPU suffix automaton work immediately (overlaps with GPU tok_emb)
+            # Uses: Numba JIT, parallel batch threads, pinned memory, CUDA streams,
+            #       and persistent automaton state across TBPTT chunks
+            rosa_finalize = rosa_async_pipeline(
+                input_ids=input_ids,
+                past_tokens=past_tokens,
+                rosa_states=rosa_states,
+                vocab_size=self.config.vocab_size,
+                device=device,
+                rosa_max_ctx=rosa_max_ctx,
+            )
+
+            # Finalize: wait for CPU work, async H2D transfer
+            rosa_batch_tensor, rosa_input, new_rosa_states = rosa_finalize()
+
             rosa_embs = self.rosa_emb(rosa_batch_tensor)
-            x = x + rosa_embs  # Neurosymbolic Inner Monologue Mix
-            new_past_tokens = full_input_ids
+            # Learnable injection gate (controls ROSA signal strength)
+            rosa_gate = torch.sigmoid(torch.clamp(self.rosa_gate_logit, min=-50.0, max=50.0))
+            x = x + rosa_gate * rosa_embs  # Gated Neurosymbolic Inner Monologue Mix
+
+            # Store past_tokens for cross-chunk continuity (capped by rosa_max_ctx)
+            # Detach and move to CPU immediately to prevent GPU memory leak across chunks
+            new_past_tokens = rosa_input.detach().cpu()
         else:
             new_past_tokens = None
 
@@ -404,8 +421,11 @@ class HierarchosCore(nn.Module):
                     h_step_outputs.append(h_out_ponder)
                     h_halt_probs.append(torch.sigmoid(halt_logit))
 
-                h_stack = torch.stack(h_step_outputs, dim=0)
-                halt_stack = torch.stack(h_halt_probs, dim=0)
+                # BUG #4 FIX: Force ACT weighting to float32 for numerical stability.
+                # BFloat16's limited precision (~7 bits) causes underflow in cumprod chains,
+                # leading to NaN weights. Mirrors the autocast(enabled=False) pattern in rwkv_cell.py.
+                h_stack = torch.stack(h_step_outputs, dim=0).float()
+                halt_stack = torch.stack(h_halt_probs, dim=0).float()
                 remain = 1.0 - halt_stack
                 remain_shifted = torch.cat([torch.ones_like(remain[:1]), remain[:-1]], dim=0)
                 cum_remain = torch.cumprod(remain_shifted, dim=0)
@@ -416,6 +436,7 @@ class HierarchosCore(nn.Module):
                 weights = weights / total.unsqueeze(0)
                 remainder = remainder / total
                 final_h_out = (weights.unsqueeze(-1) * h_stack).sum(dim=0) + remainder.unsqueeze(-1) * h_stack[-1]
+                final_h_out = final_h_out.to(enc.dtype)  # Cast back to working precision
                 
                 target_context = self.h_to_context(final_h_out)
                 target_context = torch.clamp(target_context, min=-50.0, max=50.0)
@@ -456,29 +477,19 @@ class HierarchosCore(nn.Module):
             commitment_costs.append(cc)
 
             # ==================================================================
-            # 5. MEMORY UPDATE (Differentiable Hebbian)
+            # 5. MEMORY UPDATE (Differentiable Hebbian — Inference Only)
             # ==================================================================
-            if self.training:
+            # During training, the trainer handles LTM updates via gradient-based
+            # Titans inner_update after backward(). Running Hebbian here too would
+            # cause double-decay and conflicting update signals on the same slots.
+            if not self.training:
                 val_to_store = self.val_proj(enc)
                 val_to_store = torch.clamp(val_to_store, min=-20.0, max=20.0)
                 val_expanded = val_to_store.unsqueeze(1).expand(-1, self.config.ltm_topk, -1)
                 
                 curr_fast_vals, curr_mom_vals = self.ltm.update_memory_hebbian(
                     topk_idx, None, val_expanded,
-                    current_lr=getattr(self.config, 'ltm_lr', 0.01),
-                    timestamp=float(abs_t),
-                    tokens_covered=1,
-                    fast_vals=curr_fast_vals,
-                    mom_vals=curr_mom_vals
-                )
-            else:
-                val_to_store = self.val_proj(enc)
-                val_to_store = torch.clamp(val_to_store, min=-20.0, max=20.0)
-                val_expanded = val_to_store.unsqueeze(1).expand(-1, self.config.ltm_topk, -1)
-                
-                curr_fast_vals, curr_mom_vals = self.ltm.update_memory_hebbian(
-                    topk_idx, None, val_expanded,
-                    current_lr=getattr(self.config, 'ltm_lr', 0.01),
+                    current_lr=getattr(self.config, 'ltm_lr', 0.001),  # COH #1: Use config LR, not hardcoded 0.01
                     timestamp=0.0,
                     tokens_covered=1,
                     fast_vals=curr_fast_vals,
@@ -519,9 +530,16 @@ class HierarchosCore(nn.Module):
                 # Z-Loss Regularization built to prevent exploding logits
                 z_loss_weight = getattr(self.config, 'z_loss_weight', 1e-4)
                 if z_loss_weight > 0:
-                    valid_mask_flat = flat_labels != -100
-                    valid_logits = flat_logits[valid_mask_flat]
-                    z_loss = torch.logsumexp(valid_logits, dim=-1).pow(2).mean() * z_loss_weight
+                    # AMP FIX: Disable autocast for the z-loss block. Boolean indexing
+                    # (flat_logits[valid_mask_flat]) uses masked_scatter_ in its backward
+                    # pass. Under BFloat16 AMP, logsumexp can produce BF16 gradients that
+                    # flow back into the float32 flat_logits via masked_scatter_, crashing
+                    # with "expected self and source to have same dtypes".
+                    _zloss_device = device.type if device.type in ('cuda', 'cpu') else 'cpu'
+                    with torch.amp.autocast(device_type=_zloss_device, enabled=False):
+                        valid_mask_flat = flat_labels != -100
+                        valid_logits = flat_logits[valid_mask_flat]
+                        z_loss = torch.logsumexp(valid_logits, dim=-1).pow(2).mean() * z_loss_weight
                     loss = loss + z_loss
             
             # Compute auxiliary costs for reporting (trainer handles loss composition)
@@ -543,7 +561,7 @@ class HierarchosCore(nn.Module):
             "prev_context": prev_context,
             "target_context": target_context,
             "drift_state": final_drift,
-            "ltm_memory_state": (curr_fast_vals, curr_mom_vals, new_past_tokens),
+            "ltm_memory_state": (curr_fast_vals, curr_mom_vals, new_past_tokens, new_rosa_states),
         }
 
     def prepare_inputs_for_generation(self, input_ids, **kwargs):

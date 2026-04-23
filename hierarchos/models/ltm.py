@@ -72,88 +72,94 @@ class LTMModule(nn.Module):
         return self.vals + self.fast_vals
 
     def retrieve_topk(self, queries: torch.Tensor, topk: int = 4, min_timestamp: float = 0.0, source_filter: Optional[int] = None, fast_vals: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.LongTensor, torch.Tensor]:
-        scale_factor = self.keys.shape[1] ** -0.5
-        sim = (queries @ self.keys.t()) * scale_factor
+        # CRITICAL AMP FIX: Disable autocast for the entire retrieval path.
+        # Under BFloat16 AMP, torch.matmul is in the BF16-eligible list and will
+        # silently recast explicit .float() operands back to BF16. The backward pass
+        # of this BF16 matmul then propagates BF16 gradients into float32 parameters
+        # via masked_scatter_, which crashes with:
+        #   "masked_scatter_: expected self and source to have same dtypes but got BFloat16 and Float"
+        # This mirrors the autocast(enabled=False) pattern used in rwkv_cell.py for WKV stability.
+        _device_type = queries.device.type if queries.device.type in ('cuda', 'cpu') else 'cpu'
+        with torch.amp.autocast(device_type=_device_type, enabled=False):
+            # Cast queries to float32 to ensure all downstream ops stay in float32
+            queries = queries.float()
 
-        if min_timestamp > 0.0 or source_filter is not None:
-            with torch.no_grad():
-                valid_mask = torch.ones(self.keys.size(0), dtype=torch.bool, device=self.keys.device)
-                if min_timestamp > 0.0:
-                    valid_mask &= (self.timestamps >= min_timestamp)
-                if source_filter is not None:
-                    valid_mask &= (self.sources == source_filter)
+            scale_factor = self.keys.shape[1] ** -0.5
+            sim = (queries @ self.keys.t()) * scale_factor
 
-                sim = torch.nan_to_num(sim, nan=-torch.inf, posinf=torch.finfo(sim.dtype).max, neginf=-torch.inf)
-                # AMP FIX: Cast neg_inf to match sim dtype to prevent masked_scatter_ dtype mismatch
-                sim = torch.where(valid_mask, sim, self.neg_inf.to(dtype=sim.dtype))
+            if min_timestamp > 0.0 or source_filter is not None:
+                with torch.no_grad():
+                    valid_mask = torch.ones(self.keys.size(0), dtype=torch.bool, device=self.keys.device)
+                    if min_timestamp > 0.0:
+                        valid_mask &= (self.timestamps >= min_timestamp)
+                    if source_filter is not None:
+                        valid_mask &= (self.sources == source_filter)
 
-        num_valid_slots_per_query = sim.isfinite().sum(dim=-1)
-        num_valid_slots = num_valid_slots_per_query.min().item()
-        effective_topk = min(topk, int(num_valid_slots))
+                    sim = torch.nan_to_num(sim, nan=-torch.inf, posinf=torch.finfo(sim.dtype).max, neginf=-torch.inf)
+                    sim = torch.where(valid_mask, sim, self.neg_inf.to(dtype=sim.dtype))
 
-        if effective_topk <= 0:
-            query_shape = list(queries.shape)
-            vals_shape = query_shape[:-1] + [topk, self.vals.shape[-1]]
-            idx_shape = query_shape[:-1] + [topk]
+            num_valid_slots_per_query = sim.isfinite().sum(dim=-1)
+            num_valid_slots = num_valid_slots_per_query.min().item()
+            effective_topk = min(topk, int(num_valid_slots))
+
+            if effective_topk <= 0:
+                query_shape = list(queries.shape)
+                vals_shape = query_shape[:-1] + [topk, self.vals.shape[-1]]
+                idx_shape = query_shape[:-1] + [topk]
+                
+                return (torch.zeros(vals_shape, device=queries.device, dtype=self.vals.dtype), 
+                        torch.full(idx_shape, -1, device=queries.device, dtype=torch.long), 
+                        torch.zeros(idx_shape, device=queries.device, dtype=torch.float32))
+
+            sim_detached = sim.detach()
+            _, idx = torch.topk(sim_detached, k=effective_topk, dim=-1)
             
-            return (torch.zeros(vals_shape, device=queries.device, dtype=self.vals.dtype), 
-                    torch.full(idx_shape, -1, device=queries.device, dtype=torch.long), 
-                    torch.zeros(idx_shape, device=queries.device, dtype=torch.float32))
+            current_fast_vals = fast_vals if fast_vals is not None else self.fast_vals
+            effective_memory = self.vals + current_fast_vals
+            
+            effective_memory_size = self.vals.shape[0]
+            idx_clamped = idx.clamp(min=0, max=effective_memory_size-1)
+            
+            num_classes = effective_memory_size
+            range_tensor = torch.arange(num_classes, device=idx_clamped.device)
+            view_shape = [1] * idx.ndim + [-1]
+            range_tensor = range_tensor.view(*view_shape)
+            
+            one_hot = (idx_clamped.unsqueeze(-1) == range_tensor).float()
+            
+            sim_expanded = sim.unsqueeze(-2)
+            sim_topk = (one_hot * sim_expanded).sum(dim=-1)
+            
+            gathered_vals = torch.matmul(one_hot, effective_memory.float())
+            attn_weights = F.softmax(sim_topk, dim=-1)
+            
+            if torch.isnan(attn_weights).any():
+                attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
+            
+            weighted_vals = gathered_vals * attn_weights.unsqueeze(-1)
+            weighted_vals = weighted_vals.contiguous()
+            
+            flat_ts = torch.matmul(one_hot, self.timestamps.unsqueeze(1)).squeeze(-1)
+            ts_retrieved = flat_ts
 
-        sim_detached = sim.detach()
-        _, idx = torch.topk(sim_detached, k=effective_topk, dim=-1)
-        
-        current_fast_vals = fast_vals if fast_vals is not None else self.fast_vals
-        effective_memory = self.vals + current_fast_vals
-        
-        effective_memory_size = self.vals.shape[0]
-        idx_clamped = idx.clamp(min=0, max=effective_memory_size-1)
-        
-        num_classes = effective_memory_size
-        range_tensor = torch.arange(num_classes, device=idx_clamped.device)
-        view_shape = [1] * idx.ndim + [-1]
-        range_tensor = range_tensor.view(*view_shape)
-        
-        # AMP FIX: Use float32 for one_hot and subsequent ops to prevent
-        # masked_scatter_ dtype mismatch (BFloat16 vs Float) during backward.
-        # Under BFloat16 AMP, sim is BFloat16 but softmax promotes to float32,
-        # creating a dtype split that crashes in backward's masked_scatter_.
-        one_hot = (idx_clamped.unsqueeze(-1) == range_tensor).float()
-        
-        sim_f32 = sim.float()
-        sim_expanded = sim_f32.unsqueeze(-2)
-        sim_topk = (one_hot * sim_expanded).sum(dim=-1)
-        
-        gathered_vals = torch.matmul(one_hot, effective_memory.float())
-        attn_weights = F.softmax(sim_topk, dim=-1)
-        
-        if torch.isnan(attn_weights).any():
-            attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
-        
-        weighted_vals = gathered_vals * attn_weights.unsqueeze(-1)
-        weighted_vals = weighted_vals.contiguous()
-        
-        flat_ts = torch.matmul(one_hot, self.timestamps.unsqueeze(1)).squeeze(-1)
-        ts_retrieved = flat_ts
-
-        if effective_topk < topk:
-            pad_size = topk - effective_topk
-            batch_shape_list = list(idx_clamped.shape[:-1])
-            
-            idx_pad = torch.full(batch_shape_list + [pad_size], -1, device=idx.device, dtype=idx.dtype)
-            idx_ret = torch.cat([idx, idx_pad], dim=-1)
-            
-            vals_pad = torch.zeros(batch_shape_list + [pad_size, weighted_vals.shape[-1]], 
-                                   device=weighted_vals.device, dtype=weighted_vals.dtype)
-            vals_ret = torch.cat([weighted_vals, vals_pad], dim=-2)
-            
-            ts_pad = torch.zeros(batch_shape_list + [pad_size], 
-                               device=ts_retrieved.device, dtype=ts_retrieved.dtype)
-            ts_ret = torch.cat([ts_retrieved, ts_pad], dim=-1)
-            
-            return vals_ret, idx_ret, ts_ret
-        else:
-            return weighted_vals, idx, ts_retrieved
+            if effective_topk < topk:
+                pad_size = topk - effective_topk
+                batch_shape_list = list(idx_clamped.shape[:-1])
+                
+                idx_pad = torch.full(batch_shape_list + [pad_size], -1, device=idx.device, dtype=idx.dtype)
+                idx_ret = torch.cat([idx, idx_pad], dim=-1)
+                
+                vals_pad = torch.zeros(batch_shape_list + [pad_size, weighted_vals.shape[-1]], 
+                                       device=weighted_vals.device, dtype=weighted_vals.dtype)
+                vals_ret = torch.cat([weighted_vals, vals_pad], dim=-2)
+                
+                ts_pad = torch.zeros(batch_shape_list + [pad_size], 
+                                   device=ts_retrieved.device, dtype=ts_retrieved.dtype)
+                ts_ret = torch.cat([ts_retrieved, ts_pad], dim=-1)
+                
+                return vals_ret, idx_ret, ts_ret
+            else:
+                return weighted_vals, idx, ts_retrieved
 
     def inner_update(self, topk_idx: torch.LongTensor, grads_tensor: torch.Tensor, current_lr: float, timestamp: float, 
                     source: int = SRC_USER_INTERACTION, tokens_covered: int = None,

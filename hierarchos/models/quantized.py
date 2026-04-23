@@ -138,13 +138,12 @@ class QuantizedRWKVCell:
             if p.device.type != device:
                 p.data = p.data.to(device)
 
-        # Capture input for next Time Mixing state (Token Shift)
-        x_in = x 
-
         sx, aa, bb, pp, sx_cm = state.unbind(dim=2)
 
         # --- Time mixing ---
+        # COH #2: x_norm stored in state slot 0 (matches full model's rwkv_cell.py)
         x_norm = F.layer_norm(x, (self.n_embd,), weight=self.ln1_w, bias=self.ln1_b)
+        x_in = x_norm  # This is what gets stored in slot 0
 
         xk = x_norm * self.time_mix_k + sx * (1 - self.time_mix_k)
         xv = x_norm * self.time_mix_v + sx * (1 - self.time_mix_v)
@@ -163,9 +162,6 @@ class QuantizedRWKVCell:
         
         # Time Mixing Output / Channel Mixing Input
         x = x + self.output(r * wkv, device)
-        
-        # Capture input for next Channel Mixing state
-        x_tm = x 
 
         ww = pp + self.time_decay
         p = torch.maximum(ww, k)
@@ -176,17 +172,19 @@ class QuantizedRWKVCell:
         pp = p
 
         # --- Channel mixing ---
+        # COH #2: x_norm2 stored in state slot 4 (matches full model's rwkv_cell.py)
         x_norm2 = F.layer_norm(x, (self.n_embd,), weight=self.ln2_w, bias=self.ln2_b)
 
         xk = x_norm2 * self.time_mix_k_cm + sx_cm * (1 - self.time_mix_k_cm)
         xr = x_norm2 * self.time_mix_r_cm + sx_cm * (1 - self.time_mix_r_cm)
         
         r = torch.sigmoid(self.receptance_cm(xr, device))
-        k = torch.square(torch.relu(self.key_cm(xk, device)))
+        key_out = self.key_cm(xk, device)
+        k = F.silu(key_out) * torch.relu(key_out)
         x = x + r * self.value_cm(k, device)
 
-        # Update state: [x_in, aa, bb, pp, x_tm]
-        new_state = torch.stack([x_in, aa, bb, pp, x_tm], dim=2)
+        # Update state: [x_in(=x_norm), aa, bb, pp, x_norm2] — aligned with full model
+        new_state = torch.stack([x_in, aa, bb, pp, x_norm2], dim=2)
         return x, new_state
 
 class QuantizedHierarchos:

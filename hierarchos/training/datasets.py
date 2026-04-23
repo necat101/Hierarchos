@@ -72,7 +72,7 @@ def create_dataloader_for_chunked(path, max_length, batch_size, num_workers=0):
             "labels": torch.stack([item['labels'] for item in batch]),
             "attention_mask": torch.stack([item['attention_mask'] for item in batch])
         }
-    pin_memory = torch.cuda.is_available() and num_workers > 0
+    pin_memory = torch.cuda.is_available()
     return DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn_simple,
                       num_workers=num_workers, pin_memory=pin_memory,
                       persistent_workers=(num_workers > 0))
@@ -114,7 +114,7 @@ def create_dataloader_pt_chunked(directory_path, max_length, batch_size, num_wor
             "attention_mask": torch.stack([item['attention_mask'] for item in batch])
         }
     return DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn_pt, shuffle=True,
-                      num_workers=num_workers, pin_memory=(torch.cuda.is_available() and num_workers > 0),
+                      num_workers=num_workers, pin_memory=torch.cuda.is_available(),
                       persistent_workers=(num_workers > 0))
 
 def process_text_sample(tokenizer, text_dict: dict, max_length: int, kayla_mode: bool = False,

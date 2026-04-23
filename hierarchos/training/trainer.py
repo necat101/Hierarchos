@@ -110,11 +110,22 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                     global_pos_offset=start_t
                 )
                 
-                # --- [NEW] Titans Memory Gradient-Based Update (Parity Fix) ---
+                # AMP FIX (BUG #1): Cast raw_topk_vals to float32 and retain_grad INSIDE
+                # autocast to prevent masked_scatter_ dtype mismatch in backward pass.
+                # Under BFloat16 AMP, these tensors are created as BF16; retain_grad()
+                # on BF16 tensors causes autograd to use masked_scatter_ with mismatched
+                # dtypes (BF16 holder vs F32 gradient), crashing after ~2k steps.
                 if outputs.get("raw_topk_vals") is not None:
+                    float32_topk = []
                     for t_val in outputs["raw_topk_vals"]:
-                        if t_val.requires_grad: t_val.retain_grad()
-                # -------------------------------------------------------------
+                        if t_val.requires_grad:
+                            t_f32 = t_val.float()
+                            t_f32.retain_grad()
+                            float32_topk.append(t_f32)
+                        else:
+                            float32_topk.append(t_val)
+                    outputs["raw_topk_vals"] = float32_topk
+
 
                 ce_loss = outputs['loss']
                 ponder_cost = outputs.get('ponder_cost')
@@ -150,17 +161,14 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                 # --- FLAT WEIGHTING (Parity with Monolith) ---
                 # The monolith does not weight chunks by length. 
                 # We use unweighted loss to ensure gradient parity.
-                chunk_loss = combined_loss / accumulation_steps
+                chunk_loss = combined_loss / (accumulation_steps * num_chunks)
 
                 # We still need chunk_ratio (relative to T) for sequence-averaged display metrics
                 chunk_len = (end_t - start_t)
                 chunk_ratio = chunk_len / float(T)
             
             # Backprop per chunk (TBPTT)
-            # Prepare for LTM gradient extraction
-            if outputs.get("raw_topk_vals") is not None:
-                for t_val in outputs["raw_topk_vals"]:
-                    if t_val.requires_grad: t_val.retain_grad()
+            # retain_grad() is now handled inside autocast block above (BUG #1 fix)
 
             if scaler is not None: scaler.scale(chunk_loss).backward()
             else: chunk_loss.backward()
@@ -185,30 +193,52 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                     # Clear intermediate grads immediately to free memory
                     for t_val in outputs["raw_topk_vals"]:
                         t_val.grad = None
+                    outputs["raw_topk_vals"] = None  # Free tensor references (BUG #3: memory leak fix)
 
                     if torch.isfinite(ltm_grads_tensor).all():
-                        if getattr(args, 'grad_clip', 1.0) > 0:
-                            torch.nn.utils.clip_grad_norm_([ltm_grads_tensor], getattr(args, 'grad_clip', 1.0))
+                        # Direct tensor clipping (clip_grad_norm_ expects parameters with .grad,
+                        # but ltm_grads_tensor IS the gradient data itself — no .grad attribute)
+                        _clip_val = getattr(args, 'grad_clip', 1.0)
+                        if _clip_val > 0:
+                            _grad_norm = ltm_grads_tensor.norm()
+                            if _grad_norm > _clip_val:
+                                ltm_grads_tensor = ltm_grads_tensor * (_clip_val / (_grad_norm + 1e-8))
+                        
+                        # Unpack current LTM state for the update
+                        curr_ltm = outputs.get('ltm_memory_state')
+                        curr_fast = curr_ltm[0] if curr_ltm is not None else None
+                        curr_mom = curr_ltm[1] if curr_ltm is not None else None
+                        curr_past_tokens = curr_ltm[2] if curr_ltm is not None and len(curr_ltm) >= 3 else None
+                        curr_rosa_states = curr_ltm[3] if curr_ltm is not None and len(curr_ltm) >= 4 else None
                         
                         # Titans inner_update (Gradient-based)
-                        # [PARITY FIX] We do NOT pass hebbian_fast/mom here to match 
-                        # the monolith's behavior during training.
+                        # Pass fast_vals/mom_vals from forward pass state, not module defaults
                         new_fast, new_mom = model.ltm.inner_update(
                             outputs["topk_idx"],
                             ltm_grads_tensor,
-                            current_lr=getattr(args, 'ltm_lr', 0.001), # Default 1e-3
+                            current_lr=getattr(args, 'ltm_lr', 0.001),
                             source=2, # SRC_TRAINING_DATA
                             timestamp=float(end_t),
                             tokens_covered=end_t - start_t,
+                            fast_vals=curr_fast,
+                            mom_vals=curr_mom,
                             inplace=True
                         )
-                        ltm_state = (new_fast.detach(), new_mom.detach())
+                        ltm_state = (new_fast.detach(), new_mom.detach(), 
+                                     curr_past_tokens.detach() if curr_past_tokens is not None else None,
+                                     curr_rosa_states)  # ROSA automaton states (plain Python, no detach needed)
                     else:
-                        ltm_state = (outputs['ltm_memory_state'][0].detach(), outputs['ltm_memory_state'][1].detach())
+                        curr_ltm = outputs['ltm_memory_state']
+                        ltm_state = (curr_ltm[0].detach(), curr_ltm[1].detach(),
+                                     curr_ltm[2].detach() if len(curr_ltm) >= 3 and curr_ltm[2] is not None else None,
+                                     curr_ltm[3] if len(curr_ltm) >= 4 else None)
             else:
                 # No LTM outputs? Just take what we have
                 if outputs.get('ltm_memory_state') is not None:
-                    ltm_state = (outputs['ltm_memory_state'][0].detach(), outputs['ltm_memory_state'][1].detach())
+                    curr_ltm = outputs['ltm_memory_state']
+                    ltm_state = (curr_ltm[0].detach(), curr_ltm[1].detach(),
+                                 curr_ltm[2].detach() if len(curr_ltm) >= 3 and curr_ltm[2] is not None else None,
+                                 curr_ltm[3] if len(curr_ltm) >= 4 else None)
 
             # Update states for next chunk (TBPTT - detach to limit gradient flow)
             if outputs.get('h_state') is not None:
@@ -296,13 +326,16 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         if gpu_capability[0] >= 8:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
+            torch.set_float32_matmul_precision('high')  # OPT #4: Canonical TF32 API
             print("INFO: TF32 matmul enabled (Ampere+ GPU detected).")
 
         # cuDNN benchmark — auto-tunes convolution algorithms for the hardware
         torch.backends.cudnn.benchmark = True
 
-        # Auto-enable AMP on CUDA if not explicitly disabled
-        if not getattr(args, 'amp', False):
+        # Auto-enable AMP on CUDA unless the user explicitly passed --amp or --no-amp.
+        # Must check all argparse-accepted forms (hyphen and underscore variants).
+        _amp_was_explicitly_set = any(a in sys.argv for a in ('--amp', '--no-amp', '--no_amp'))
+        if not _amp_was_explicitly_set:
             args.amp = True
             config.amp = True
             print("INFO: AMP auto-enabled for CUDA training (use --no-amp to disable).")
@@ -315,9 +348,11 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
 
         # Prefer bfloat16 on Ampere+ for better dynamic range (no GradScaler needed)
         if gpu_capability[0] >= 8 and torch.cuda.is_bf16_supported():
+            args.amp_dtype = 'bfloat16'
             config.amp_dtype = 'bfloat16'
             print("INFO: Using bfloat16 AMP (Ampere+ native support).")
         else:
+            args.amp_dtype = 'float16'
             config.amp_dtype = 'float16'
             print("INFO: Using float16 AMP with GradScaler.")
 
@@ -333,6 +368,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     scaler = None
     scheduler = None
     checkpoint = None
+    # NOTE: use_amp MUST be read AFTER the CUDA block above, which may auto-enable AMP.
     use_amp = getattr(args, 'amp', False)
     
     # 1. Loading/Resuming Logic
@@ -426,6 +462,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                     print("WARNING: h_halt_proj.bias not found, surgical fix skipped.")
         
         if is_directml_device(device): optimizer = DirectMLAdamW(model.parameters(), lr=args.starting_lr)
+        elif device.type == 'cuda': optimizer = torch.optim.AdamW(model.parameters(), lr=args.starting_lr, fused=True)
         else: optimizer = torch.optim.AdamW(model.parameters(), lr=args.starting_lr)
         
         if not getattr(args, 'override_scheduling', False) and 'optimizer_state_dict' in checkpoint:
@@ -435,7 +472,9 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         # Original script uses 'completed_epoch', modular uses 'epoch', check both for compatibility
         start_epoch = checkpoint.get('completed_epoch', checkpoint.get('epoch', 0))
         print(f"Successfully loaded model state. Resuming from epoch {start_epoch + 1}.")
-        if use_amp and getattr(config, 'amp_dtype', 'float16') != 'bfloat16':
+        # BFloat16 does NOT use GradScaler — its dynamic range makes scaling unnecessary.
+        # Only create scaler for float16 AMP.
+        if use_amp and getattr(config, 'amp_dtype', 'float16') == 'float16':
             scaler = GradScaler()
             if 'scaler_state_dict' in checkpoint and not getattr(args, 'override_scheduling', False):
                 try: scaler.load_state_dict(checkpoint['scaler_state_dict'])
@@ -448,17 +487,19 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         model.config = model_config
         
         if is_directml_device(device): optimizer = DirectMLAdamW(model.parameters(), lr=args.starting_lr)
+        elif device.type == 'cuda': optimizer = torch.optim.AdamW(model.parameters(), lr=args.starting_lr, fused=True)
         else: optimizer = torch.optim.AdamW(model.parameters(), lr=args.starting_lr)
         
-        if use_amp and getattr(config, 'amp_dtype', 'float16') != 'bfloat16': scaler = GradScaler()
+        if use_amp and getattr(config, 'amp_dtype', 'float16') == 'float16': scaler = GradScaler()
     
     else:
         print("Starting training from scratch.")
         if 'vocab_size' not in config: config.vocab_size = len(tokenizer)
         model = HierarchosCore(config).to(device)
         if is_directml_device(device): optimizer = DirectMLAdamW(model.parameters(), lr=args.starting_lr)
+        elif device.type == 'cuda': optimizer = torch.optim.AdamW(model.parameters(), lr=args.starting_lr, fused=True)
         else: optimizer = torch.optim.AdamW(model.parameters(), lr=args.starting_lr)
-        if use_amp and getattr(config, 'amp_dtype', 'float16') != 'bfloat16': scaler = GradScaler()
+        if use_amp and getattr(config, 'amp_dtype', 'float16') == 'float16': scaler = GradScaler()
 
     # --- [NEW] Sync LTM reference chunk size (Parity Fix) ---
     training_chunk_size = getattr(args, 'training_chunk_size', 128)
@@ -799,12 +840,15 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
     
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # AMP setup
+    # AMP setup (BFloat16 does NOT use GradScaler — only float16 needs it)
     scaler = None
     use_amp = getattr(args, 'amp', False)
+    amp_dtype_str = getattr(args, 'amp_dtype', None) or getattr(config, 'amp_dtype', 'float16')
+    amp_dtype = torch.bfloat16 if amp_dtype_str == 'bfloat16' else torch.float16
     if use_amp:
-        scaler = GradScaler()
-        print("INFO: Automatic Mixed Precision (AMP) ENABLED for fine-tuning.")
+        if amp_dtype_str == 'float16':
+            scaler = GradScaler()
+        print(f"INFO: Automatic Mixed Precision (AMP) ENABLED for fine-tuning ({amp_dtype_str}).")
 
     # Scheduler setup
     scheduler = None
@@ -846,8 +890,14 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
             labels = batch["labels"].to(device)
 
             autocast_device_type = 'cpu' if is_directml_device(device) else device.type
-            with autocast(device_type=autocast_device_type, enabled=use_amp):
+            with autocast(device_type=autocast_device_type, dtype=amp_dtype, enabled=use_amp):
                 outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                
+                # AMP FIX: Cast topk_vals to float32 before retain_grad (same fix as train path).
+                # Prevents masked_scatter_ dtype mismatch crash under BFloat16 AMP.
+                if outputs.get("topk_vals") is not None and outputs["topk_vals"].requires_grad:
+                    outputs["topk_vals"] = outputs["topk_vals"].float()
+                    outputs["topk_vals"].retain_grad()
                 
                 cross_entropy_loss = outputs.get("loss")
                 ponder_cost = outputs.get("ponder_cost")
@@ -919,6 +969,7 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                                 outputs["topk_idx"],
                                 ltm_grads_copy,
                                 current_lr=ltm_lr,
+                                timestamp=float(i + 1),
                                 source=2  # SRC_TRAINING_DATA
                             )
 

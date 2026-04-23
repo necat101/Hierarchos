@@ -229,7 +229,9 @@ def chat(args, device, tokenizer):
 
     # AMP Setup
     use_amp = getattr(args, 'amp', False) and learning_enabled and device.type == 'cuda'
-    scaler = GradScaler() if use_amp else None
+    # BFloat16 does NOT use GradScaler — only float16 needs it (same as trainer.py)
+    amp_dtype_str = getattr(args, 'amp_dtype', None) or getattr(config, 'amp_dtype', 'float16')
+    scaler = GradScaler() if (use_amp and amp_dtype_str == 'float16') else None
     dummy_optimizer = None
     if use_amp:
         dummy_param_amp = nn.Parameter(torch.tensor(0.0)).to(device)
@@ -271,10 +273,20 @@ def chat(args, device, tokenizer):
                 outputs = update_model(input_ids=full_sequence, labels=None)
                 logits = outputs["logits"]
                 
+                # AMP FIX (BUG #1 parity with trainer.py): Cast raw_topk_vals to
+                # float32 BEFORE retain_grad(). Under BFloat16 AMP, these tensors
+                # are BF16; retain_grad() on BF16 causes masked_scatter_ dtype
+                # mismatch (BF16 holder vs F32 gradient) during backward().
                 if outputs.get("raw_topk_vals") is not None:
+                    float32_topk = []
                     for t in outputs["raw_topk_vals"]:
                         if t.requires_grad:
-                            t.retain_grad()
+                            t_f32 = t.float()
+                            t_f32.retain_grad()
+                            float32_topk.append(t_f32)
+                        else:
+                            float32_topk.append(t)
+                    outputs["raw_topk_vals"] = float32_topk
 
                 shift_logits = logits[..., :-1, :].contiguous()
                 shift_labels = labels[..., 1:].contiguous()
@@ -398,6 +410,7 @@ def chat(args, device, tokenizer):
         prev_context = torch.zeros(1, context_dim, device=rnn_device)
         target_context = torch.zeros(1, context_dim, device=rnn_device)
         drift_state = torch.zeros(1, context_dim, device=rnn_device)
+        ltm_state = None  # Will hold (fast_vals, mom_vals, past_tokens, rosa_states)
         
         total_tokens_generated = 0
 
@@ -487,6 +500,7 @@ def chat(args, device, tokenizer):
                 prev_context.zero_()
                 target_context.zero_()
                 drift_state.zero_()
+                ltm_state = None  # Reset ROSA automaton states too
                 total_tokens_generated = 0
                 print("State Reset complete. Model is now fresh.")
                 continue
@@ -558,6 +572,7 @@ def chat(args, device, tokenizer):
                         prev_context=prev_context.cpu(),
                         target_context=target_context.cpu(),
                         drift_state=drift_state.cpu(),
+                        ltm_memory_state=ltm_state,
                         global_pos_offset=total_tokens_generated,
                         device=inference_device,
                         min_timestamp=min_ts_filter,
@@ -568,6 +583,7 @@ def chat(args, device, tokenizer):
                     prev_context = outputs['prev_context']
                     target_context = outputs['target_context']
                     drift_state = outputs.get('drift_state', drift_state)
+                    ltm_state = outputs.get('ltm_memory_state', ltm_state)
                 else:
                     outputs = model(
                         model_input_ids.to(device),
@@ -576,6 +592,7 @@ def chat(args, device, tokenizer):
                         prev_context=prev_context,
                         target_context=target_context,
                         drift_state=drift_state,
+                        ltm_memory_state=ltm_state,
                         global_pos_offset=total_tokens_generated,
                         min_timestamp=min_ts_filter,
                         source_filter=source_id_filter
@@ -590,6 +607,7 @@ def chat(args, device, tokenizer):
                         prev_context = outputs['prev_context']
                     if outputs.get('target_context') is not None:
                         target_context = outputs['target_context']
+                    ltm_state = outputs.get('ltm_memory_state', ltm_state)
 
                 logits = outputs["logits"].to(device)
                 next_token_logits = logits[:, -1, :]
@@ -653,6 +671,7 @@ def chat(args, device, tokenizer):
                                 prev_context=prev_context.cpu(),
                                 target_context=target_context.cpu(),
                                 drift_state=drift_state.cpu(),
+                                ltm_memory_state=ltm_state,
                                 global_pos_offset=total_tokens_generated,
                                 device=inference_device,
                                 min_timestamp=min_ts_filter,
@@ -663,6 +682,7 @@ def chat(args, device, tokenizer):
                             prev_context = outputs['prev_context']
                             target_context = outputs['target_context']
                             drift_state = outputs.get('drift_state', drift_state)
+                            ltm_state = outputs.get('ltm_memory_state', ltm_state)
                         else:
                             outputs = model(
                                 model_input_ids.to(device),
@@ -671,6 +691,7 @@ def chat(args, device, tokenizer):
                                 prev_context=prev_context,
                                 target_context=target_context,
                                 drift_state=drift_state,
+                                ltm_memory_state=ltm_state,
                                 global_pos_offset=total_tokens_generated,
                                 min_timestamp=min_ts_filter,
                                 source_filter=source_id_filter
@@ -685,6 +706,7 @@ def chat(args, device, tokenizer):
                                 prev_context = outputs['prev_context']
                             if outputs.get('target_context') is not None:
                                 target_context = outputs['target_context']
+                            ltm_state = outputs.get('ltm_memory_state', ltm_state)
 
                         logits = outputs["logits"].to(device)
                         next_token_logits = logits[:, -1, :]

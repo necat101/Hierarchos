@@ -298,6 +298,11 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
 
 def train(args, device, tokenizer, dataloader, dataloader_len):
     print("Running in TRAIN mode...")
+    if dataloader_len <= 0:
+        print("ERROR: dataloader_len must be > 0. If automatic detection failed, please specify --dataset-size.")
+        return
+    
+    
     if getattr(args, 'out_dir', None):
         os.makedirs(args.out_dir, exist_ok=True)
     config = AttrDict(vars(args))
@@ -770,6 +775,9 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
         raise ImportError("Please install 'peft' for fine-tuning: pip install peft")
     
     print("Running in FINETUNE mode with LoRA...")
+    if dataloader_len <= 0:
+        print("ERROR: dataloader_len must be > 0. If automatic detection failed, please specify --dataset-size.")
+        return
 
     # Load the base model and its config
     model, model_config = load_full_model_with_config(args.model_path, device)

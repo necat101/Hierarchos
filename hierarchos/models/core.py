@@ -173,6 +173,12 @@ class HierarchosCore(nn.Module):
         self.h_rnn = RWKVCell(config.h_hidden)
         self.h_to_context = nn.Linear(config.h_hidden, config.context_dim)
         self.h_halt_proj = nn.Linear(config.h_hidden, 1)
+        # Initialize bias to encourage max_h_steps pondering steps initially
+        # Formula: logit(1/N) = -log(N-1). This sets initial halt prob to 1/max_h_steps.
+        with torch.no_grad():
+            initial_steps = max(2.0, float(config.max_h_steps))
+            initial_bias = -math.log(initial_steps - 1.0)
+            self.h_halt_proj.bias.fill_(initial_bias)
         
         # Worker Components
         self.l_input_proj = nn.Linear(config.context_dim * 2, config.l_hidden)

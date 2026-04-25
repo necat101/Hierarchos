@@ -555,7 +555,23 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     for epoch in range(start_epoch, args.epochs):
         model.train()
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}")
-        running_states = (None, None, None, None, None, None)
+        
+        # [NEW] Restore running_states if resuming mid-epoch
+        if epoch == start_epoch and checkpoint and 'running_states' in checkpoint:
+            _raw_states = checkpoint['running_states']
+            # Ensure tensors are on the correct device
+            running_states = []
+            for s in _raw_states:
+                if isinstance(s, torch.Tensor):
+                    running_states.append(s.to(device))
+                elif isinstance(s, tuple):
+                    running_states.append(tuple(ss.to(device) if isinstance(ss, torch.Tensor) else ss for ss in s))
+                else:
+                    running_states.append(s)
+            running_states = tuple(running_states)
+            print(f"INFO: Restored RNN/LTM running states from checkpoint on {device}.")
+        else:
+            running_states = (None, None, None, None, None, None)
         
         for step, batch in enumerate(pbar):
             # Mid-Epoch Resumption: Skip steps already processed
@@ -595,6 +611,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                     'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
                     'scaler_state_dict': scaler.state_dict() if scaler else None,
                     'config': dict(model.config),
+                    'running_states': running_states, # [NEW] Persist states for graceful resumption
                 }, os.path.join(args.out_dir, f"hierarchos_epoch_{epoch+1}_step_{step+1}.pt"))
             
             # --- STEP-BASED EVALUATION (runs every N steps) ---
@@ -829,6 +846,20 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
         modules_to_save=["ltm"],  # LTM still updated directly
     )
     model = get_peft_model(model, lora_config)
+
+    # Resumption Logic
+    start_epoch = 0
+    start_step = 0
+    checkpoint = None
+    if getattr(args, 'resume_from_ckpt', None):
+        print(f"Resuming LoRA finetune from: {args.resume_from_ckpt}")
+        checkpoint = torch.load(args.resume_from_ckpt, map_location='cpu')
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        start_epoch = checkpoint.get('completed_epoch', 0)
+        start_step = checkpoint.get('mid_epoch_step', 0)
+        print(f"INFO: Resuming from epoch {start_epoch+1}, step {start_step}.")
+
     model.print_trainable_parameters()
 
     # Optimizer selection
@@ -838,16 +869,26 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
     else:
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.starting_lr)
     
+    if checkpoint and 'optimizer_state_dict' in checkpoint:
+        try:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            print("Successfully loaded optimizer state.")
+        except:
+            print("Warning: Could not load optimizer state.")
+
     os.makedirs(args.out_dir, exist_ok=True)
 
     # AMP setup (BFloat16 does NOT use GradScaler — only float16 needs it)
     scaler = None
     use_amp = getattr(args, 'amp', False)
-    amp_dtype_str = getattr(args, 'amp_dtype', None) or getattr(config, 'amp_dtype', 'float16')
+    amp_dtype_str = getattr(args, 'amp_dtype', None) or getattr(model.config if hasattr(model, 'config') else args, 'amp_dtype', 'float16')
     amp_dtype = torch.bfloat16 if amp_dtype_str == 'bfloat16' else torch.float16
     if use_amp:
         if amp_dtype_str == 'float16':
             scaler = GradScaler()
+            if checkpoint and 'scaler_state_dict' in checkpoint:
+                try: scaler.load_state_dict(checkpoint['scaler_state_dict'])
+                except: pass
         print(f"INFO: Automatic Mixed Precision (AMP) ENABLED for fine-tuning ({amp_dtype_str}).")
 
     # Scheduler setup
@@ -858,6 +899,9 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
         if num_update_steps > 0:
             print(f"INFO: Cosine Annealing LR scheduler ENABLED. Total steps: {num_update_steps}, Max LR: {args.starting_lr}, Min LR: {args.min_lr}")
             scheduler = CosineAnnealingLR(optimizer, T_max=num_update_steps, eta_min=args.min_lr)
+            if checkpoint and 'scheduler_state_dict' in checkpoint:
+                try: scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                except: pass
         else:
             print("Warning: Cannot enable LR schedule, dataset might be too small.")
 
@@ -869,7 +913,7 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
     grad_clip = getattr(args, 'grad_clip', 1.0)
     ltm_lr = getattr(args, 'ltm_lr', 0.001)
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         print(f"\n--- LoRA Finetune Epoch {epoch + 1} / {args.epochs} ---")
         pbar = tqdm(dataloader, desc=f"Finetune Epoch {epoch + 1}")
         total_loss = 0.0
@@ -880,6 +924,12 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
         steps_in_epoch = 0
 
         for i, batch in enumerate(pbar):
+            # Mid-Epoch Resumption: Skip steps already processed
+            if epoch == start_epoch and i < start_step:
+                if i == start_step - 1:
+                    print(f"INFO: Resuming from mid-epoch step {start_step}...")
+                continue
+
             if batch is None:
                 continue
 
@@ -991,6 +1041,20 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                     optimizer.zero_grad(set_to_none=True)
                     backward_called_in_cycle = False
                     global_step += 1
+
+                    # Periodic Checkpointing (Progress Protection)
+                    if getattr(args, 'save_steps', 0) > 0 and (i + 1) % args.save_steps == 0:
+                        ckpt_path = os.path.join(args.out_dir, f"hierarchos_finetune_epoch_{epoch+1}_step_{i+1}.pt")
+                        print(f"\n[Step {i+1}] Periodic Checkpoint: Saving to {ckpt_path}...")
+                        save_checkpoint_safely({
+                            'completed_epoch': epoch,
+                            'mid_epoch_step': i + 1,
+                            'model_state_dict': model.state_dict(),
+                            'optimizer_state_dict': optimizer.state_dict(),
+                            'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                            'scaler_state_dict': scaler.state_dict() if scaler else None,
+                            'config': dict(model.config),
+                        }, ckpt_path)
                 else:
                     print(f"\nWarning: Skipping optimizer step at batch {i+1} due to invalid loss.")
                     optimizer.zero_grad(set_to_none=True)

@@ -13,7 +13,7 @@ A novel AI architecture that synergistically integrates Google's Titans memory s
 #### 🧠 Architecture
 - **RWKV v8 Backbone**: Replaced GRU cells with full RWKV v8 (Receptance Weighted Key Value) cells featuring linear attention, Time Mixing with WKV recurrence, and SwiGLU Channel Mixing.
 - **DeepEmbed (4x Scale)**: New learnable token embeddings at 4× hidden dimension that gate the RWKV channel mixing FFN, providing richer per-token modulation.
-- **ROSA (Receptive Ordered Suffix Automaton)**: A neurosymbolic inner monologue — a CPU-side Suffix Automaton predicts likely next tokens, which are embedded and added to the input representation. Gives the model a "heads up" about upcoming patterns.
+- **ROSA (Rapid Online Suffix Automaton)**: A neurosymbolic inner monologue — a CPU-side Suffix Automaton predicts likely next tokens, which are embedded and added to the input representation. Gives the model a "heads up" about upcoming patterns.
 - **V7 Backward Compatibility**: Set `use_deepembed=False, use_rosa=False` in config to run in pure V7 mode. All V7 checkpoints load cleanly.
 
 #### ⚡ CUDA Datacenter Optimizations (Zero Config)

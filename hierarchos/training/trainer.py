@@ -12,7 +12,7 @@ import numpy as np
 
 from .optimizers import DirectMLAdamW
 from ..utils.device import is_directml_device, set_threads
-from ..utils.checkpoint import save_checkpoint_safely, load_full_model_with_config
+from ..utils.checkpoint import save_checkpoint_safely, load_full_model_with_config, sanitize_model_state_dict
 from ..models.core import HierarchosCore
 
 # Helper for AttrDict access
@@ -110,21 +110,12 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                     global_pos_offset=start_t
                 )
                 
-                # AMP FIX (BUG #1): Cast raw_topk_vals to float32 and retain_grad INSIDE
-                # autocast to prevent masked_scatter_ dtype mismatch in backward pass.
-                # Under BFloat16 AMP, these tensors are created as BF16; retain_grad()
-                # on BF16 tensors causes autograd to use masked_scatter_ with mismatched
-                # dtypes (BF16 holder vs F32 gradient), crashing after ~2k steps.
+                # LTM fast-memory update needs gradients from the exact tensors used
+                # by the forward graph. retrieve_topk already keeps them float32.
                 if outputs.get("raw_topk_vals") is not None:
-                    float32_topk = []
                     for t_val in outputs["raw_topk_vals"]:
                         if t_val.requires_grad:
-                            t_f32 = t_val.float()
-                            t_f32.retain_grad()
-                            float32_topk.append(t_f32)
-                        else:
-                            float32_topk.append(t_val)
-                    outputs["raw_topk_vals"] = float32_topk
+                            t_val.retain_grad()
 
 
                 ce_loss = outputs['loss']
@@ -210,6 +201,8 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                         curr_mom = curr_ltm[1] if curr_ltm is not None else None
                         curr_past_tokens = curr_ltm[2] if curr_ltm is not None and len(curr_ltm) >= 3 else None
                         curr_rosa_states = curr_ltm[3] if curr_ltm is not None and len(curr_ltm) >= 4 else None
+                        curr_timestamps = curr_ltm[4] if curr_ltm is not None and len(curr_ltm) >= 5 else None
+                        curr_sources = curr_ltm[5] if curr_ltm is not None and len(curr_ltm) >= 6 else None
                         
                         # Titans inner_update (Gradient-based)
                         # Pass fast_vals/mom_vals from forward pass state, not module defaults
@@ -222,23 +215,31 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                             tokens_covered=end_t - start_t,
                             fast_vals=curr_fast,
                             mom_vals=curr_mom,
+                            timestamps=curr_timestamps,
+                            sources=curr_sources,
                             inplace=True
                         )
                         ltm_state = (new_fast.detach(), new_mom.detach(), 
                                      curr_past_tokens.detach() if curr_past_tokens is not None else None,
-                                     curr_rosa_states)  # ROSA automaton states (plain Python, no detach needed)
+                                     curr_rosa_states,
+                                     curr_timestamps.detach() if isinstance(curr_timestamps, torch.Tensor) else curr_timestamps,
+                                     curr_sources.detach() if isinstance(curr_sources, torch.Tensor) else curr_sources)  # ROSA automaton states (plain Python, no detach needed)
                     else:
                         curr_ltm = outputs['ltm_memory_state']
                         ltm_state = (curr_ltm[0].detach(), curr_ltm[1].detach(),
                                      curr_ltm[2].detach() if len(curr_ltm) >= 3 and curr_ltm[2] is not None else None,
-                                     curr_ltm[3] if len(curr_ltm) >= 4 else None)
+                                     curr_ltm[3] if len(curr_ltm) >= 4 else None,
+                                     curr_ltm[4].detach() if len(curr_ltm) >= 5 and isinstance(curr_ltm[4], torch.Tensor) else None,
+                                     curr_ltm[5].detach() if len(curr_ltm) >= 6 and isinstance(curr_ltm[5], torch.Tensor) else None)
             else:
                 # No LTM outputs? Just take what we have
                 if outputs.get('ltm_memory_state') is not None:
                     curr_ltm = outputs['ltm_memory_state']
                     ltm_state = (curr_ltm[0].detach(), curr_ltm[1].detach(),
                                  curr_ltm[2].detach() if len(curr_ltm) >= 3 and curr_ltm[2] is not None else None,
-                                 curr_ltm[3] if len(curr_ltm) >= 4 else None)
+                                 curr_ltm[3] if len(curr_ltm) >= 4 else None,
+                                 curr_ltm[4].detach() if len(curr_ltm) >= 5 and isinstance(curr_ltm[4], torch.Tensor) else None,
+                                 curr_ltm[5].detach() if len(curr_ltm) >= 6 and isinstance(curr_ltm[5], torch.Tensor) else None)
 
             # Update states for next chunk (TBPTT - detach to limit gradient flow)
             if outputs.get('h_state') is not None:
@@ -383,7 +384,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         
         saved_config = checkpoint.get('config', {})
         model_config = AttrDict(saved_config)
-        state_dict = checkpoint['model_state_dict']
+        state_dict = sanitize_model_state_dict(checkpoint['model_state_dict'], reset_transient_ltm=False)
         
         # ARCH Detection (Safely handling compiled checkpoints with '_orig_mod.' prefix)
         state_dict_keys = set()
@@ -611,7 +612,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                 save_checkpoint_safely({
                     'completed_epoch': epoch, # Not yet completed
                     'mid_epoch_step': step + 1,
-                    'model_state_dict': model.state_dict(),
+                    'model_state_dict': sanitize_model_state_dict(model),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
                     'scaler_state_dict': scaler.state_dict() if scaler else None,
@@ -655,7 +656,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         
         save_checkpoint_safely({
             'completed_epoch': epoch + 1,
-            'model_state_dict': model.state_dict(),
+            'model_state_dict': sanitize_model_state_dict(model),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
             'scaler_state_dict': scaler.state_dict() if scaler else None,
@@ -712,10 +713,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     print(f"Saving final inference model to: {final_model_path}")
     
     # Clean state dict (remove _orig_mod. prefix from compiled models)
-    clean_state_dict = {}
-    for k, v in model.state_dict().items():
-        clean_key = k.replace('_orig_mod.', '')
-        clean_state_dict[clean_key] = v
+    clean_state_dict = sanitize_model_state_dict(model)
     
     final_checkpoint = {
         'model_state_dict': clean_state_dict,
@@ -863,7 +861,7 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
         print(f"Resuming LoRA finetune from: {args.resume_from_ckpt}")
         checkpoint = torch.load(args.resume_from_ckpt, map_location='cpu')
         if 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
+            model.load_state_dict(sanitize_model_state_dict(checkpoint['model_state_dict'], reset_transient_ltm=False), strict=False)
         start_epoch = checkpoint.get('completed_epoch', 0)
         start_step = checkpoint.get('mid_epoch_step', 0)
         print(f"INFO: Resuming from epoch {start_epoch+1}, step {start_step}.")
@@ -1057,7 +1055,7 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                         save_checkpoint_safely({
                             'completed_epoch': epoch,
                             'mid_epoch_step': i + 1,
-                            'model_state_dict': model.state_dict(),
+                            'model_state_dict': sanitize_model_state_dict(model),
                             'optimizer_state_dict': optimizer.state_dict(),
                             'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
                             'scaler_state_dict': scaler.state_dict() if scaler else None,

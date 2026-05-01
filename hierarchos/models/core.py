@@ -135,11 +135,14 @@ class HierarchosCore(nn.Module):
         if self.use_deepembed:
             self.h_deepemb = nn.Embedding(config.vocab_size, config.h_hidden * 4)
             self.l_deepemb = nn.Embedding(config.vocab_size, config.l_hidden * 4)
+            nn.init.ones_(self.h_deepemb.weight)
+            nn.init.ones_(self.l_deepemb.weight)
         
         # V8 ROSA Embed - default to True
         self.use_rosa = getattr(config, 'use_rosa', True)
         if self.use_rosa:
             self.rosa_emb = nn.Embedding(config.vocab_size + 1, config.context_dim)
+            nn.init.zeros_(self.rosa_emb.weight)
             # Learnable gate: sigmoid(-1.0) ≈ 0.27 initial injection strength
             self.rosa_gate_logit = nn.Parameter(torch.tensor(-1.0))
         
@@ -269,18 +272,38 @@ class HierarchosCore(nn.Module):
 
         # Unpack LTM Memory State early so we can use past_tokens + ROSA states
         rosa_states = None
+        memory_timestamps = None
+        memory_sources = None
         if ltm_memory_state is None:
-            curr_fast_vals = self.ltm.fast_vals
-            curr_mom_vals = self.ltm._mom_vals
+            isolate_training_ltm = self.training and getattr(self.config, 'isolate_batch_ltm', True)
+            if isolate_training_ltm:
+                curr_fast_vals = self.ltm.fast_vals.unsqueeze(0).expand(B, -1, -1).clone()
+                curr_mom_vals = self.ltm._mom_vals.unsqueeze(0).expand(B, -1, -1).clone()
+                memory_timestamps = self.ltm.timestamps.unsqueeze(0).expand(B, -1).clone()
+                memory_sources = self.ltm.sources.unsqueeze(0).expand(B, -1).clone()
+            else:
+                curr_fast_vals = self.ltm.fast_vals
+                curr_mom_vals = self.ltm._mom_vals
+                memory_timestamps = self.ltm.timestamps
+                memory_sources = self.ltm.sources
             past_tokens = None
         else:
-            if len(ltm_memory_state) >= 4:
+            if len(ltm_memory_state) >= 6:
+                curr_fast_vals, curr_mom_vals, past_tokens, rosa_states, memory_timestamps, memory_sources = ltm_memory_state[:6]
+            elif len(ltm_memory_state) >= 4:
                 curr_fast_vals, curr_mom_vals, past_tokens, rosa_states = ltm_memory_state[:4]
             elif len(ltm_memory_state) >= 3:
                 curr_fast_vals, curr_mom_vals, past_tokens = ltm_memory_state[:3]
             else:
                 curr_fast_vals, curr_mom_vals = ltm_memory_state
                 past_tokens = None
+            if memory_timestamps is None:
+                if curr_fast_vals.dim() == 3:
+                    memory_timestamps = self.ltm.timestamps.unsqueeze(0).expand(curr_fast_vals.shape[0], -1).clone()
+                    memory_sources = self.ltm.sources.unsqueeze(0).expand(curr_fast_vals.shape[0], -1).clone()
+                else:
+                    memory_timestamps = self.ltm.timestamps
+                    memory_sources = self.ltm.sources
 
         # V8 ROSA Precomputation (only when enabled)
         new_rosa_states = None
@@ -345,6 +368,8 @@ class HierarchosCore(nn.Module):
             # Ensure they are on the correct device
             curr_fast_vals = curr_fast_vals.to(device)
             curr_mom_vals = curr_mom_vals.to(device)
+            memory_timestamps = memory_timestamps.to(device)
+            memory_sources = memory_sources.to(device)
 
         final_embs = []
         ponder_costs = []
@@ -372,7 +397,8 @@ class HierarchosCore(nn.Module):
             q = torch.clamp(self.qproj(q_in), min=-10, max=10)
             
             topk_vals, topk_idx, topk_ts = self.ltm.retrieve_topk(
-                q, self.config.ltm_topk, min_timestamp, source_filter, fast_vals=curr_fast_vals
+                q, self.config.ltm_topk, min_timestamp, source_filter, fast_vals=curr_fast_vals,
+                timestamps=memory_timestamps, sources=memory_sources
             )
             
             all_topk_vals.append(topk_vals)
@@ -500,6 +526,8 @@ class HierarchosCore(nn.Module):
                     tokens_covered=1,
                     fast_vals=curr_fast_vals,
                     mom_vals=curr_mom_vals,
+                    timestamps=memory_timestamps,
+                    sources=memory_sources,
                     inplace=True
                 )
 
@@ -567,7 +595,7 @@ class HierarchosCore(nn.Module):
             "prev_context": prev_context,
             "target_context": target_context,
             "drift_state": final_drift,
-            "ltm_memory_state": (curr_fast_vals, curr_mom_vals, new_past_tokens, new_rosa_states),
+            "ltm_memory_state": (curr_fast_vals, curr_mom_vals, new_past_tokens, new_rosa_states, memory_timestamps, memory_sources),
         }
 
     def prepare_inputs_for_generation(self, input_ids, **kwargs):

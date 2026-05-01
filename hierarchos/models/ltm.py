@@ -71,7 +71,10 @@ class LTMModule(nn.Module):
         """Returns the combined memory (Slow + Fast)."""
         return self.vals + self.fast_vals
 
-    def retrieve_topk(self, queries: torch.Tensor, topk: int = 4, min_timestamp: float = 0.0, source_filter: Optional[int] = None, fast_vals: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.LongTensor, torch.Tensor]:
+    def retrieve_topk(self, queries: torch.Tensor, topk: int = 4, min_timestamp: float = 0.0,
+                      source_filter: Optional[int] = None, fast_vals: Optional[torch.Tensor] = None,
+                      timestamps: Optional[torch.Tensor] = None,
+                      sources: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.LongTensor, torch.Tensor]:
         # CRITICAL AMP FIX: Disable autocast for the entire retrieval path.
         # Under BFloat16 AMP, torch.matmul is in the BF16-eligible list and will
         # silently recast explicit .float() operands back to BF16. The backward pass
@@ -87,13 +90,18 @@ class LTMModule(nn.Module):
             scale_factor = self.keys.shape[1] ** -0.5
             sim = (queries @ self.keys.t()) * scale_factor
 
+            current_timestamps = timestamps if timestamps is not None else self.timestamps
+            current_sources = sources if sources is not None else self.sources
+            current_timestamps = current_timestamps.to(device=queries.device)
+            current_sources = current_sources.to(device=queries.device)
+
             if min_timestamp > 0.0 or source_filter is not None:
                 with torch.no_grad():
-                    valid_mask = torch.ones(self.keys.size(0), dtype=torch.bool, device=self.keys.device)
+                    valid_mask = torch.ones_like(sim, dtype=torch.bool)
                     if min_timestamp > 0.0:
-                        valid_mask &= (self.timestamps >= min_timestamp)
+                        valid_mask = valid_mask & (current_timestamps >= min_timestamp)
                     if source_filter is not None:
-                        valid_mask &= (self.sources == source_filter)
+                        valid_mask = valid_mask & (current_sources == source_filter)
 
                     sim = torch.nan_to_num(sim, nan=-torch.inf, posinf=torch.finfo(sim.dtype).max, neginf=-torch.inf)
                     sim = torch.where(valid_mask, sim, self.neg_inf.to(dtype=sim.dtype))
@@ -139,8 +147,10 @@ class LTMModule(nn.Module):
             weighted_vals = gathered_vals * attn_weights.unsqueeze(-1)
             weighted_vals = weighted_vals.contiguous()
             
-            flat_ts = torch.matmul(one_hot, self.timestamps.unsqueeze(1)).squeeze(-1)
-            ts_retrieved = flat_ts
+            ts_for_gather = current_timestamps.to(device=one_hot.device, dtype=one_hot.dtype)
+            while ts_for_gather.ndim < one_hot.ndim:
+                ts_for_gather = ts_for_gather.unsqueeze(-2)
+            ts_retrieved = (one_hot * ts_for_gather).sum(dim=-1)
 
             if effective_topk < topk:
                 pad_size = topk - effective_topk
@@ -164,12 +174,28 @@ class LTMModule(nn.Module):
     def inner_update(self, topk_idx: torch.LongTensor, grads_tensor: torch.Tensor, current_lr: float, timestamp: float, 
                     source: int = SRC_USER_INTERACTION, tokens_covered: int = None,
                     fast_vals: Optional[torch.Tensor] = None, mom_vals: Optional[torch.Tensor] = None,
+                    timestamps: Optional[torch.Tensor] = None, sources: Optional[torch.Tensor] = None,
                     inplace: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Performs a Fast Weight Associative Update (Titans Style).
         """
         curr_fast = fast_vals if fast_vals is not None else self.fast_vals
         curr_mom = mom_vals if mom_vals is not None else self._mom_vals
+
+        if curr_fast.dim() == 3:
+            return self._inner_update_batched(
+                topk_idx=topk_idx,
+                grads_tensor=grads_tensor,
+                current_lr=current_lr,
+                timestamp=timestamp,
+                source=source,
+                tokens_covered=tokens_covered,
+                curr_fast=curr_fast,
+                curr_mom=curr_mom,
+                timestamps=timestamps,
+                sources=sources,
+                inplace=inplace
+            )
         
         if grads_tensor is None: 
             return curr_fast, curr_mom
@@ -247,15 +273,76 @@ class LTMModule(nn.Module):
             new_fast = decayed_fast + update_mask
             new_fast = torch.clamp(new_fast, min=-20.0, max=20.0)
 
+        target_timestamps = timestamps if timestamps is not None else self.timestamps
+        target_sources = sources if sources is not None else self.sources
         with torch.no_grad():
-            self.timestamps.data[nonzero_mask] = timestamp
-            self.sources.data[nonzero_mask] = source
+            target_timestamps.data[nonzero_mask] = timestamp
+            target_sources.data[nonzero_mask] = source
             
         return new_fast, new_mom
 
+    def _inner_update_batched(self, topk_idx: torch.LongTensor, grads_tensor: torch.Tensor,
+                              current_lr: float, timestamp: float, source: int,
+                              tokens_covered: int, curr_fast: torch.Tensor,
+                              curr_mom: torch.Tensor, timestamps: Optional[torch.Tensor],
+                              sources: Optional[torch.Tensor], inplace: bool) -> Tuple[torch.Tensor, torch.Tensor]:
+        if grads_tensor is None:
+            return curr_fast, curr_mom
+
+        valid_mask_all = topk_idx >= 0
+        if not valid_mask_all.any():
+            return curr_fast, curr_mom
+
+        grads_tensor = grads_tensor.float()
+        if not inplace:
+            curr_fast = curr_fast.float().clone()
+            curr_mom = curr_mom.float().clone()
+        else:
+            curr_fast = curr_fast.float()
+            curr_mom = curr_mom.float()
+
+        if tokens_covered is None:
+            tokens_covered = self.reference_chunk_len
+        retention_rate = (1.0 - self.forget_rate) ** (tokens_covered / float(self.reference_chunk_len))
+
+        num_slots = self.vals.size(0)
+        range_tensor = torch.arange(num_slots, device=curr_fast.device).unsqueeze(0)
+
+        for batch_idx in range(curr_fast.shape[0]):
+            valid_mask = valid_mask_all[batch_idx]
+            if not valid_mask.any():
+                curr_fast[batch_idx].mul_(retention_rate)
+                continue
+
+            idx_flat = topk_idx[batch_idx][valid_mask].view(-1).to(curr_fast.device)
+            grads_flat = grads_tensor[batch_idx][valid_mask].view(-1, self.vals.size(1)).to(curr_fast.device)
+            one_hot = (idx_flat.unsqueeze(1) == range_tensor).float()
+            counts = one_hot.sum(dim=0)
+            slot_grads = torch.matmul(one_hot.t(), grads_flat)
+            slot_grads = slot_grads / (counts.unsqueeze(-1) + 1e-8)
+            nonzero_mask = counts > 0
+
+            curr_mom[batch_idx].mul_(self.momentum).add_(slot_grads)
+            curr_mom[batch_idx].clamp_(min=-50.0, max=50.0)
+
+            update_step = curr_mom[batch_idx] + self.weight_decay * curr_fast[batch_idx]
+            update_step = update_step.mul(-current_lr)
+            curr_fast[batch_idx].mul_(retention_rate)
+            update_step = torch.where(nonzero_mask.unsqueeze(-1), update_step, torch.zeros_like(update_step))
+            curr_fast[batch_idx].add_(update_step)
+            curr_fast[batch_idx].clamp_(min=-20.0, max=20.0)
+
+            if timestamps is not None and sources is not None:
+                with torch.no_grad():
+                    timestamps[batch_idx].data[nonzero_mask] = timestamp
+                    sources[batch_idx].data[nonzero_mask] = source
+
+        return curr_fast, curr_mom
+
     def update_memory_hebbian(self, topk_idx: torch.LongTensor, keys: torch.Tensor, vals: torch.Tensor, current_lr: float, timestamp: float, 
                               source: int = SRC_USER_INTERACTION, tokens_covered: int = None, fast_vals: Optional[torch.Tensor] = None,
-                              mom_vals: Optional[torch.Tensor] = None, inplace: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+                              mom_vals: Optional[torch.Tensor] = None, timestamps: Optional[torch.Tensor] = None,
+                              sources: Optional[torch.Tensor] = None, inplace: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Performs a Hebbian-style associative update, unified with Titans Momentum logic.
         """
@@ -269,5 +356,7 @@ class LTMModule(nn.Module):
             tokens_covered=tokens_covered,
             fast_vals=fast_vals,
             mom_vals=mom_vals,
+            timestamps=timestamps,
+            sources=sources,
             inplace=inplace
         )

@@ -4,6 +4,27 @@ import torch.nn as nn
 from typing import Dict, Any, Tuple, Optional
 from .device import is_directml_device
 
+TRANSIENT_LTM_STATE_KEYS = (
+    "ltm.fast_vals",
+    "ltm._mom_vals",
+    "ltm.timestamps",
+    "ltm.sources",
+)
+
+
+def sanitize_model_state_dict(model_or_state_dict, reset_transient_ltm: bool = True) -> Dict[str, torch.Tensor]:
+    """Return a save-ready state_dict with compile prefixes removed and transient LTM state zeroed."""
+    source_state = model_or_state_dict.state_dict() if hasattr(model_or_state_dict, "state_dict") else model_or_state_dict
+    clean_state = {}
+    for key, value in source_state.items():
+        clean_key = key.replace("_orig_mod.", "")
+        if reset_transient_ltm and any(clean_key.endswith(suffix) for suffix in TRANSIENT_LTM_STATE_KEYS):
+            clean_state[clean_key] = torch.zeros_like(value)
+        else:
+            clean_state[clean_key] = value
+    return clean_state
+
+
 # Helper for AttrDict access
 class AttrDict(dict):
     def __init__(self, *args, **kwargs):
@@ -50,7 +71,7 @@ def load_full_model_with_config(model_path: str, device):
     
     # Strip _orig_mod. prefix from compiled model checkpoints (torch.compile adds this)
     # Without this, strict=False silently drops ALL weights from compiled checkpoints
-    state_dict = {k.replace('_orig_mod.', ''): v for k, v in checkpoint['model_state_dict'].items()}
+    state_dict = sanitize_model_state_dict(checkpoint['model_state_dict'], reset_transient_ltm=False)
     
     # Handle qproj shape mismatch (Old -> New Architecture)
     if 'qproj.weight' in state_dict:
@@ -73,6 +94,8 @@ def load_full_model_with_config(model_path: str, device):
     if not load_result.missing_keys and not load_result.unexpected_keys:
         print(f"INFO: All {len(state_dict)} weight tensors loaded successfully.")
     model.to(device)
+    if checkpoint.get('training_complete', False) and hasattr(model, 'reset_memory'):
+        model.reset_memory()
     model.eval()
     return model, config
 

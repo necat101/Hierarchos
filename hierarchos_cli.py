@@ -27,6 +27,15 @@ from hierarchos import (
     create_dataloader_pt_chunked
 )
 
+
+def load_hf_dataset(dataset_name, dataset_config=None, split="train"):
+    try:
+        from datasets import load_dataset
+    except ImportError as exc:
+        raise ImportError("Hugging Face dataset loading requires the 'datasets' package.") from exc
+    return load_dataset(dataset_name, dataset_config, split=split)
+
+
 def main():
     parser = argparse.ArgumentParser(description="hierarchos: A Hybrid Memory-Reasoning Architecture")
     parser.add_argument("mode", type=str, choices=["train", "finetune", "chat", "quantize", "merge-lora", "ckpt-2-inf"], help="Operation mode.")
@@ -172,9 +181,8 @@ def main():
     if args.auto_max_length and args.mode in ['train', 'finetune']:
         max_found = 0
         if args.hf_dataset:
-            from datasets import load_dataset
             print(f"Scanning HF dataset: {args.hf_dataset}...")
-            temp_ds = load_dataset(args.hf_dataset, args.hf_dataset_config, split=args.hf_dataset_split)
+            temp_ds = load_hf_dataset(args.hf_dataset, args.hf_dataset_config, split=args.hf_dataset_split)
             for sample in tqdm(temp_ds, desc="Scanning HF"):
                 processed = process_text_sample(tokenizer, sample, 9999, args.kayla, args.text_column, args.prompt_column, args.completion_column)
                 if processed: max_found = max(max_found, len(processed['input_ids']))
@@ -202,7 +210,8 @@ def main():
     if args.mode == "train":
         dataloader = None
         if args.hf_dataset:
-            dataset = HuggingFaceMapStyleDataset(temp_ds if 'temp_ds' in locals() else load_dataset(args.hf_dataset, args.hf_dataset_config, split=args.hf_dataset_split), 
+            hf_dataset = temp_ds if 'temp_ds' in locals() else load_hf_dataset(args.hf_dataset, args.hf_dataset_config, split=args.hf_dataset_split)
+            dataset = HuggingFaceMapStyleDataset(hf_dataset, 
                                                 tokenizer, args.max_length, args.kayla, args.text_column, args.prompt_column, args.completion_column)
             dataloader = create_map_style_dataloader(dataset, args.batch_size, tokenizer.pad_token_id, args.num_workers)
         elif args.pre_chunked_dataset:
@@ -258,8 +267,7 @@ def main():
         # Build dataloader for finetune
         dataloader = None
         if args.hf_dataset:
-            from datasets import load_dataset
-            temp_ds = load_dataset(args.hf_dataset, args.hf_dataset_config, split=args.hf_dataset_split)
+            temp_ds = load_hf_dataset(args.hf_dataset, args.hf_dataset_config, split=args.hf_dataset_split)
             dataset = HuggingFaceMapStyleDataset(temp_ds, tokenizer, args.max_length, args.kayla, 
                                                    args.text_column, args.prompt_column, args.completion_column)
             dataloader = create_map_style_dataloader(dataset, args.batch_size, tokenizer.pad_token_id, args.num_workers)

@@ -16,6 +16,7 @@ import os
 import sys
 import signal
 import traceback
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -68,6 +69,30 @@ def is_correction_or_instruction(text: str) -> bool:
     if word_count > 5 and not is_positive_feedback(text):
         return True
     return False
+
+
+# --- Training-Parity Format Wrapper & Parser ---
+def wrap_for_hierarchos(raw_text, system_prompt=None):
+    """Wraps user input into the exact format the model saw during training.
+    
+    The training pipeline (process_text_sample in datasets.py) tokenizes JSONL
+    data as:  User: {instruction}\n\nAssistant: {output}<EOS>
+    This wrapper must produce the identical prompt prefix so the model sees
+    in-distribution text at inference time.
+    
+    An optional system_prompt is prepended inside the User field to guide
+    behavior without introducing OOD formatting.
+    """
+    clean_text = raw_text.strip()
+    if system_prompt:
+        return f"User: [{system_prompt}]\n{clean_text}\n\nAssistant: "
+    return f"User: {clean_text}\n\nAssistant: "
+
+
+def clean_hierarchos_output(raw_generation):
+    """Cleans any trailing artifacts from the model's generation."""
+    # Model generates plain text followed by EOS; strip whitespace only
+    return raw_generation.strip()
 
 
 # --- Simple Generation Helper ---
@@ -386,6 +411,7 @@ def chat(args, device, tokenizer):
     print("Commands:")
     print("  /filter time=-<seconds> | /filter source=<id>  : Constrain memory retrieval")
     print("  /settings | /topk <int> | /topp <float>        : View/Change sampling")
+    print("  /system <prompt> | /system clear               : Set/clear system prompt")
     print("  /reset                                         : Clear RNN & Hierarchical states")
     print("  /reset_ltm                                     : Clear LTM memory (fast_vals)")
     print("  /status                                        : Show model state info")
@@ -395,6 +421,7 @@ def chat(args, device, tokenizer):
     try:
         min_ts_filter = 0.0
         source_id_filter = None
+        system_prompt = None  # Optional system prompt prepended to User field
 
         # =================================================================
         # 6. STATE INITIALIZATION
@@ -415,6 +442,35 @@ def chat(args, device, tokenizer):
         ltm_state = None  # Will hold (fast_vals, mom_vals, past_tokens, rosa_states)
         
         total_tokens_generated = 0
+
+        # --- Startup Diagnostic: Verify model produces reasonable predictions ---
+        print("INFO: Running inference diagnostic...")
+        try:
+            _diag_prompt = "User: Hello\n\nAssistant: "
+            _diag_ids = tokenizer.encode(_diag_prompt, return_tensors="pt").to(device)
+            with torch.no_grad():
+                _diag_out = model(
+                    _diag_ids if not is_quantized else _diag_ids.cpu(),
+                    h_state=None, l_state=None,
+                    prev_context=None, target_context=None,
+                )
+                _diag_logits = _diag_out["logits"][:, -1, :]
+                _diag_probs = torch.softmax(_diag_logits.float(), dim=-1)
+                _diag_topk = torch.topk(_diag_probs, 5)
+                print(f"  Prompt: {repr(_diag_prompt)}")
+                print(f"  Top-5 next tokens:")
+                for i in range(5):
+                    _tok = tokenizer.decode([_diag_topk.indices[0, i].item()])
+                    _prob = _diag_topk.values[0, i].item()
+                    print(f"    {i+1}. {repr(_tok):>15s}  ({_prob:.4f})")
+                _entropy = -((_diag_probs * torch.log(_diag_probs + 1e-10)).sum(-1)).item()
+                print(f"  Logit entropy: {_entropy:.2f} (random={math.log(config.vocab_size):.2f})")
+                if _entropy > math.log(config.vocab_size) * 0.8:
+                    print("  ⚠️  HIGH ENTROPY — model may have failed to load weights correctly!")
+                else:
+                    print("  ✓ Entropy looks reasonable — weights appear loaded.")
+        except Exception as e:
+            print(f"  Diagnostic failed: {e}")
 
         # =================================================================
         # 7. MAIN CHAT LOOP
@@ -481,6 +537,17 @@ def chat(args, device, tokenizer):
 
             if prompt.startswith('/settings'):
                 print(f"Current Settings:\n  Temperature: {args.temperature}\n  Top-K: {args.top_k}\n  Top-P: {args.top_p}")
+                print(f"  System Prompt: {repr(system_prompt) if system_prompt else '(none)'}")
+                continue
+
+            if prompt.startswith('/system'):
+                rest = prompt[len('/system'):].strip()
+                if not rest or rest.lower() == 'clear':
+                    system_prompt = None
+                    print("System prompt cleared.")
+                else:
+                    system_prompt = rest
+                    print(f"System prompt set to: {repr(system_prompt)}")
                 continue
 
             if prompt.startswith('/reset_ltm'):
@@ -556,11 +623,12 @@ def chat(args, device, tokenizer):
             # =================================================================
             # B. GENERATION LOGIC
             # =================================================================
-            prompt_format = f"### Instruction:\n{prompt}\n\n### Response:\n"
+            prompt_format = wrap_for_hierarchos(prompt, system_prompt=system_prompt)
             prompt_ids = tokenizer.encode(prompt_format, return_tensors="pt").to(device)
 
             print("\nhierarchos: ", end="", flush=True)
             response_ids = []
+            _display_buffer = ""  # Buffer last 2 chars to catch trailing JSON close
 
             # 1. PREFILL PASS
             with torch.no_grad():
@@ -648,7 +716,12 @@ def chat(args, device, tokenizer):
                 if next_token_id.item() != tokenizer.eos_token_id:
                     response_ids.append(next_token_id.item())
                     decoded_token = tokenizer.decode([next_token_id.item()])
-                    print(decoded_token, end="", flush=True)
+                    # Buffer output to catch JSON closing syntax
+                    _display_buffer += decoded_token
+                    if len(_display_buffer) > 2:
+                        _flush = _display_buffer[:-2]
+                        print(_flush, end="", flush=True)
+                        _display_buffer = _display_buffer[-2:]
                     current_ids = next_token_id
                 else:
                     current_ids = None
@@ -753,10 +826,23 @@ def chat(args, device, tokenizer):
                         if "###" in decoded_token and len(decoded_token) <= 5:
                             break
 
-                        print(decoded_token, end="", flush=True)
+                        # Buffer output to catch JSON closing syntax
+                        _display_buffer += decoded_token
+                        if len(_display_buffer) > 2:
+                            _flush = _display_buffer[:-2]
+                            print(_flush, end="", flush=True)
+                            _display_buffer = _display_buffer[-2:]
                         current_ids = next_token_id
                         total_tokens_generated += 1
 
+            # Flush display buffer, stripping JSON closing syntax if present
+            if _display_buffer:
+                if _display_buffer.endswith('"}'):
+                    _display_buffer = _display_buffer[:-2]
+                elif _display_buffer.endswith('"'):
+                    _display_buffer = _display_buffer[:-1]
+                if _display_buffer:
+                    print(_display_buffer, end="", flush=True)
             print("\n")
 
             # =================================================================

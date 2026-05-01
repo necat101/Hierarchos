@@ -48,8 +48,11 @@ def load_full_model_with_config(model_path: str, device):
     from ..models.core import HierarchosCore
     model = HierarchosCore(config)
     
+    # Strip _orig_mod. prefix from compiled model checkpoints (torch.compile adds this)
+    # Without this, strict=False silently drops ALL weights from compiled checkpoints
+    state_dict = {k.replace('_orig_mod.', ''): v for k, v in checkpoint['model_state_dict'].items()}
+    
     # Handle qproj shape mismatch (Old -> New Architecture)
-    state_dict = checkpoint['model_state_dict']
     if 'qproj.weight' in state_dict:
         old_w = state_dict['qproj.weight']
         new_w = model.qproj.weight
@@ -62,7 +65,13 @@ def load_full_model_with_config(model_path: str, device):
             else:
                 del state_dict['qproj.weight']
 
-    model.load_state_dict(state_dict, strict=False)
+    load_result = model.load_state_dict(state_dict, strict=False)
+    if load_result.missing_keys:
+        print(f"WARNING: {len(load_result.missing_keys)} missing keys: {load_result.missing_keys[:5]}{'...' if len(load_result.missing_keys) > 5 else ''}")
+    if load_result.unexpected_keys:
+        print(f"WARNING: {len(load_result.unexpected_keys)} unexpected keys: {load_result.unexpected_keys[:5]}{'...' if len(load_result.unexpected_keys) > 5 else ''}")
+    if not load_result.missing_keys and not load_result.unexpected_keys:
+        print(f"INFO: All {len(state_dict)} weight tensors loaded successfully.")
     model.to(device)
     model.eval()
     return model, config

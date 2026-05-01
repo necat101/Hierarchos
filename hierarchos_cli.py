@@ -36,6 +36,19 @@ def load_hf_dataset(dataset_name, dataset_config=None, split="train"):
     return load_dataset(dataset_name, dataset_config, split=split)
 
 
+def configure_tokenizer_length(tokenizer, max_length):
+    """Keep tokenizer warnings aligned with Hierarchos' runtime context length."""
+    if tokenizer is None or not max_length:
+        return
+
+    try:
+        tokenizer.model_max_length = int(max_length)
+        if hasattr(tokenizer, "init_kwargs"):
+            tokenizer.init_kwargs["model_max_length"] = int(max_length)
+    except Exception:
+        pass
+
+
 def main():
     parser = argparse.ArgumentParser(description="hierarchos: A Hybrid Memory-Reasoning Architecture")
     parser.add_argument("mode", type=str, choices=["train", "finetune", "chat", "quantize", "merge-lora", "ckpt-2-inf"], help="Operation mode.")
@@ -174,6 +187,7 @@ def main():
         if tokenizer.pad_token is None:
             if tokenizer.eos_token: tokenizer.pad_token = tokenizer.eos_token
             else: tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+        configure_tokenizer_length(tokenizer, args.max_length)
     except Exception as e:
         print(f"ERROR: Failed to load tokenizer: {e}"); sys.exit(1)
 

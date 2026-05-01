@@ -94,10 +94,11 @@ def main():
     train_group.add_argument("--persist-state", action="store_true", default=False, help="Persist RNN/LTM states between batches. Default: False.")
     train_group.add_argument("--no-persist-state", dest="persist_state", action="store_false", help="Disable state persistence between chunks.")
     train_group.add_argument("--training-chunk-size", "--training_chunk_size", type=int, default=128, help="TBPTT chunk size (Default: 128).")
-    train_group.add_argument("--save-steps", type=int, default=0, help="Save a checkpoint every N steps (0 to disable).")
+    train_group.add_argument("--save-steps", type=int, default=0, help="Save a checkpoint/adapter every N steps during training/finetuning (0 to disable).")
     train_group.add_argument("--num_workers", type=int, default=0, help="DataLoader workers. Set to 4-8 for GPU training.")
     train_group.add_argument("--amp", action="store_true", help="Enable mixed precision (auto-enabled on CUDA).")
     train_group.add_argument("--no-amp", dest="amp", action="store_false", help="Explicitly disable mixed precision.")
+    train_group.add_argument("--dataset-size", type=int, default=None, help="Force a specific dataset size (total samples) to calculate steps for the LR scheduler.")
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile (auto-enabled on CUDA).")
     parser.add_argument("--force-compile", action="store_true")
 
@@ -116,7 +117,7 @@ def main():
 
     # --- Inference & Sampling ---
     infer_group = parser.add_argument_group('Inference')
-    infer_group.add_argument("--temperature", type=float, default=0.7)
+    infer_group.add_argument("--temperature", type=float, default=1.0)
     infer_group.add_argument("--top-k", type=int, default=40)
     infer_group.add_argument("--top-p", type=float, default=0.9)
     infer_group.add_argument("--repetition-penalty", type=float, default=1.2, help="Penalty for repeating tokens (1.0=none, >1.0=discourage). Default: 1.2.")
@@ -215,8 +216,40 @@ def main():
         if dataloader is None:
             print("ERROR: No dataset provided for training. Use --train or --hf_dataset."); sys.exit(1)
 
-        try: dataloader_len = len(dataloader)
-        except: dataloader_len = 100000
+        if args.dataset_size:
+            dataloader_len = max(1, args.dataset_size // args.batch_size)
+            print(f"INFO: Manual session override: {args.dataset_size} samples -> {dataloader_len} steps per epoch.")
+        else:
+            try: 
+                dataloader_len = len(dataloader)
+            except: 
+                # Heuristic for IterableDataset (JSONL) or HF Metadata
+                if args.hf_dataset:
+                    print(f"INFO: Estimating size for HF dataset: {args.hf_dataset}...")
+                    try:
+                        from datasets import load_dataset_builder
+                        builder = load_dataset_builder(args.hf_dataset, args.hf_dataset_config)
+                        info = builder.info
+                        split = args.hf_dataset_split or 'train'
+                        if split in info.splits:
+                            count = info.splits[split].num_examples
+                            dataloader_len = max(1, count // args.batch_size)
+                            print(f"INFO: Automatic HF session detection found {count} samples -> {dataloader_len} steps per epoch.")
+                        else:
+                            print(f"ERROR: Could not find split '{split}' in HF dataset info. Please use --dataset-size."); sys.exit(1)
+                    except Exception as e:
+                        print(f"ERROR: Failed to query HF metadata: {e}. Please specify --dataset-size manually."); sys.exit(1)
+                elif hasattr(args, 'train') and isinstance(args.train, str) and os.path.isfile(args.train):
+                    print(f"INFO: Estimating dataset size from {args.train}...")
+                    try:
+                        with open(args.train, 'r', encoding='utf-8') as f:
+                            count = sum(1 for _ in f)
+                        dataloader_len = max(1, count // args.batch_size)
+                        print(f"INFO: Automatic session detection found {count} samples -> {dataloader_len} steps per epoch.")
+                    except Exception as e:
+                        print(f"ERROR: Could not count lines in {args.train}: {e}. Please specify --dataset-size manually."); sys.exit(1)
+                else:
+                    print("ERROR: Dataset size could not be determined automatically. Please use --dataset-size to specify the number of steps per epoch."); sys.exit(1)
 
         train(args, pt_device, tokenizer, dataloader, dataloader_len)
     elif args.mode == "chat":
@@ -228,7 +261,7 @@ def main():
             from datasets import load_dataset
             temp_ds = load_dataset(args.hf_dataset, args.hf_dataset_config, split=args.hf_dataset_split)
             dataset = HuggingFaceMapStyleDataset(temp_ds, tokenizer, args.max_length, args.kayla, 
-                                                  args.text_column, args.prompt_column, args.completion_column)
+                                                   args.text_column, args.prompt_column, args.completion_column)
             dataloader = create_map_style_dataloader(dataset, args.batch_size, tokenizer.pad_token_id, args.num_workers)
         elif args.pre_chunked_dataset:
             dataloader = create_dataloader_for_chunked(args.train, args.max_length, args.batch_size, args.num_workers)
@@ -241,8 +274,40 @@ def main():
         if dataloader is None:
             print("ERROR: No dataset provided for finetuning. Use --train or --hf_dataset."); sys.exit(1)
 
-        try: dataloader_len = len(dataloader)
-        except: dataloader_len = 100000
+        if args.dataset_size:
+            dataloader_len = max(1, args.dataset_size // args.batch_size)
+            print(f"INFO: Manual session override: {args.dataset_size} samples -> {dataloader_len} steps per epoch.")
+        else:
+            try: 
+                dataloader_len = len(dataloader)
+            except: 
+                # Heuristic for IterableDataset (JSONL) or HF Metadata
+                if args.hf_dataset:
+                    print(f"INFO: Estimating size for HF dataset: {args.hf_dataset}...")
+                    try:
+                        from datasets import load_dataset_builder
+                        builder = load_dataset_builder(args.hf_dataset, args.hf_dataset_config)
+                        info = builder.info
+                        split = args.hf_dataset_split or 'train'
+                        if split in info.splits:
+                            count = info.splits[split].num_examples
+                            dataloader_len = max(1, count // args.batch_size)
+                            print(f"INFO: Automatic HF session detection found {count} samples -> {dataloader_len} steps per epoch.")
+                        else:
+                            print(f"ERROR: Could not find split '{split}' in HF dataset info. Please use --dataset-size."); sys.exit(1)
+                    except Exception as e:
+                        print(f"ERROR: Failed to query HF metadata: {e}. Please specify --dataset-size manually."); sys.exit(1)
+                elif hasattr(args, 'train') and isinstance(args.train, str) and os.path.isfile(args.train):
+                    print(f"INFO: Estimating dataset size from {args.train}...")
+                    try:
+                        with open(args.train, 'r', encoding='utf-8') as f:
+                            count = sum(1 for _ in f)
+                        dataloader_len = max(1, count // args.batch_size)
+                        print(f"INFO: Automatic session detection found {count} samples -> {dataloader_len} steps per epoch.")
+                    except Exception as e:
+                        print(f"ERROR: Could not count lines in {args.train}: {e}. Please specify --dataset-size manually."); sys.exit(1)
+                else:
+                    print("ERROR: Dataset size could not be determined automatically. Please use --dataset-size to specify the number of steps per epoch."); sys.exit(1)
 
         finetune(args, pt_device, tokenizer, dataloader, dataloader_len)
     elif args.mode == "ckpt-2-inf":

@@ -213,7 +213,11 @@ class QuantizedHierarchos:
             self.ltm = LTMModule(n_slots=self.config.ltm_slots,
                                  key_dim=self.config.ltm_key_dim,
                                  val_dim=self.config.ltm_val_dim,
-                                 reference_chunk_len=getattr(self.config, 'reference_chunk_len', 128))
+                                 lr=getattr(self.config, 'ltm_lr', 1e-3),
+                                 momentum=getattr(self.config, 'ltm_momentum', 0.9),
+                                 wd=getattr(self.config, 'ltm_weight_decay', 1e-4),
+                                 forget_rate=getattr(self.config, 'ltm_forget_rate', 0.01),
+                                 reference_chunk_len=getattr(self.config, 'reference_chunk_len', getattr(self.config, 'training_chunk_size', 128)))
                                  
             ltm_state = {}
             for k in ['ltm.keys', 'ltm.vals', 'ltm.timestamps', 'ltm.sources']:
@@ -278,6 +282,40 @@ class QuantizedHierarchos:
                  drift_state=None, ltm_memory_state=None, **kwargs):
         
         B, T = input_ids.shape
+        allow_hebbian_update = kwargs.pop("allow_hebbian_update", False)
+        suppress_hebbian = kwargs.pop("suppress_hebbian", getattr(self, "suppress_hebbian", True))
+        if allow_hebbian_update:
+            suppress_hebbian = False
+        memory_timestamps = None
+        memory_sources = None
+        if ltm_memory_state is None:
+            isolate_batch_ltm = getattr(self.config, 'isolate_batch_ltm', True) and B > 1
+            if isolate_batch_ltm:
+                curr_fast_vals = self.ltm.fast_vals.unsqueeze(0).expand(B, -1, -1).clone()
+                curr_mom_vals = self.ltm._mom_vals.unsqueeze(0).expand(B, -1, -1).clone()
+                memory_timestamps = self.ltm.timestamps.unsqueeze(0).expand(B, -1).clone()
+                memory_sources = self.ltm.sources.unsqueeze(0).expand(B, -1).clone()
+            else:
+                curr_fast_vals = self.ltm.fast_vals
+                curr_mom_vals = self.ltm._mom_vals
+                memory_timestamps = self.ltm.timestamps
+                memory_sources = self.ltm.sources
+        else:
+            if len(ltm_memory_state) >= 6:
+                curr_fast_vals, curr_mom_vals, _, _, memory_timestamps, memory_sources = ltm_memory_state[:6]
+            elif len(ltm_memory_state) >= 2:
+                curr_fast_vals, curr_mom_vals = ltm_memory_state[:2]
+            else:
+                curr_fast_vals = self.ltm.fast_vals
+                curr_mom_vals = self.ltm._mom_vals
+            if memory_timestamps is None:
+                if curr_fast_vals.dim() == 3:
+                    memory_timestamps = self.ltm.timestamps.unsqueeze(0).expand(curr_fast_vals.shape[0], -1).clone()
+                    memory_sources = self.ltm.sources.unsqueeze(0).expand(curr_fast_vals.shape[0], -1).clone()
+                else:
+                    memory_timestamps = self.ltm.timestamps
+                    memory_sources = self.ltm.sources
+
         curr_prev_context = prev_context.to(device if device == 'vulkan' else 'cpu')
         logits = None
         stride = self.config.h_stride
@@ -310,7 +348,10 @@ class QuantizedHierarchos:
             query = torch.clamp(query, min=-10.0, max=10.0)
             topk_vals, topk_idx, topk_ts = self.ltm.retrieve_topk(query, topk=self.config.ltm_topk, 
                                                            min_timestamp=min_timestamp, 
-                                                           source_filter=source_filter)
+                                                           source_filter=source_filter,
+                                                           fast_vals=curr_fast_vals,
+                                                           timestamps=memory_timestamps,
+                                                           sources=memory_sources)
             all_topk_vals.append(topk_vals); all_topk_idx.append(topk_idx)
             
             args = topk_ts.unsqueeze(-1) * self.time_freqs.to(device).unsqueeze(0).unsqueeze(0)
@@ -384,16 +425,34 @@ class QuantizedHierarchos:
             enc = enc + self.l_to_out(l_out, device=device)
             logits = self.lm_head(self.out_norm(enc.cpu()), device=device)
 
-            if self.val_proj is not None:
+            if self.val_proj is not None and not suppress_hebbian:
                  val_to_store = self.val_proj(enc.to(device), device=device) if hasattr(self.val_proj, 'qtype') else self.val_proj(enc.to(device))
                  val_expanded = torch.clamp(val_to_store, min=-20.0, max=20.0).unsqueeze(1).expand(-1, self.config.ltm_topk, -1)
-                 self.ltm.update_memory_hebbian(topk_idx, None, val_expanded, current_lr=self.config.ltm_lr, timestamp=float(abs_t), tokens_covered=1, inplace=True)
+                 curr_fast_vals, curr_mom_vals = self.ltm.update_memory_hebbian(
+                     topk_idx, None, val_expanded,
+                     current_lr=self.config.ltm_lr,
+                     timestamp=float(abs_t),
+                     tokens_covered=1,
+                     fast_vals=curr_fast_vals,
+                     mom_vals=curr_mom_vals,
+                     timestamps=memory_timestamps,
+                     sources=memory_sources,
+                     inplace=True
+                 )
 
         return {
             "logits": logits.unsqueeze(1) if logits is not None else None,
             "h_state": h_state.cpu(), "l_state": l_state.cpu(),
             "prev_context": curr_prev_context.cpu(), "target_context": curr_target_context.cpu(),
-            "drift_state": current_drift.cpu()
+            "drift_state": current_drift.cpu(),
+            "ltm_memory_state": (
+                curr_fast_vals.cpu(),
+                curr_mom_vals.cpu(),
+                None,
+                None,
+                memory_timestamps.cpu() if isinstance(memory_timestamps, torch.Tensor) else memory_timestamps,
+                memory_sources.cpu() if isinstance(memory_sources, torch.Tensor) else memory_sources,
+            )
         }
 
 def load_quantized(model_path: str, device=None):

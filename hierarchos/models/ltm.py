@@ -139,19 +139,17 @@ class LTMModule(nn.Module):
             sim_topk = (one_hot * sim_expanded).sum(dim=-1)
             
             gathered_vals = torch.matmul(one_hot, effective_memory.float())
-            attn_weights = F.softmax(sim_topk, dim=-1)
             
-            if torch.isnan(attn_weights).any():
-                attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
-            
-            weighted_vals = gathered_vals * attn_weights.unsqueeze(-1)
-            weighted_vals = weighted_vals.contiguous()
+            # --- FINAL LTM FIX: Clean Concatenation Signal ---
+            # With normalization handling the bleeding, we can now use the 
+            # raw memories as the model expects. Softmax is no longer needed.
+            weighted_vals = gathered_vals.contiguous()
             
             ts_for_gather = current_timestamps.to(device=one_hot.device, dtype=one_hot.dtype)
             while ts_for_gather.ndim < one_hot.ndim:
                 ts_for_gather = ts_for_gather.unsqueeze(-2)
             ts_retrieved = (one_hot * ts_for_gather).sum(dim=-1)
-
+            
             if effective_topk < topk:
                 pad_size = topk - effective_topk
                 batch_shape_list = list(idx_clamped.shape[:-1])
@@ -200,7 +198,7 @@ class LTMModule(nn.Module):
         if grads_tensor is None: 
             return curr_fast, curr_mom
 
-        device = self.vals.device
+        device = curr_fast.device
         valid_mask = topk_idx >= 0
         if not valid_mask.any(): 
             return curr_fast, curr_mom
@@ -222,8 +220,7 @@ class LTMModule(nn.Module):
         range_tensor = torch.arange(num_classes, device=device).unsqueeze(0)
         one_hot = (idx_flat.unsqueeze(1) == range_tensor).float()
         
-        torch.sum(one_hot, dim=0, out=self.update_counts)
-        counts = self.update_counts
+        counts = one_hot.sum(dim=0)
         slot_grads = torch.matmul(one_hot.t(), grads_flat.to(device))
         
         # <<< STABILITY FIX: div + 1e-8 for safe division >>>
@@ -231,13 +228,12 @@ class LTMModule(nn.Module):
         
         nonzero_mask = counts > 0
 
-        # TITANS UPDATE LOGIC
         if inplace:
             curr_mom.mul_(self.momentum).add_(slot_grads)
             curr_mom.clamp_(min=-50.0, max=50.0)
             new_mom = curr_mom
         else:
-            new_mom = curr_mom * self.momentum + slot_grads
+            new_mom = self.momentum * curr_mom + slot_grads
             new_mom = torch.clamp(new_mom, min=-50.0, max=50.0)
         
         if tokens_covered is None:
@@ -247,31 +243,37 @@ class LTMModule(nn.Module):
         retention_rate = (1.0 - self.forget_rate) ** decay_scaler
         
         if inplace:
-            self.update_slots.copy_(new_mom)
-            self.update_slots.add_(curr_fast, alpha=self.weight_decay)
-            self.update_slots.mul_(-current_lr)
+            update_step = (new_mom + self.weight_decay * curr_fast) * (-current_lr)
             
+            # Global decay
             curr_fast.mul_(retention_rate)
-            nonzero_mask_expanded = nonzero_mask.unsqueeze(-1).expand_as(curr_fast)
-            self.update_slots.masked_fill_(~nonzero_mask_expanded, 0.0)
             
-            curr_fast.add_(self.update_slots)
-            curr_fast.clamp_(min=-20.0, max=20.0)
+            nonzero_mask_expanded = nonzero_mask.unsqueeze(-1).expand_as(curr_fast)
+            update_step = torch.where(nonzero_mask_expanded, update_step, torch.zeros_like(update_step))
+            curr_fast.add_(update_step)
+            curr_fast.clamp_(min=-50.0, max=50.0)
             new_fast = curr_fast
+
+            if getattr(self, "accumulate_deltas", False):
+                self.ltm_deltas.add_(update_step)
         else:
             update_delta = (new_mom + self.weight_decay * curr_fast)
             update_step = update_delta * (-current_lr)
-            decayed_fast = curr_fast * retention_rate
             
-            # AMP FIX: Ensure both torch.where operands are the same dtype (float32)
-            # to prevent masked_scatter_ dtype mismatch in backward pass
-            update_mask = torch.zeros_like(decayed_fast)  # Already float32 from curr_fast.float() above
-            update_step = update_step.to(dtype=update_mask.dtype)  # Guarantee match
-            nonzero_mask_expanded = nonzero_mask.unsqueeze(-1).expand_as(update_mask)
+            # Apply the same global decay/update rule as the trainer's batched path.
+            decayed_fast = curr_fast * retention_rate
+            nonzero_mask_expanded = nonzero_mask.unsqueeze(-1).expand_as(decayed_fast)
+            
+            update_mask = torch.zeros_like(decayed_fast)
+            update_step = update_step.to(dtype=update_mask.dtype)
             update_mask = torch.where(nonzero_mask_expanded, update_step, update_mask)
             
             new_fast = decayed_fast + update_mask
-            new_fast = torch.clamp(new_fast, min=-20.0, max=20.0)
+            new_fast = torch.clamp(new_fast, min=-50.0, max=50.0)
+
+            # Record change for LoRA accumulation if enabled
+            if getattr(self, "accumulate_deltas", False):
+                self.ltm_deltas.add_(update_mask)
 
         target_timestamps = timestamps if timestamps is not None else self.timestamps
         target_sources = sources if sources is not None else self.sources
@@ -330,7 +332,11 @@ class LTMModule(nn.Module):
             curr_fast[batch_idx].mul_(retention_rate)
             update_step = torch.where(nonzero_mask.unsqueeze(-1), update_step, torch.zeros_like(update_step))
             curr_fast[batch_idx].add_(update_step)
-            curr_fast[batch_idx].clamp_(min=-20.0, max=20.0)
+            curr_fast[batch_idx].clamp_(min=-50.0, max=50.0)
+
+            # Record change for LoRA accumulation if enabled
+            if getattr(self, "accumulate_deltas", False):
+                self.ltm_deltas.add_(update_step)
 
             if timestamps is not None and sources is not None:
                 with torch.no_grad():

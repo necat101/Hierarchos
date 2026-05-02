@@ -3,7 +3,7 @@ import numpy as np
 from hierarchos import HierarchosCore, QuantizedHierarchos, LTMModule, AttrDict
 
 def test_inference_memory_update():
-    print("\n=== Test: Inference Memory Update ===")
+    print("\n=== Test: Inference Memory Gating ===")
     
     # Config
     config = {
@@ -35,21 +35,33 @@ def test_inference_memory_update():
     model.reset_memory()
     initial_fast_vals = model.ltm.fast_vals.clone()
     
-    # 2. Run Forward Pass (Inference)
-    # We expect the model to update memory IF we enable it. 
-    # Currently, it likely won't update in eval mode without our fix.
+    # 2. Plain inference is read-only for LTM. Hebbian writes are reserved
+    # for explicit validation/praise paths.
     outputs = model(input_ids)
     
     # 3. Check if memory changed
     final_fast_vals = model.ltm.fast_vals.clone()
     
     diff = (final_fast_vals - initial_fast_vals).abs().sum().item()
-    print(f"Memory Diff (HierarchosCore.eval): {diff}")
+    print(f"Memory Diff (plain HierarchosCore.eval): {diff}")
     
     if diff == 0:
-        print("[FAIL] Memory did not update during inference (HierarchosCore)!")
+        print("[PASS] Plain inference left LTM unchanged.")
     else:
-        print("[PASS] Memory updated during inference (HierarchosCore).")
+        print("[FAIL] Plain inference wrote to LTM unexpectedly!")
+        raise AssertionError("Plain inference wrote to LTM unexpectedly")
+
+    # 4. Explicit validation/praise path still allows Hebbian memory writes.
+    with torch.no_grad():
+        model(input_ids, allow_hebbian_update=True)
+    validation_diff = (model.ltm.fast_vals - initial_fast_vals).abs().sum().item()
+    print(f"Memory Diff (validation Hebbian): {validation_diff}")
+
+    if validation_diff > 0:
+        print("[PASS] Validation Hebbian update wrote to LTM.")
+    else:
+        print("[FAIL] Validation Hebbian update did not write to LTM!")
+        raise AssertionError("Validation Hebbian update did not write to LTM")
         
     # Note: QuantizedHierarchos requires a quantized model file to load, 
     # so we can't easily test it here without creating one. 

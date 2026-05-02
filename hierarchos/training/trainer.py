@@ -5,7 +5,6 @@ from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import time
 from tqdm import tqdm
-import math
 import sys
 import traceback
 import numpy as np
@@ -26,6 +25,58 @@ def validate_loss(loss: torch.Tensor, name: str = "loss") -> bool:
         print(f"ERROR: Invalid loss ({loss.item()}) detected in {name}!")
         return False
     return True
+
+def compute_chunk_training_weights(labels: torch.Tensor, attention_mask: torch.Tensor = None, chunk_size: int = 128):
+    """
+    Build TBPTT chunk weights that match the causal objective.
+
+    CrossEntropy is averaged over valid shifted labels inside each chunk, so the
+    trainer must weight chunk CE by the number of supervised answer tokens, not
+    by raw chunk count or total padded length. Auxiliary costs are token-level
+    dynamics, so they use real attention-mask tokens instead.
+    """
+    B, T = labels.shape
+    if chunk_size <= 0 or chunk_size > T:
+        chunk_size = T
+
+    chunks = []
+    total_valid_predictions = 0
+    total_real_tokens = 0
+
+    for start_t in range(0, T, chunk_size):
+        end_t = min(start_t + chunk_size, T)
+        chunk_labels = labels[:, start_t:end_t]
+
+        if chunk_labels.shape[1] > 1:
+            valid_predictions = int((chunk_labels[:, 1:] != -100).sum().item())
+        else:
+            valid_predictions = 0
+
+        if attention_mask is not None:
+            real_tokens = int(attention_mask[:, start_t:end_t].sum().item())
+        else:
+            real_tokens = B * (end_t - start_t)
+
+        chunks.append({
+            "start": start_t,
+            "end": end_t,
+            "valid_predictions": valid_predictions,
+            "real_tokens": real_tokens,
+        })
+        total_valid_predictions += valid_predictions
+        total_real_tokens += real_tokens
+
+    for chunk in chunks:
+        chunk["label_ratio"] = (
+            chunk["valid_predictions"] / float(total_valid_predictions)
+            if total_valid_predictions > 0 else 0.0
+        )
+        chunk["token_ratio"] = (
+            chunk["real_tokens"] / float(total_real_tokens)
+            if total_real_tokens > 0 else 0.0
+        )
+
+    return chunks
 
 def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, running_states):
     """Training step with temporal chunking to match original hierarchos.py."""
@@ -84,7 +135,8 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
     # Temporal chunking (critical for RWKV-based models)
     chunk_size = getattr(args, 'training_chunk_size', 128)
     if chunk_size <= 0 or chunk_size > T: chunk_size = T
-    num_chunks = math.ceil(T / chunk_size)
+    chunk_plan = compute_chunk_training_weights(full_labels, full_attention_mask, chunk_size)
+    num_chunks = len(chunk_plan)
     
     total_loss = 0.0
     total_ponder = 0.0
@@ -93,9 +145,17 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
     final_outputs = None
     
     try:
-        for chunk_idx in range(num_chunks):
-            start_t = chunk_idx * chunk_size
-            end_t = min((chunk_idx + 1) * chunk_size, T)
+        for chunk_idx, chunk_info in enumerate(chunk_plan):
+            start_t = chunk_info["start"]
+            end_t = chunk_info["end"]
+            label_ratio = chunk_info["label_ratio"]
+            token_ratio = chunk_info["token_ratio"]
+
+            # Dynamic padding can create trailing chunks with no real tokens and
+            # no supervised labels. Skip them entirely so padding cannot decay or
+            # momentum-step LTM state through a zero-gradient update.
+            if label_ratio == 0.0 and token_ratio == 0.0:
+                continue
             
             # Slice tensors for this chunk
             input_ids = full_input_ids[:, start_t:end_t]
@@ -122,7 +182,7 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                 ponder_cost = outputs.get('ponder_cost')
                 commitment_cost = outputs.get('commitment_cost')
                 
-                combined_loss = ce_loss
+                aux_loss = torch.zeros_like(ce_loss)
                 
                 # --- ACT Sensitivity: Adaptive Ponder Loss ---
                 if ponder_cost is not None:
@@ -131,7 +191,7 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                     if getattr(args, 'encourage_thinking', False):
                         # RECOVERY MODE: Invert ponder penalty to REWARD thinking
                         # Negative weight means higher ponder = lower loss
-                        combined_loss = combined_loss - (abs(ponder_weight) * ponder_cost)
+                        aux_loss = aux_loss - (abs(ponder_weight) * ponder_cost)
                     elif getattr(args, 'adaptive_ponder', False):
                         # ADAPTIVE MODE: Scale ponder target with loss
                         # Higher CE loss = more thinking needed
@@ -141,22 +201,18 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                         ponder_diff = target_ponder - ponder_cost
                         # Penalize under-thinking (when ponder < target), ignore over-thinking
                         ponder_penalty = torch.relu(ponder_diff) * ponder_weight
-                        combined_loss = combined_loss + ponder_penalty
+                        aux_loss = aux_loss + ponder_penalty
                     else:
                         # STANDARD MODE: Original additive penalty (penalizes thinking)
-                        combined_loss = combined_loss + (ponder_weight * ponder_cost)
+                        aux_loss = aux_loss + (ponder_weight * ponder_cost)
                 
                 if commitment_cost is not None:
-                    combined_loss = combined_loss + (getattr(args, 'commitment_loss_weight', 0.5) * commitment_cost)
+                    aux_loss = aux_loss + (getattr(args, 'commitment_loss_weight', 0.5) * commitment_cost)
 
-                # --- FLAT WEIGHTING (Parity with Monolith) ---
-                # The monolith does not weight chunks by length. 
-                # We use unweighted loss to ensure gradient parity.
-                chunk_loss = combined_loss / (accumulation_steps * num_chunks)
-
-                # We still need chunk_ratio (relative to T) for sequence-averaged display metrics
-                chunk_len = (end_t - start_t)
-                chunk_ratio = chunk_len / float(T)
+                # CE is already averaged over valid labels within this chunk.
+                # Weight it by supervised answer-token count so long masked
+                # prompts/tool traces do not dilute the actual learning signal.
+                chunk_loss = ((ce_loss * label_ratio) + (aux_loss * token_ratio)) / accumulation_steps
             
             # Backprop per chunk (TBPTT)
             # retain_grad() is now handled inside autocast block above (BUG #1 fix)
@@ -254,11 +310,11 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                 drift_state = torch.clamp(outputs['drift_state'].detach(), min=-5.0, max=5.0)
             
             # Accumulate for display
-            total_loss += ce_loss.item() * chunk_ratio
+            total_loss += ce_loss.item() * label_ratio
             if ponder_cost is not None: 
-                total_ponder += ponder_cost.item() * chunk_ratio
+                total_ponder += ponder_cost.item() * token_ratio
             if commitment_cost is not None: 
-                total_commit += commitment_cost.item() * chunk_ratio
+                total_commit += commitment_cost.item() * token_ratio
             
             chunks_processed += 1
             # final_outputs = outputs # REMOVED: Memory Leak Fix

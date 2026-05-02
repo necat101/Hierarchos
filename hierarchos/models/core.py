@@ -79,7 +79,7 @@ class WorkerLoop:
                 
                 drift_delta = torch.tanh(self.context_drift_proj(l_out))
                 current_drift = torch.clamp(current_drift + drift_delta, min=-5.0, max=5.0)
-                drift_sq = torch.sum(current_drift ** 2, dim=-1).mean()
+                drift_sq = torch.sum(current_drift ** 2, dim=-1)
                 hinge_cost = torch.relu(drift_sq - self.commitment_threshold)
                 hinge_cost = torch.clamp(hinge_cost, max=100.0)
                 drift_costs.append(hinge_cost)
@@ -104,9 +104,9 @@ class WorkerLoop:
         next_l_state = torch.clamp(next_l_state, min=-50.0, max=50.0)
         
         final_enc = current_enc + self.l_to_out(final_l_out)
-        commitment_cost = torch.tensor(0.0, device=enc.device, dtype=enc.dtype)
+        commitment_cost = torch.zeros(enc.shape[0], device=enc.device, dtype=enc.dtype)
         if len(drift_costs) > 0:
-            commitment_cost = torch.stack(drift_costs).mean()
+            commitment_cost = torch.stack(drift_costs, dim=0).mean(dim=0)
 
         return final_enc, next_l_state, commitment_cost, current_drift
 
@@ -159,7 +159,10 @@ class HierarchosCore(nn.Module):
             key_dim=config.ltm_key_dim, 
             val_dim=config.ltm_val_dim,
             lr=getattr(config, 'ltm_lr', 1e-3),
-            forget_rate=getattr(config, 'ltm_forget_rate', 0.01)
+            momentum=getattr(config, 'ltm_momentum', 0.9),
+            wd=getattr(config, 'ltm_weight_decay', 1e-4),
+            forget_rate=getattr(config, 'ltm_forget_rate', 0.01),
+            reference_chunk_len=getattr(config, 'reference_chunk_len', getattr(config, 'training_chunk_size', 128))
         )
         self.qproj = nn.Linear(config.context_dim * 2, config.ltm_key_dim, bias=False)
         self.val_proj = nn.Linear(config.context_dim, config.ltm_val_dim, bias=False)
@@ -267,6 +270,10 @@ class HierarchosCore(nn.Module):
         """
         B, T = input_ids.shape
         device = input_ids.device
+        allow_hebbian_update = kwargs.pop("allow_hebbian_update", False)
+        suppress_hebbian = kwargs.pop("suppress_hebbian", getattr(self, "suppress_hebbian", True))
+        if allow_hebbian_update:
+            suppress_hebbian = False
 
         x = self.tok_emb(input_ids)
 
@@ -275,8 +282,9 @@ class HierarchosCore(nn.Module):
         memory_timestamps = None
         memory_sources = None
         if ltm_memory_state is None:
-            isolate_training_ltm = self.training and getattr(self.config, 'isolate_batch_ltm', True)
-            if isolate_training_ltm:
+            isolate_batch_ltm = getattr(self.config, 'isolate_batch_ltm', True)
+            isolate_runtime_ltm = isolate_batch_ltm and (self.training or B > 1)
+            if isolate_runtime_ltm:
                 curr_fast_vals = self.ltm.fast_vals.unsqueeze(0).expand(B, -1, -1).clone()
                 curr_mom_vals = self.ltm._mom_vals.unsqueeze(0).expand(B, -1, -1).clone()
                 memory_timestamps = self.ltm.timestamps.unsqueeze(0).expand(B, -1).clone()
@@ -373,9 +381,12 @@ class HierarchosCore(nn.Module):
 
         final_embs = []
         ponder_costs = []
+        ponder_weights = []
         commitment_costs = []
+        commitment_weights = []
         all_topk_vals = []
         all_topk_idx = []
+        aux_attention_mask = attention_mask.to(device=device, dtype=torch.float32) if attention_mask is not None else None
 
         stride = self.config.h_stride
         final_drift = None
@@ -394,7 +405,7 @@ class HierarchosCore(nn.Module):
             # --- LTM Retrieval ---
             p = self.persistent.unsqueeze(0).expand(B, -1)
             q_in = torch.cat([token_x, prev_context], dim=-1)
-            q = torch.clamp(self.qproj(q_in), min=-10, max=10)
+            q = torch.clamp(self.qproj(q_in), min=-12, max=12)
             
             topk_vals, topk_idx, topk_ts = self.ltm.retrieve_topk(
                 q, self.config.ltm_topk, min_timestamp, source_filter, fast_vals=curr_fast_vals,
@@ -431,7 +442,7 @@ class HierarchosCore(nn.Module):
             if torch.isnan(h_out_real).any() or torch.isinf(h_out_real).any():
                 print(f"WARNING: NaN/Inf detected in h_out_real at step {t}")
             
-            step_ponder_cost = torch.tensor(0.0, device=device)
+            step_ponder_cost = torch.zeros(B, device=device, dtype=enc.dtype)
             
             # PLANNING STEP (Strided with ACT)
             if abs_t % stride == 0:
@@ -473,8 +484,12 @@ class HierarchosCore(nn.Module):
                 target_context = self.h_to_context(final_h_out)
                 target_context = torch.clamp(target_context, min=-50.0, max=50.0)
                 
-                step_ponder_cost = cum_remain.sum(dim=0).mean()
+                step_ponder_cost = cum_remain.sum(dim=0).to(enc.dtype)
                 ponder_costs.append(step_ponder_cost)
+                if aux_attention_mask is not None:
+                    ponder_weights.append(aux_attention_mask[:, t])
+                else:
+                    ponder_weights.append(torch.ones(B, device=device, dtype=torch.float32))
             
             # LERP (Interpolation)
             step_in_stride = abs_t % stride
@@ -507,6 +522,10 @@ class HierarchosCore(nn.Module):
             
             final_embs.append(enc)
             commitment_costs.append(cc)
+            if aux_attention_mask is not None:
+                commitment_weights.append(aux_attention_mask[:, t])
+            else:
+                commitment_weights.append(torch.ones(B, device=device, dtype=torch.float32))
 
             # ==================================================================
             # 5. MEMORY UPDATE (Differentiable Hebbian — Inference Only)
@@ -514,7 +533,7 @@ class HierarchosCore(nn.Module):
             # During training, the trainer handles LTM updates via gradient-based
             # Titans inner_update after backward(). Running Hebbian here too would
             # cause double-decay and conflicting update signals on the same slots.
-            if not self.training:
+            if not self.training and not suppress_hebbian:
                 val_to_store = self.val_proj(enc)
                 val_to_store = torch.clamp(val_to_store, min=-20.0, max=20.0)
                 val_expanded = val_to_store.unsqueeze(1).expand(-1, self.config.ltm_topk, -1)
@@ -577,10 +596,18 @@ class HierarchosCore(nn.Module):
                     loss = loss + z_loss
             
             # Compute auxiliary costs for reporting (trainer handles loss composition)
-            if ponder_costs: 
-                ponder_cost_out = torch.stack(ponder_costs).mean()
-            if commitment_costs: 
-                commitment_cost_out = torch.stack(commitment_costs).mean()
+            def _weighted_aux_mean(costs, weights):
+                if not costs:
+                    return None
+                cost_tensor = torch.stack([c.float().view(B) for c in costs], dim=0)
+                weight_tensor = torch.stack(weights, dim=0).float()
+                denom = weight_tensor.sum()
+                if denom <= 0:
+                    return torch.zeros((), device=device, dtype=cost_tensor.dtype)
+                return (cost_tensor * weight_tensor).sum() / denom
+
+            ponder_cost_out = _weighted_aux_mean(ponder_costs, ponder_weights)
+            commitment_cost_out = _weighted_aux_mean(commitment_costs, commitment_weights)
 
         return {
             "loss": loss, 
@@ -603,9 +630,9 @@ class HierarchosCore(nn.Module):
 
     def update_memory(self, topk_idx, grads, timestamp, lr=1e-3):
         """Updates the LTM memory using gradients (Titans style)."""
-        self.ltm.inner_update(topk_idx, grads, current_lr=lr, timestamp=timestamp)
+        self.ltm.inner_update(topk_idx, grads, current_lr=lr, timestamp=timestamp, inplace=True)
 
     def update_memory_hebbian(self, topk_idx, vals, timestamp, lr=1e-3, tokens_covered=1):
         """Updates the LTM memory using Hebbian rule (Fallback for Inference)."""
         self.ltm.update_memory_hebbian(topk_idx, None, vals, current_lr=lr, 
-                                       timestamp=timestamp, tokens_covered=tokens_covered)
+                                       timestamp=timestamp, tokens_covered=tokens_covered, inplace=True)

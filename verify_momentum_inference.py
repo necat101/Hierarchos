@@ -29,6 +29,7 @@ def test_momentum_inference():
     
     model = HierarchosCore(config)
     model.eval()
+    model.suppress_hebbian = False
     
     # Initialize memory to zeros
     model.ltm.fast_vals.zero_()

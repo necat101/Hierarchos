@@ -71,6 +71,31 @@ def is_correction_or_instruction(text: str) -> bool:
     return False
 
 
+def extract_correction_text(text: str):
+    """Extracts corrected target text from terse feedback like 'its 4'."""
+    clean = text.strip()
+    lower = clean.lower()
+    prefixes = (
+        "it's ",
+        "its ",
+        "it is ",
+        "actually ",
+        "actually, ",
+        "no, ",
+        "wrong, ",
+        "incorrect, ",
+        "the answer is ",
+        "answer is ",
+        "it should be ",
+        "should be ",
+    )
+    for prefix in prefixes:
+        if lower.startswith(prefix):
+            correction = clean[len(prefix):].strip()
+            return correction if correction else None
+    return None
+
+
 # --- Training-Parity Format Wrapper & Parser ---
 def wrap_for_hierarchos(raw_text, system_prompt=None):
     """Wraps user input into the exact format the model saw during training.
@@ -95,28 +120,67 @@ def clean_hierarchos_output(raw_generation):
     return raw_generation.strip()
 
 
+def passive_response_quality(token_ids):
+    """Conservative quality gate for self-generated passive LTM writes."""
+    ids = [int(t) for t in token_ids]
+    if len(ids) < 8:
+        return False, "too short"
+
+    unique_ratio = len(set(ids)) / max(1, len(ids))
+    if len(ids) >= 20 and unique_ratio < 0.35:
+        return False, "low token diversity"
+
+    for n in (3, 4):
+        if len(ids) < n * 2:
+            continue
+        ngrams = [tuple(ids[i:i + n]) for i in range(len(ids) - n + 1)]
+        ngram_unique_ratio = len(set(ngrams)) / max(1, len(ngrams))
+        if ngram_unique_ratio < 0.75:
+            return False, f"repeated {n}-grams"
+
+    return True, "ok"
+
+
+def parse_temperature_setting(raw_value: str) -> float:
+    """Parses a runtime temperature value constrained to 0.00..1.00 in 0.05 steps."""
+    value = float(raw_value)
+    if value < 0.0 or value > 1.0:
+        raise ValueError("temperature must be between 0 and 1")
+
+    scaled = round(value * 20)
+    stepped = scaled / 20.0
+    if abs(value - stepped) > 1e-8:
+        raise ValueError("temperature must use 0.05 increments")
+    return stepped
+
+
 # --- Simple Generation Helper ---
 def generate_sample(model, tokenizer, prompt, device, max_new_tokens=100, temperature=0.7, top_k=50, top_p=0.9):
     """Simple generation for testing/comparison."""
     model.eval()
+    previous_suppress_hebbian = getattr(model, "suppress_hebbian", False)
+    model.suppress_hebbian = True
     tokens = tokenizer.encode(prompt, return_tensors="pt").to(device)
     h_state, l_state, p_ctx, t_ctx = None, None, None, None
     ltm_state = None
 
-    generated = tokens
-    for _ in range(max_new_tokens):
-        with torch.no_grad():
-            outputs = model(input_ids=tokens, h_state=h_state, l_state=l_state,
-                            prev_context=p_ctx, target_context=t_ctx, ltm_memory_state=ltm_state)
-            logits = outputs['logits'][:, -1, :] / max(temperature, 1e-6)
-            next_token = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
-            generated = torch.cat([generated, next_token], dim=1)
-            tokens = next_token
-            h_state, l_state = outputs['h_state'], outputs['l_state']
-            p_ctx, t_ctx = outputs['prev_context'], outputs['target_context']
-            ltm_state = outputs.get('ltm_memory_state')
-            if next_token.item() == tokenizer.eos_token_id:
-                break
+    try:
+        generated = tokens
+        for _ in range(max_new_tokens):
+            with torch.no_grad():
+                outputs = model(input_ids=tokens, h_state=h_state, l_state=l_state,
+                                prev_context=p_ctx, target_context=t_ctx, ltm_memory_state=ltm_state)
+                logits = outputs['logits'][:, -1, :] / max(temperature, 1e-6)
+                next_token = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
+                generated = torch.cat([generated, next_token], dim=1)
+                tokens = next_token
+                h_state, l_state = outputs['h_state'], outputs['l_state']
+                p_ctx, t_ctx = outputs['prev_context'], outputs['target_context']
+                ltm_state = outputs.get('ltm_memory_state')
+                if next_token.item() == tokenizer.eos_token_id:
+                    break
+    finally:
+        model.suppress_hebbian = previous_suppress_hebbian
 
     return tokenizer.decode(generated[0], skip_special_tokens=True)
 
@@ -128,6 +192,10 @@ def chat(args, device, tokenizer):
     
     Ported from hierarchos.py monolith for full feature parity.
     """
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except Exception:
+        pass
     print("Running in CHAT mode...")
     
     # Import here to avoid circular imports
@@ -234,10 +302,15 @@ def chat(args, device, tokenizer):
                 except Exception as e:
                     print(f"Warning: Failed to load LTM deltas: {e}")
     elif learning_enabled:
-        print("LTM online learning is ACTIVE. Updates will modify model weights directly.")
+        print("LTM online learning is ACTIVE for passive prompt memory and explicit feedback/validation.")
+        print("Passive response learning is OFF by default; use --passive-response-learning to opt in.")
 
     if not is_quantized:
         model.eval()
+    if model is not None:
+        model.suppress_hebbian = True
+    if shadow_model is not None:
+        shadow_model.suppress_hebbian = True
 
     # LTM Scheduler setup
     ltm_scheduler = None
@@ -266,10 +339,10 @@ def chat(args, device, tokenizer):
     # =================================================================
     # 4. LOCAL HELPER FOR LTM UPDATE
     # =================================================================
-    def perform_ltm_update(input_ids_tensor, label_ids_tensor, source_id, penalty=False, lr_override=None, silent=False, compute_only=False):
+    def perform_ltm_update(input_ids_tensor, label_ids_tensor, source_id, penalty=False, lr_override=None, silent=False, compute_only=False, learn_input_tokens=False):
         """Performs LTM update. Returns loss value if successful, else None.
         If compute_only=True, only computes loss without updating LTM."""
-        nonlocal ltm_has_been_updated
+        nonlocal ltm_has_been_updated, ltm_state
         
         update_model = shadow_model if is_quantized else model
         if update_model is None:
@@ -281,8 +354,15 @@ def chat(args, device, tokenizer):
 
         update_model.train()
         with torch.enable_grad():
-            full_sequence = torch.cat([input_ids_tensor, label_ids_tensor], dim=0).unsqueeze(0)
-            labels = torch.cat([torch.full_like(input_ids_tensor, -100), label_ids_tensor], dim=0).unsqueeze(0)
+            if label_ids_tensor is None:
+                full_sequence = input_ids_tensor.unsqueeze(0)
+                labels = full_sequence.clone() if learn_input_tokens else torch.full_like(full_sequence, -100)
+            else:
+                full_sequence = torch.cat([input_ids_tensor, label_ids_tensor], dim=0).unsqueeze(0)
+                if learn_input_tokens:
+                    labels = full_sequence.clone()
+                else:
+                    labels = torch.cat([torch.full_like(input_ids_tensor, -100), label_ids_tensor], dim=0).unsqueeze(0)
             
             max_length = getattr(config, 'max_length', 1024)
             if full_sequence.shape[1] > max_length:
@@ -295,23 +375,21 @@ def chat(args, device, tokenizer):
 
             autocast_device = 'cpu' if is_directml_device(target_device) else target_device.type
             with autocast(device_type=autocast_device, enabled=use_amp):
-                outputs = update_model(input_ids=full_sequence, labels=None)
+                outputs = update_model(
+                    input_ids=full_sequence,
+                    labels=None,
+                    ltm_memory_state=ltm_state,
+                    suppress_hebbian=True,
+                )
                 logits = outputs["logits"]
                 
-                # AMP FIX (BUG #1 parity with trainer.py): Cast raw_topk_vals to
-                # float32 BEFORE retain_grad(). Under BFloat16 AMP, these tensors
-                # are BF16; retain_grad() on BF16 causes masked_scatter_ dtype
-                # mismatch (BF16 holder vs F32 gradient) during backward().
+                # LTM feedback learning must retain gradients on the exact
+                # retrieval tensors consumed by the forward graph. retrieve_topk
+                # already runs in float32, matching trainer.py.
                 if outputs.get("raw_topk_vals") is not None:
-                    float32_topk = []
                     for t in outputs["raw_topk_vals"]:
                         if t.requires_grad:
-                            t_f32 = t.float()
-                            t_f32.retain_grad()
-                            float32_topk.append(t_f32)
-                        else:
-                            float32_topk.append(t)
-                    outputs["raw_topk_vals"] = float32_topk
+                            t.retain_grad()
 
                 shift_logits = logits[..., :-1, :].contiguous()
                 shift_labels = labels[..., 1:].contiguous()
@@ -366,15 +444,43 @@ def chat(args, device, tokenizer):
                     if current_scale != 1.0:
                         ltm_grads_copy = ltm_grads_copy / current_scale
 
-                update_model.ltm.inner_update(
+                curr_ltm = outputs.get("ltm_memory_state")
+                curr_fast = curr_ltm[0] if curr_ltm is not None else None
+                curr_mom = curr_ltm[1] if curr_ltm is not None else None
+                old_past_tokens = ltm_state[2] if ltm_state is not None and len(ltm_state) >= 3 else None
+                old_rosa_states = ltm_state[3] if ltm_state is not None and len(ltm_state) >= 4 else None
+                curr_timestamps = curr_ltm[4] if curr_ltm is not None and len(curr_ltm) >= 5 else None
+                curr_sources = curr_ltm[5] if curr_ltm is not None and len(curr_ltm) >= 6 else None
+
+                new_fast, new_mom = update_model.ltm.inner_update(
                     outputs["topk_idx"],
                     ltm_grads_copy,
                     current_lr=current_ltm_lr,
                     timestamp=0.0,
                     source=source_id,
                     tokens_covered=full_sequence.shape[1],
+                    fast_vals=curr_fast,
+                    mom_vals=curr_mom,
+                    timestamps=curr_timestamps,
+                    sources=curr_sources,
                     inplace=True
                 )
+                if curr_ltm is not None:
+                    if is_quantized:
+                        new_fast = new_fast.detach().cpu()
+                        new_mom = new_mom.detach().cpu()
+                        if isinstance(curr_timestamps, torch.Tensor):
+                            curr_timestamps = curr_timestamps.detach().cpu()
+                        if isinstance(curr_sources, torch.Tensor):
+                            curr_sources = curr_sources.detach().cpu()
+                    ltm_state = (
+                        new_fast.detach(),
+                        new_mom.detach(),
+                        old_past_tokens.detach() if isinstance(old_past_tokens, torch.Tensor) else old_past_tokens,
+                        old_rosa_states,
+                        curr_timestamps.detach() if isinstance(curr_timestamps, torch.Tensor) else curr_timestamps,
+                        curr_sources.detach() if isinstance(curr_sources, torch.Tensor) else curr_sources,
+                    )
                 ltm_has_been_updated = True
 
                 if use_amp and scaler and dummy_optimizer:
@@ -404,13 +510,87 @@ def chat(args, device, tokenizer):
         update_model.eval()
         return None
 
+    def perform_validation_hebbian_update(input_ids_tensor, label_ids_tensor, source_id, lr_override=None, silent=False):
+        """Stores a validated exchange in fast LTM using Hebbian writes only after praise/validation."""
+        nonlocal ltm_has_been_updated, ltm_state
+
+        update_model = model
+        if update_model is None:
+            if not silent:
+                print(" (No model available for validation memory)")
+            return None
+
+        full_sequence = torch.cat([input_ids_tensor, label_ids_tensor], dim=0).unsqueeze(0)
+        max_length = getattr(config, 'max_length', 1024)
+        if full_sequence.shape[1] > max_length:
+            full_sequence = full_sequence[:, -max_length:]
+
+        model_input = full_sequence.cpu() if is_quantized else full_sequence.to(device)
+        rnn_device_local = "cpu" if is_quantized else device
+        local_h = torch.zeros(1, getattr(config, 'h_hidden', config.context_dim), 5, device=rnn_device_local)
+        local_l = torch.zeros(1, getattr(config, 'l_hidden', config.context_dim), 5, device=rnn_device_local)
+        local_h[:, :, 3] = -1e30
+        local_l[:, :, 3] = -1e30
+        local_prev = torch.zeros(1, config.context_dim, device=rnn_device_local)
+        local_target = torch.zeros(1, config.context_dim, device=rnn_device_local)
+
+        previous_suppress = getattr(update_model, "suppress_hebbian", True)
+        previous_lr = getattr(update_model.config, "ltm_lr", None)
+        current_ltm_lr = lr_override if lr_override is not None else ltm_lr
+        update_model.suppress_hebbian = False
+        update_model.config.ltm_lr = current_ltm_lr
+
+        try:
+            if hasattr(update_model, "eval"):
+                update_model.eval()
+            with torch.no_grad():
+                outputs = update_model(
+                    input_ids=model_input,
+                    h_state=local_h if is_quantized else None,
+                    l_state=local_l if is_quantized else None,
+                    prev_context=local_prev if is_quantized else None,
+                    target_context=local_target if is_quantized else None,
+                    ltm_memory_state=ltm_state,
+                    global_pos_offset=0,
+                    min_timestamp=min_ts_filter,
+                    source_filter=source_id_filter,
+                    allow_hebbian_update=True,
+                )
+
+            updated_ltm = outputs.get("ltm_memory_state")
+            if updated_ltm is not None:
+                old_past_tokens = ltm_state[2] if ltm_state is not None and len(ltm_state) >= 3 else None
+                old_rosa_states = ltm_state[3] if ltm_state is not None and len(ltm_state) >= 4 else None
+                updated_mom = torch.zeros_like(updated_ltm[1]) if isinstance(updated_ltm[1], torch.Tensor) else updated_ltm[1]
+                ltm_state = (
+                    updated_ltm[0],
+                    updated_mom,
+                    old_past_tokens,
+                    old_rosa_states,
+                    updated_ltm[4] if len(updated_ltm) >= 5 else None,
+                    updated_ltm[5] if len(updated_ltm) >= 6 else None,
+                )
+                ltm_has_been_updated = True
+                if not silent:
+                    fv_norm = ltm_state[0].float().norm().item()
+                    print(f" [Hebbian validation memory | fast_vals norm: {fv_norm:.6e}]", end="", flush=True)
+                return ltm_state[0].float().norm().item() if updated_ltm[0] is not None else 0.0
+            if not silent:
+                print(" (No LTM state returned for validation memory)", end="", flush=True)
+            return None
+        finally:
+            update_model.suppress_hebbian = previous_suppress
+            if previous_lr is not None:
+                update_model.config.ltm_lr = previous_lr
+
     # =================================================================
     # 5. PRINT WELCOME MESSAGE
     # =================================================================
     print("\nWelcome to Hierarchos Chat. Type 'exit' or 'quit' to end.")
     print("Commands:")
     print("  /filter time=-<seconds> | /filter source=<id>  : Constrain memory retrieval")
-    print("  /settings | /topk <int> | /topp <float>        : View/Change sampling")
+    print("  /settings [temperature <float>] | /temp <float> : View/Change temperature")
+    print("  /topk <int> | /topp <float>                    : Change sampling filters")
     print("  /system <prompt> | /system clear               : Set/clear system prompt")
     print("  /reset                                         : Clear RNN & Hierarchical states")
     print("  /reset_ltm                                     : Clear LTM memory (fast_vals)")
@@ -508,13 +688,13 @@ def chat(args, device, tokenizer):
                                 print("Usage: /filter source=<int>")
                 continue
 
-            if prompt.startswith('/temp'):
+            if prompt.startswith('/temp') or prompt.startswith('/temperature'):
                 try:
-                    val = float(prompt.split()[1])
-                    args.temperature = max(0.0, val)
-                    print(f"Set temperature to {args.temperature}")
+                    val = parse_temperature_setting(prompt.split()[1])
+                    args.temperature = val
+                    print(f"Set temperature to {args.temperature:.2f}")
                 except (IndexError, ValueError):
-                    print("Usage: /temp <float>")
+                    print("Usage: /temp <0.00-1.00 in 0.05 increments>")
                 continue
 
             if prompt.startswith('/topk'):
@@ -536,7 +716,19 @@ def chat(args, device, tokenizer):
                 continue
 
             if prompt.startswith('/settings'):
-                print(f"Current Settings:\n  Temperature: {args.temperature}\n  Top-K: {args.top_k}\n  Top-P: {args.top_p}")
+                parts = prompt.split()
+                if len(parts) >= 3 and parts[1].lower() in ("temperature", "temp"):
+                    try:
+                        val = parse_temperature_setting(parts[2])
+                        args.temperature = val
+                        print(f"Set temperature to {args.temperature:.2f}")
+                    except ValueError:
+                        print("Usage: /settings temperature <0.00-1.00 in 0.05 increments>")
+                    continue
+                if len(parts) > 1:
+                    print("Usage: /settings [temperature <0.00-1.00 in 0.05 increments>]")
+                    continue
+                print(f"Current Settings:\n  Temperature: {args.temperature:.2f}\n  Top-K: {args.top_k}\n  Top-P: {args.top_p}")
                 print(f"  System Prompt: {repr(system_prompt) if system_prompt else '(none)'}")
                 continue
 
@@ -586,6 +778,29 @@ def chat(args, device, tokenizer):
             # A. CHECK FOR FEEDBACK & PERFORM UPDATES
             # =================================================================
             if learning_enabled:
+                correction_text = extract_correction_text(prompt) if pending_training_data is not None else None
+                if correction_text:
+                    print("[Correction received. Updating previous answer memory...]", end="", flush=True)
+                    perform_ltm_update(
+                        pending_training_data['prompt_ids'][0],
+                        pending_training_data['response_ids'],
+                        LTMModule.SRC_CORRECTION,
+                        penalty=True
+                    )
+                    correction_ids = tokenizer.encode(correction_text, add_special_tokens=False)
+                    if tokenizer.eos_token_id is not None:
+                        correction_ids = correction_ids + [tokenizer.eos_token_id]
+                    correction_tensor = torch.tensor(correction_ids, device=device)
+                    perform_ltm_update(
+                        pending_training_data['prompt_ids'][0],
+                        correction_tensor,
+                        LTMModule.SRC_CORRECTION,
+                        penalty=False
+                    )
+                    pending_training_data = None
+                    print("")
+                    continue
+
                 if is_positive_feedback(prompt) and pending_training_data is not None:
                     print("[Positive feedback. Reinforcing previous memory...]", end="", flush=True)
                     perform_ltm_update(
@@ -594,7 +809,13 @@ def chat(args, device, tokenizer):
                         LTMModule.SRC_USER_INTERACTION,
                         penalty=False
                     )
+                    perform_validation_hebbian_update(
+                        pending_training_data['prompt_ids'][0],
+                        pending_training_data['response_ids'],
+                        LTMModule.SRC_USER_INTERACTION,
+                    )
                     pending_training_data = None
+                    print("")
                     continue
 
                 elif prompt.strip().lower() in ["no", "n", "bad", "wrong", "bad bot"]:
@@ -615,6 +836,12 @@ def chat(args, device, tokenizer):
                     LTMModule.SRC_USER_INTERACTION,
                     penalty=False
                 )
+                perform_validation_hebbian_update(
+                    pending_training_data['prompt_ids'][0],
+                    pending_training_data['response_ids'],
+                    LTMModule.SRC_USER_INTERACTION,
+                )
+                print("")
                 continue
             elif prompt.strip() == "/learn":
                 print("[Nothing pending to learn]")
@@ -625,12 +852,20 @@ def chat(args, device, tokenizer):
             # =================================================================
             prompt_format = wrap_for_hierarchos(prompt, system_prompt=system_prompt)
             prompt_ids = tokenizer.encode(prompt_format, return_tensors="pt").to(device)
+            passive_learning = getattr(args, 'passive_learning', False)
+            passive_response_learning = getattr(args, 'passive_response_learning', False)
+            passive_lr = getattr(args, 'passive_lr', 1e-5)
+            surprise_threshold = getattr(args, 'surprise_threshold', 0.5)
 
             print("\nhierarchos: ", end="", flush=True)
             response_ids = []
             _display_buffer = ""  # Buffer last 2 chars to catch trailing JSON close
 
             # 1. PREFILL PASS
+            # Keep unsupervised Hebbian writes off by default. The model trained
+            # around gradient-derived LTM updates from raw_topk_vals, so normal
+            # chat learning should happen through explicit feedback/validation.
+            model.suppress_hebbian = True
             with torch.no_grad():
                 model_input_ids = prompt_ids.cpu() if is_quantized else prompt_ids.to(device)
                 
@@ -727,6 +962,11 @@ def chat(args, device, tokenizer):
                     current_ids = None
 
             # 2. INCREMENTAL GENERATION LOOP
+            # CRITICAL: Suppress Hebbian LTM updates during autoregressive
+            # generation. Each generated token was triggering momentum-amplified
+            # memory updates that compound exponentially, causing the latent
+            # space to bleed (gibberish output after ~10-15 tokens).
+            model.suppress_hebbian = True
             max_new_tokens = getattr(args, 'max_new_tokens', 512)
             if current_ids is not None:
                 with torch.no_grad():
@@ -835,6 +1075,10 @@ def chat(args, device, tokenizer):
                         current_ids = next_token_id
                         total_tokens_generated += 1
 
+            # Leave Hebbian writes suppressed between turns. They are opened
+            # only inside the praise/validation feedback path above.
+            model.suppress_hebbian = True
+
             # Flush display buffer, stripping JSON closing syntax if present
             if _display_buffer:
                 if _display_buffer.endswith('"}'):
@@ -848,6 +1092,16 @@ def chat(args, device, tokenizer):
             # =================================================================
             # C. BUFFER DATA FOR NEXT TURN
             # =================================================================
+            if passive_learning and learning_enabled:
+                perform_ltm_update(
+                    prompt_ids[0],
+                    None,
+                    LTMModule.SRC_USER_INTERACTION,
+                    lr_override=passive_lr,
+                    silent=True,
+                    learn_input_tokens=True,
+                )
+
             if len(response_ids) > 0:
                 pending_training_data = {
                     'prompt_ids': prompt_ids,
@@ -857,11 +1111,7 @@ def chat(args, device, tokenizer):
                 # =================================================================
                 # D. PASSIVE LEARNING (if enabled)
                 # =================================================================
-                passive_learning = getattr(args, 'passive_learning', False)
-                passive_lr = getattr(args, 'passive_lr', 1e-5)
-                surprise_threshold = getattr(args, 'surprise_threshold', 0.5)
-                
-                if passive_learning and learning_enabled:
+                if passive_response_learning and learning_enabled:
                     # First compute loss WITHOUT updating to check surprise threshold
                     loss_val = perform_ltm_update(
                         pending_training_data['prompt_ids'][0],
@@ -873,8 +1123,10 @@ def chat(args, device, tokenizer):
                         compute_only=True  # Only compute, don't update yet
                     )
                     
-                    # Only perform actual update if loss exceeds threshold
-                    if loss_val is not None and loss_val > surprise_threshold:
+                    quality_ok, quality_reason = passive_response_quality(response_ids)
+
+                    # Only learn self-generated text when it is low-surprise and non-degenerate.
+                    if loss_val is not None and loss_val <= surprise_threshold and quality_ok:
                         perform_ltm_update(
                             pending_training_data['prompt_ids'][0],
                             pending_training_data['response_ids'],
@@ -884,7 +1136,20 @@ def chat(args, device, tokenizer):
                             silent=True,
                             compute_only=False  # Actually update
                         )
-                        print(f"[Passive LTM update | Loss: {loss_val:.3f} > {surprise_threshold:.2f} threshold]")
+                        print(f"[Passive response LTM update | Loss: {loss_val:.3f} <= {surprise_threshold:.2f}]")
+                    elif loss_val is not None:
+                        if loss_val > surprise_threshold:
+                            print(f"[Passive response LTM skipped | Loss: {loss_val:.3f} > {surprise_threshold:.2f}]")
+                        else:
+                            print(f"[Passive response LTM skipped | {quality_reason} | Loss: {loss_val:.3f}]")
+
+            # --- LTM State Health: Reset momentum and log norms ---
+            # Momentum is an optimizer-like transient. Do not carry it across
+            # conversation turns, even when fast_vals are intentionally retained.
+            if ltm_state is not None and len(ltm_state) >= 2:
+                ltm_state = (ltm_state[0], torch.zeros_like(ltm_state[1]), *ltm_state[2:])
+                fv_norm = ltm_state[0].float().norm().item()
+                print(f"[LTM State | fast_vals norm: {fv_norm:.6e} | momentum reset]")
 
     except KeyboardInterrupt:
         print("\n\n[Ctrl+C detected. Exiting chat.]")
@@ -936,6 +1201,9 @@ def chat(args, device, tokenizer):
                             print("Invalid input.")
                     except EOFError:
                         print("\nEOF detected. Assuming 'no' for saving.")
+                        break
+                    except KeyboardInterrupt:
+                        print("\nInterrupted. Changes will be discarded. Exiting.")
                         break
 
         elif ltm_has_been_updated:

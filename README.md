@@ -6,6 +6,8 @@
 
 A novel AI architecture that synergistically integrates Google's Titans memory system with a Hierarchical Reasoning Model (HRM) and RWKV linear attention to move beyond the limitations of scale and take a decisive step on the path to AGI.
 
+UPDATE 5/4/2026 CONFIRMED TO NOW WORK ON NVIDIA HARDWARE FOR TRAINING!! UPDATE YOUR LOCAL REPO TO THE CURRENT STATE! NEW DOCUMENTATION AND RELEASE COMING SOON!
+
 -----
 
 ### 🚀 **New in v0.18: The "RWKV v8 & CUDA Datacenter" Update**

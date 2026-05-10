@@ -389,6 +389,44 @@ def test_chunked_lm_loss_matches_full_logits_objective_and_gradients():
     assert torch.allclose(model.lm_head.weight.grad, full_head_grad, atol=1e-6)
 
 
+def test_training_forward_can_skip_logits_while_preserving_ltm_gradients():
+    torch.manual_seed(28)
+    cfg = _config()
+    cfg.vocab_size = 257
+    cfg.z_loss_weight = 1e-4
+    cfg.cuda_loss_chunk_rows = 5
+    model = HierarchosCore(cfg)
+    model.train()
+
+    input_ids = torch.tensor([[21, 22, 23, 24, 25]], dtype=torch.long)
+    labels = input_ids.clone()
+
+    outputs = model(
+        input_ids=input_ids,
+        labels=labels,
+        suppress_hebbian=True,
+        return_logits=False,
+        return_topk_values=False,
+    )
+
+    assert outputs["logits"] is None
+    assert outputs["topk_vals"] is None
+    assert outputs["loss"] is not None
+
+    for value_tensor in outputs["raw_topk_vals"]:
+        if value_tensor.requires_grad:
+            value_tensor.retain_grad()
+
+    outputs["loss"].backward()
+    grad_norm = sum(
+        value_tensor.grad.abs().sum().item()
+        for value_tensor in outputs["raw_topk_vals"]
+        if value_tensor.grad is not None
+    )
+
+    assert grad_norm > 0
+
+
 def test_inplace_ltm_update_accumulates_deltas_like_state_delta():
     torch.manual_seed(29)
     ltm = LTMModule(n_slots=6, key_dim=4, val_dim=4, momentum=0.0, wd=0.0, forget_rate=0.0)

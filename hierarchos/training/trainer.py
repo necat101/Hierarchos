@@ -139,6 +139,10 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
     # uses .item(); doing it after the CUDA transfer serializes the GPU once per
     # chunk on long sequences.
     chunk_plan = compute_chunk_training_weights(full_labels, full_attention_mask, chunk_size)
+    real_tokens_in_batch = (
+        int(full_attention_mask.sum().item())
+        if full_attention_mask is not None else int(B * T)
+    )
     full_input_ids = full_input_ids.to(device, non_blocking=_nb)
     if full_attention_mask is not None: full_attention_mask = full_attention_mask.to(device, non_blocking=_nb)
     full_labels = full_labels.to(device, non_blocking=_nb)
@@ -392,6 +396,9 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
             'loss': torch.tensor(total_loss),
             'ponder_cost': torch.tensor(total_ponder) if total_ponder > 0 else None,
             'commitment_cost': torch.tensor(total_commit) if total_commit > 0 else None,
+            'seq_len': T,
+            'real_tokens': real_tokens_in_batch,
+            'chunks_processed': chunks_processed,
         }
         
         next_states = (h_state, l_state, prev_ctx, target_ctx, drift_state, ltm_state)
@@ -716,6 +723,10 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                     postfix["ponder"] = f"{outputs['ponder_cost'].item():.2f}"
                 if outputs.get('commitment_cost') is not None:
                     postfix["commit"] = f"{outputs['commitment_cost'].item():.2e}"
+                if outputs.get('seq_len') is not None:
+                    postfix["T"] = outputs['seq_len']
+                if outputs.get('real_tokens') is not None:
+                    postfix["tok"] = outputs['real_tokens']
                 if scheduler:
                     postfix["lr"] = f"{scheduler.get_last_lr()[0]:.2e}"
                 pbar.set_postfix(postfix)

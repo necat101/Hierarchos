@@ -260,50 +260,6 @@ class HierarchosCore(nn.Module):
             print(f"Warning: Compilation failed! Falling back to eager mode. {e}")
             self.config.compile = False
 
-    def _compute_cuda_chunked_lm_loss(self, final: torch.Tensor, labels: torch.Tensor,
-                                      z_loss_weight: float) -> torch.Tensor:
-        """
-        CUDA-only training loss that avoids materializing [B, T, vocab] logits.
-
-        CPU keeps the full-logits path below because dense row-major work is fast
-        there and it preserves the original debug-friendly behavior.
-        """
-        device = final.device
-        shift_hidden = final[:, :-1, :].contiguous().view(-1, final.shape[-1])
-        shift_labels = labels[:, 1:].contiguous().view(-1)
-        valid_weight = (shift_labels != -100).to(dtype=torch.float32)
-        valid_count = valid_weight.sum()
-
-        chunk_rows = int(getattr(self.config, "cuda_loss_chunk_rows", 2048))
-        chunk_rows = max(1, chunk_rows)
-        ce_sum = torch.zeros((), device=device, dtype=torch.float32)
-        z_sum = torch.zeros((), device=device, dtype=torch.float32)
-
-        for start in range(0, shift_hidden.shape[0], chunk_rows):
-            end = min(start + chunk_rows, shift_hidden.shape[0])
-            logits_chunk = self.lm_head(shift_hidden[start:end]).float()
-            logits_chunk = torch.clamp(logits_chunk, min=-30.0, max=30.0)
-            labels_chunk = shift_labels[start:end]
-            ce_sum = ce_sum + F.cross_entropy(
-                logits_chunk,
-                labels_chunk,
-                ignore_index=-100,
-                reduction="sum",
-            )
-
-            if z_loss_weight > 0:
-                weight_chunk = valid_weight[start:end]
-                z_terms = torch.logsumexp(logits_chunk, dim=-1).pow(2)
-                z_sum = z_sum + (z_terms * weight_chunk).sum()
-
-        denom = valid_count.clamp_min(1.0)
-        loss = ce_sum / denom
-        if z_loss_weight > 0:
-            loss = loss + (z_sum / denom) * z_loss_weight
-
-        zero_loss = final.sum() * 0.0
-        return torch.where(valid_count > 0, loss, zero_loss)
-
     def forward(self, input_ids, attention_mask=None, labels=None, 
                 h_state=None, l_state=None, 
                 prev_context=None, target_context=None,
@@ -598,38 +554,26 @@ class HierarchosCore(nn.Module):
         # 5. FINAL OUTPUTS
         # ==================================================================
         final = self.out_norm(torch.stack(final_embs, dim=1))
-        use_cuda_chunked_loss = bool(
-            labels is not None
-            and self.training
-            and device.type == 'cuda'
-            and getattr(self.config, 'cuda_chunked_lm_head', True)
-        )
-        logits = None if use_cuda_chunked_loss else self.lm_head(final)
+        logits = self.lm_head(final)
         
-        if logits is not None and (torch.isnan(logits).any() or torch.isinf(logits).any()):
+        if torch.isnan(logits).any() or torch.isinf(logits).any():
             print("WARNING: NaN/Inf detected in logits. Replacing with zeros and clamping...")
             logits = torch.nan_to_num(logits, nan=0.0, posinf=30.0, neginf=-30.0)
         
-        if logits is not None:
-            logits = torch.clamp(logits, min=-30.0, max=30.0)
+        logits = torch.clamp(logits, min=-30.0, max=30.0)
 
         loss = None
         ponder_cost_out = None
         commitment_cost_out = None
 
         if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
+            
             valid_mask = shift_labels != -100
-            if use_cuda_chunked_loss:
-                loss = self._compute_cuda_chunked_lm_loss(
-                    final,
-                    labels,
-                    getattr(self.config, 'z_loss_weight', 1e-4),
-                )
-            elif not valid_mask.any():
+            if not valid_mask.any():
                 loss = torch.tensor(0.0, device=device, requires_grad=True)
             else:
-                shift_logits = logits[..., :-1, :].contiguous()
                 flat_logits = shift_logits.view(-1, self.config.vocab_size).float()
                 flat_labels = shift_labels.view(-1)
                 

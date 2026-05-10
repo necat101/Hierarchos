@@ -595,10 +595,13 @@ class HierarchosCore(nn.Module):
                     with torch.amp.autocast(device_type=_zloss_device, enabled=False):
                         valid_mask_flat = flat_labels != -100
                         if device.type == 'cuda':
-                            valid_weight = valid_mask_flat.to(dtype=flat_logits.dtype)
-                            valid_count = valid_weight.sum().clamp_min(1.0)
-                            z_terms = torch.logsumexp(flat_logits, dim=-1).pow(2)
-                            z_loss = ((z_terms * valid_weight).sum() / valid_count) * z_loss_weight
+                            # CUDA path: compact to supervised rows only. The previous
+                            # branchless masking avoided masked_scatter_ but did a
+                            # logsumexp over every padded/prompt row, which explodes on
+                            # long batches. index_select keeps gradients safe and bounded.
+                            valid_idx = valid_mask_flat.nonzero(as_tuple=False).flatten()
+                            valid_logits = flat_logits.index_select(0, valid_idx)
+                            z_loss = torch.logsumexp(valid_logits, dim=-1).pow(2).mean() * z_loss_weight
                         else:
                             valid_logits = flat_logits[valid_mask_flat]
                             z_loss = torch.logsumexp(valid_logits, dim=-1).pow(2).mean() * z_loss_weight

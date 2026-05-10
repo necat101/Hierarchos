@@ -2,7 +2,7 @@ import torch
 
 from hierarchos import AttrDict, HierarchosCore, LTMModule
 from hierarchos.inference.chat import extract_correction_text, parse_temperature_setting, passive_response_quality
-from hierarchos.training.trainer import compute_chunk_training_weights
+from hierarchos.training.trainer import compute_chunk_training_weights, compute_remaining_update_steps
 
 
 def _config():
@@ -298,3 +298,20 @@ def test_masked_padding_tokens_do_not_change_training_costs():
     assert torch.allclose(out_a["loss"], out_b["loss"], atol=1e-6)
     assert torch.allclose(out_a["ponder_cost"], out_b["ponder_cost"], atol=1e-6)
     assert torch.allclose(out_a["commitment_cost"], out_b["commitment_cost"], atol=1e-6)
+
+
+def test_override_scheduler_counts_only_remaining_mid_epoch_work():
+    assert compute_remaining_update_steps(
+        dataloader_len=2365,
+        accumulation_steps=1,
+        start_epoch=24,
+        total_epochs=27,
+        start_step=1200,
+    ) == 5895
+    assert compute_remaining_update_steps(
+        dataloader_len=2365,
+        accumulation_steps=1,
+        start_epoch=24,
+        total_epochs=27,
+        start_step=0,
+    ) == 7095

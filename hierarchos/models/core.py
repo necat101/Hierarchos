@@ -271,6 +271,8 @@ class HierarchosCore(nn.Module):
         B, T = input_ids.shape
         device = input_ids.device
         allow_hebbian_update = kwargs.pop("allow_hebbian_update", False)
+        return_logits = kwargs.pop("return_logits", True)
+        return_topk_values = kwargs.pop("return_topk_values", True)
         suppress_hebbian = kwargs.pop("suppress_hebbian", getattr(self, "suppress_hebbian", True))
         if allow_hebbian_update:
             suppress_hebbian = False
@@ -439,7 +441,7 @@ class HierarchosCore(nn.Module):
             h_out_real, h_state = self.h_rnn(enc_with_feedback, h_state, timestep=t, deepemb_vec=h_deepemb_vec)
             h_out_real = torch.clamp(h_out_real, min=-100.0, max=100.0)
             
-            if torch.isnan(h_out_real).any() or torch.isinf(h_out_real).any():
+            if getattr(self.config, 'debug_numerics', False) and (torch.isnan(h_out_real).any() or torch.isinf(h_out_real).any()):
                 print(f"WARNING: NaN/Inf detected in h_out_real at step {t}")
             
             step_ponder_cost = torch.zeros(B, device=device, dtype=enc.dtype)
@@ -554,46 +556,57 @@ class HierarchosCore(nn.Module):
         # 5. FINAL OUTPUTS
         # ==================================================================
         final = self.out_norm(torch.stack(final_embs, dim=1))
-        logits = self.lm_head(final)
-        
-        if torch.isnan(logits).any() or torch.isinf(logits).any():
-            print("WARNING: NaN/Inf detected in logits. Replacing with zeros and clamping...")
-            logits = torch.nan_to_num(logits, nan=0.0, posinf=30.0, neginf=-30.0)
-        
-        logits = torch.clamp(logits, min=-30.0, max=30.0)
+        logits = None
 
         loss = None
         ponder_cost_out = None
         commitment_cost_out = None
 
-        if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
+        if labels is not None and not return_logits:
+            loss = self._compute_cuda_chunked_lm_loss(
+                final,
+                labels,
+                getattr(self.config, 'z_loss_weight', 1e-4),
+            )
+        else:
+            logits = self.lm_head(final)
             
-            valid_mask = shift_labels != -100
-            if not valid_mask.any():
-                loss = torch.tensor(0.0, device=device, requires_grad=True)
-            else:
-                flat_logits = shift_logits.view(-1, self.config.vocab_size).float()
-                flat_labels = shift_labels.view(-1)
+            if getattr(self.config, 'debug_numerics', False) and (torch.isnan(logits).any() or torch.isinf(logits).any()):
+                print("WARNING: NaN/Inf detected in logits. Replacing with zeros and clamping...")
+                logits = torch.nan_to_num(logits, nan=0.0, posinf=30.0, neginf=-30.0)
+            
+            logits = torch.clamp(logits, min=-30.0, max=30.0)
+
+            if labels is not None:
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
                 
-                # Base CE Loss computes natively ignoring -100
-                loss = F.cross_entropy(flat_logits, flat_labels)
-                
-                # Z-Loss Regularization built to prevent exploding logits
-                z_loss_weight = getattr(self.config, 'z_loss_weight', 1e-4)
-                if z_loss_weight > 0:
-                    # AMP FIX: Disable autocast for the z-loss block. Boolean indexing
-                    # (flat_logits[valid_mask_flat]) uses masked_scatter_ in its backward
-                    # pass. Under BFloat16 AMP, logsumexp can produce BF16 gradients that
-                    # flow back into the float32 flat_logits via masked_scatter_, crashing
-                    # with "expected self and source to have same dtypes".
-                    _zloss_device = device.type if device.type in ('cuda', 'cpu') else 'cpu'
-                    with torch.amp.autocast(device_type=_zloss_device, enabled=False):
-                        valid_mask_flat = flat_labels != -100
-                        valid_logits = flat_logits[valid_mask_flat]
-                        z_loss = torch.logsumexp(valid_logits, dim=-1).pow(2).mean() * z_loss_weight
-                    loss = loss + z_loss
+                valid_mask = shift_labels != -100
+                if not valid_mask.any():
+                    loss = torch.tensor(0.0, device=device, requires_grad=True)
+                else:
+                    flat_logits = shift_logits.view(-1, self.config.vocab_size).float()
+                    flat_labels = shift_labels.view(-1)
+                    
+                    # Base CE Loss computes natively ignoring -100
+                    loss = F.cross_entropy(flat_logits, flat_labels)
+                    
+                    # Z-Loss Regularization built to prevent exploding logits
+                    z_loss_weight = getattr(self.config, 'z_loss_weight', 1e-4)
+                    if z_loss_weight > 0:
+                        # AMP FIX: Disable autocast for the z-loss block. Boolean indexing
+                        # (flat_logits[valid_mask_flat]) uses masked_scatter_ in its backward
+                        # pass. Under BFloat16 AMP, logsumexp can produce BF16 gradients that
+                        # flow back into the float32 flat_logits via masked_scatter_, crashing
+                        # with "expected self and source to have same dtypes".
+                        _zloss_device = device.type if device.type in ('cuda', 'cpu') else 'cpu'
+                        with torch.amp.autocast(device_type=_zloss_device, enabled=False):
+                            valid_mask_flat = flat_labels != -100
+                            valid_logits = flat_logits[valid_mask_flat]
+                            z_loss = torch.logsumexp(valid_logits, dim=-1).pow(2).mean() * z_loss_weight
+                        loss = loss + z_loss
+
+        if labels is not None:
             
             # Compute auxiliary costs for reporting (trainer handles loss composition)
             def _weighted_aux_mean(costs, weights):
@@ -614,7 +627,7 @@ class HierarchosCore(nn.Module):
             "logits": logits, 
             "ponder_cost": ponder_cost_out, 
             "commitment_cost": commitment_cost_out,
-            "topk_vals": torch.stack(all_topk_vals, dim=1) if all_topk_vals else None, 
+            "topk_vals": torch.stack(all_topk_vals, dim=1) if (return_topk_values and all_topk_vals) else None, 
             "raw_topk_vals": all_topk_vals,
             "topk_idx": torch.stack(all_topk_idx, dim=1) if all_topk_idx else None,
             "h_state": h_state,
@@ -642,8 +655,7 @@ class HierarchosCore(nn.Module):
 
         valid_mask = flat_labels != -100
         valid_count = valid_mask.sum()
-        if valid_count.item() == 0:
-            return torch.zeros((), device=hidden.device, dtype=torch.float32, requires_grad=True)
+        denom = valid_count.clamp_min(1).to(dtype=torch.float32)
 
         chunk_rows = int(getattr(self.config, "cuda_loss_chunk_rows", 0) or 0)
         if chunk_rows <= 0:
@@ -661,13 +673,12 @@ class HierarchosCore(nn.Module):
             total_ce = total_ce + F.cross_entropy(chunk_logits, chunk_labels, reduction="sum")
 
             if z_loss_weight > 0:
-                chunk_valid = chunk_labels != -100
-                if chunk_valid.any():
-                    total_z = total_z + torch.logsumexp(chunk_logits[chunk_valid], dim=-1).pow(2).sum()
+                row_z = torch.logsumexp(chunk_logits, dim=-1).pow(2)
+                total_z = total_z + (row_z * (chunk_labels != -100).to(dtype=row_z.dtype)).sum()
 
-        loss = total_ce / valid_count.to(dtype=torch.float32)
+        loss = total_ce / denom
         if z_loss_weight > 0:
-            loss = loss + (total_z / valid_count.to(dtype=torch.float32)) * z_loss_weight
+            loss = loss + (total_z / denom) * z_loss_weight
         return loss
 
     def prepare_inputs_for_generation(self, input_ids, **kwargs):

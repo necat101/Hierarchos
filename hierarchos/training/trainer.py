@@ -131,9 +131,6 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
     full_input_ids, full_labels, full_attention_mask = trim_trailing_padding(
         full_input_ids, full_labels, full_attention_mask
     )
-    full_input_ids = full_input_ids.to(device, non_blocking=_nb)
-    if full_attention_mask is not None: full_attention_mask = full_attention_mask.to(device, non_blocking=_nb)
-    full_labels = full_labels.to(device, non_blocking=_nb)
     
     # --- [NEW] Track Sequence Poisoning (Parity Fix) ---
     if torch.isnan(full_labels.float()).any():
@@ -180,17 +177,28 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
         if ltm_state is not None: 
             ltm_state = tuple(s.detach() if isinstance(s, torch.Tensor) else s for s in ltm_state)
     
-    # Temporal chunking (critical for RWKV-based models)
+    # Temporal chunking (critical for RWKV-based models). Build this on CPU before
+    # moving labels/masks to CUDA so per-chunk .item() accounting does not sync GPU.
     chunk_size = getattr(args, 'training_chunk_size', 128)
     if chunk_size <= 0 or chunk_size > T: chunk_size = T
     chunk_plan = compute_chunk_training_weights(full_labels, full_attention_mask, chunk_size)
     num_chunks = len(chunk_plan)
+
+    full_input_ids = full_input_ids.to(device, non_blocking=_nb)
+    if full_attention_mask is not None: full_attention_mask = full_attention_mask.to(device, non_blocking=_nb)
+    full_labels = full_labels.to(device, non_blocking=_nb)
     
-    total_loss = 0.0
-    total_ponder = 0.0
-    total_commit = 0.0
+    total_loss = torch.zeros((), device=device, dtype=torch.float32)
+    total_ponder = torch.zeros((), device=device, dtype=torch.float32)
+    total_commit = torch.zeros((), device=device, dtype=torch.float32)
+    has_ponder = False
+    has_commitment = False
     chunks_processed = 0
     final_outputs = None
+    cuda_fast_lm_loss = (
+        device.type == 'cuda'
+        and getattr(args, 'cuda_chunked_lm_loss', True)
+    )
     
     try:
         for chunk_idx, chunk_info in enumerate(chunk_plan):
@@ -215,7 +223,9 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                     input_ids=input_ids, attention_mask=attention_mask, labels=labels,
                     h_state=h_state, l_state=l_state, prev_context=prev_ctx,
                     target_context=target_ctx, drift_state=drift_state, ltm_memory_state=ltm_state,
-                    global_pos_offset=start_t
+                    global_pos_offset=start_t,
+                    return_logits=not cuda_fast_lm_loss,
+                    return_topk_values=False
                 )
                 
                 # LTM fast-memory update needs gradients from the exact tensors used
@@ -358,11 +368,13 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                 drift_state = torch.clamp(outputs['drift_state'].detach(), min=-5.0, max=5.0)
             
             # Accumulate for display
-            total_loss += ce_loss.item() * label_ratio
+            total_loss = total_loss + ce_loss.detach().float() * label_ratio
             if ponder_cost is not None: 
-                total_ponder += ponder_cost.item() * token_ratio
+                total_ponder = total_ponder + ponder_cost.detach().float() * token_ratio
+                has_ponder = True
             if commitment_cost is not None: 
-                total_commit += commitment_cost.item() * token_ratio
+                total_commit = total_commit + commitment_cost.detach().float() * token_ratio
+                has_commitment = True
             
             chunks_processed += 1
             # final_outputs = outputs # REMOVED: Memory Leak Fix
@@ -385,9 +397,9 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
         # Return averaged metrics for display
         # Since we already weighted by chunk_ratio, these are correct averages
         avg_outputs = {
-            'loss': torch.tensor(total_loss),
-            'ponder_cost': torch.tensor(total_ponder) if total_ponder > 0 else None,
-            'commitment_cost': torch.tensor(total_commit) if total_commit > 0 else None,
+            'loss': total_loss.detach().cpu(),
+            'ponder_cost': total_ponder.detach().cpu() if has_ponder else None,
+            'commitment_cost': total_commit.detach().cpu() if has_commitment else None,
         }
         
         next_states = (h_state, l_state, prev_ctx, target_ctx, drift_state, ltm_state)
@@ -465,6 +477,22 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
             args.amp_dtype = 'float16'
             config.amp_dtype = 'float16'
             print("INFO: Using float16 AMP with GradScaler.")
+
+        if getattr(args, 'cuda_chunked_lm_loss', True):
+            loss_chunk_rows = int(getattr(args, 'cuda_loss_chunk_rows', 0) or 0)
+            if loss_chunk_rows <= 0:
+                if gpu_mem >= 48:
+                    loss_chunk_rows = 8192
+                elif gpu_mem >= 16:
+                    loss_chunk_rows = 4096
+                else:
+                    loss_chunk_rows = 2048
+                args.cuda_loss_chunk_rows = loss_chunk_rows
+            config.cuda_loss_chunk_rows = loss_chunk_rows
+            config.cuda_chunked_lm_loss = True
+            print(f"INFO: CUDA chunked LM loss enabled ({loss_chunk_rows} rows/chunk, logits omitted in train_step).")
+        else:
+            config.cuda_chunked_lm_loss = False
 
         # Multi-GPU info
         num_gpus = torch.cuda.device_count()

@@ -12,7 +12,15 @@ from .training.datasets import (
     create_dataloader_pt_chunked,
     create_map_style_dataloader
 )
-from .utils.device import pick_device, set_threads, is_directml_device, setup_msvc_environment
+from .utils.device import (
+    configure_torch_runtime,
+    cuda_diagnostics,
+    describe_device,
+    pick_device,
+    set_threads,
+    is_directml_device,
+    setup_msvc_environment,
+)
 from .utils.checkpoint import AttrDict, load_full_model_with_config, save_checkpoint_safely
 from .inference.chat import chat
 

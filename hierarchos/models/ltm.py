@@ -53,23 +53,187 @@ class LTMModule(nn.Module):
         # <<< NEW: Online Learning Accumulator >>>
         self.register_buffer("ltm_deltas", torch.zeros(n_slots, val_dim), persistent=False)
         self.accumulate_deltas = False
+        # Internal architecture switch: CUDA uses gather/scatter-heavy math,
+        # CPU keeps the dense one-hot path that benchmarks well on small tensors.
+        self._cuda_friendly_math = True
 
     def reset_working_memory(self):
         """Zeros out the Fast State (Working Memory) and associated momentum buffers."""
-        device = self.fast_vals.device
-        zeros_vals = torch.zeros(self.fast_vals.shape, dtype=self.fast_vals.dtype, device='cpu').to(device)
-        self.fast_vals.copy_(zeros_vals)
-        self._mom_vals.copy_(zeros_vals)
-        
-        zeros_ts = torch.zeros(self.timestamps.shape, dtype=self.timestamps.dtype, device='cpu').to(device)
-        self.timestamps.copy_(zeros_ts)
-        
-        sources_init = torch.full(self.sources.shape, self.SRC_UNKNOWN, dtype=self.sources.dtype, device='cpu').to(device)
-        self.sources.copy_(sources_init)
+        self.fast_vals.zero_()
+        self._mom_vals.zero_()
+        self.timestamps.zero_()
+        self.sources.fill_(self.SRC_UNKNOWN)
 
     def get_effective_memory(self):
         """Returns the combined memory (Slow + Fast)."""
         return self.vals + self.fast_vals
+
+    def _use_cuda_math(self, tensor: torch.Tensor) -> bool:
+        return bool(self._cuda_friendly_math and tensor.device.type == "cuda")
+
+    @staticmethod
+    def _expand_slot_tensor_for_index(tensor: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+        """Broadcast a (..., slots, value_dim) tensor to index leading dims."""
+        if tensor.dim() == 2:
+            return tensor
+        index_leading = tuple(index.shape[:-1])
+        tensor_leading = tuple(tensor.shape[:-2])
+        if len(tensor_leading) > len(index_leading):
+            raise ValueError("LTM memory has more leading dimensions than top-k indices")
+        view_shape = tensor_leading + (1,) * (len(index_leading) - len(tensor_leading)) + tuple(tensor.shape[-2:])
+        expand_shape = index_leading + tuple(tensor.shape[-2:])
+        return tensor.reshape(view_shape).expand(expand_shape)
+
+    @staticmethod
+    def _expand_slot_metadata_for_index(tensor: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+        """Broadcast a (..., slots) metadata tensor to index leading dims."""
+        if tensor.dim() == 1:
+            return tensor
+        index_leading = tuple(index.shape[:-1])
+        tensor_leading = tuple(tensor.shape[:-1])
+        if len(tensor_leading) > len(index_leading):
+            raise ValueError("LTM metadata has more leading dimensions than top-k indices")
+        view_shape = tensor_leading + (1,) * (len(index_leading) - len(tensor_leading)) + (tensor.shape[-1],)
+        expand_shape = index_leading + (tensor.shape[-1],)
+        return tensor.reshape(view_shape).expand(expand_shape)
+
+    def _gather_topk_cuda(self, idx_clamped: torch.LongTensor, effective_memory: torch.Tensor,
+                          current_timestamps: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        effective_memory = effective_memory.float()
+        if effective_memory.dim() == 2:
+            flat_idx = idx_clamped.reshape(-1)
+            gathered_vals = effective_memory.index_select(0, flat_idx)
+            gathered_vals = gathered_vals.view(*idx_clamped.shape, effective_memory.shape[-1])
+        else:
+            memory_view = self._expand_slot_tensor_for_index(effective_memory, idx_clamped)
+            gather_idx = idx_clamped.unsqueeze(-1).expand(*idx_clamped.shape, memory_view.shape[-1])
+            gathered_vals = torch.gather(memory_view, dim=-2, index=gather_idx)
+
+        current_timestamps = current_timestamps.to(device=idx_clamped.device, dtype=torch.float32)
+        if current_timestamps.dim() == 1:
+            ts_retrieved = current_timestamps.index_select(0, idx_clamped.reshape(-1))
+            ts_retrieved = ts_retrieved.view_as(idx_clamped)
+        else:
+            ts_view = self._expand_slot_metadata_for_index(current_timestamps, idx_clamped)
+            ts_retrieved = torch.gather(ts_view, dim=-1, index=idx_clamped)
+
+        return gathered_vals.contiguous(), ts_retrieved
+
+    def _inner_update_flat_cuda(self, topk_idx: torch.LongTensor, grads_tensor: torch.Tensor,
+                                current_lr: float, timestamp: float, source: int,
+                                tokens_covered: int, curr_fast: torch.Tensor,
+                                curr_mom: torch.Tensor, timestamps: Optional[torch.Tensor],
+                                sources: Optional[torch.Tensor],
+                                inplace: bool) -> Tuple[torch.Tensor, torch.Tensor]:
+        if grads_tensor is None:
+            return curr_fast, curr_mom
+
+        device = curr_fast.device
+        topk_idx = topk_idx.to(device=device, dtype=torch.long)
+        grads_tensor = grads_tensor.to(device=device).float()
+        valid_mask = topk_idx >= 0
+        if not valid_mask.any():
+            return curr_fast, curr_mom
+
+        curr_fast = curr_fast.float() if inplace else curr_fast.float().clone()
+        curr_mom = curr_mom.float() if inplace else curr_mom.float().clone()
+
+        idx_flat = topk_idx[valid_mask].reshape(-1)
+        grads_flat = grads_tensor[valid_mask].reshape(-1, self.vals.size(1)).contiguous()
+
+        num_slots = self.vals.size(0)
+        counts = torch.zeros(num_slots, dtype=torch.float32, device=device)
+        counts.index_add_(0, idx_flat, torch.ones_like(idx_flat, dtype=torch.float32))
+
+        slot_grads = torch.zeros(num_slots, self.vals.size(1), dtype=torch.float32, device=device)
+        slot_grads.index_add_(0, idx_flat, grads_flat)
+        slot_grads = slot_grads / (counts.unsqueeze(-1) + 1e-8)
+        nonzero_mask = counts > 0
+
+        curr_mom.mul_(self.momentum).add_(slot_grads)
+        curr_mom.clamp_(min=-50.0, max=50.0)
+
+        if tokens_covered is None:
+            tokens_covered = self.reference_chunk_len
+        retention_rate = (1.0 - self.forget_rate) ** (tokens_covered / float(self.reference_chunk_len))
+
+        update_step = (curr_mom + self.weight_decay * curr_fast).mul(-current_lr)
+        curr_fast.mul_(retention_rate)
+        update_step = torch.where(nonzero_mask.unsqueeze(-1), update_step, torch.zeros_like(update_step))
+        curr_fast.add_(update_step)
+        curr_fast.clamp_(min=-50.0, max=50.0)
+
+        if getattr(self, "accumulate_deltas", False):
+            self.ltm_deltas.add_(update_step)
+
+        target_timestamps = timestamps if timestamps is not None else self.timestamps
+        target_sources = sources if sources is not None else self.sources
+        with torch.no_grad():
+            target_timestamps = target_timestamps.to(device=device)
+            target_sources = target_sources.to(device=device)
+            target_timestamps.masked_fill_(nonzero_mask, float(timestamp))
+            target_sources.masked_fill_(nonzero_mask, int(source))
+
+        return curr_fast, curr_mom
+
+    def _inner_update_batched_cuda(self, topk_idx: torch.LongTensor, grads_tensor: torch.Tensor,
+                                   current_lr: float, timestamp: float, source: int,
+                                   tokens_covered: int, curr_fast: torch.Tensor,
+                                   curr_mom: torch.Tensor, timestamps: Optional[torch.Tensor],
+                                   sources: Optional[torch.Tensor],
+                                   inplace: bool) -> Tuple[torch.Tensor, torch.Tensor]:
+        if grads_tensor is None:
+            return curr_fast, curr_mom
+
+        device = curr_fast.device
+        topk_idx = topk_idx.to(device=device, dtype=torch.long)
+        grads_tensor = grads_tensor.to(device=device).float()
+        valid_mask = topk_idx >= 0
+        if not valid_mask.any():
+            return curr_fast, curr_mom
+
+        curr_fast = curr_fast.float() if inplace else curr_fast.float().clone()
+        curr_mom = curr_mom.float() if inplace else curr_mom.float().clone()
+
+        if tokens_covered is None:
+            tokens_covered = self.reference_chunk_len
+        retention_rate = (1.0 - self.forget_rate) ** (tokens_covered / float(self.reference_chunk_len))
+
+        batch_size, num_slots, val_dim = curr_fast.shape
+        idx_safe = topk_idx.clamp(min=0)
+        flat_idx = idx_safe.reshape(batch_size, -1)
+        valid_flat = valid_mask.reshape(batch_size, -1).float()
+        grads_flat = grads_tensor.reshape(batch_size, -1, val_dim) * valid_flat.unsqueeze(-1)
+
+        counts = torch.zeros(batch_size, num_slots, dtype=torch.float32, device=device)
+        counts.scatter_add_(1, flat_idx, valid_flat)
+
+        slot_grads = torch.zeros(batch_size, num_slots, val_dim, dtype=torch.float32, device=device)
+        slot_idx = flat_idx.unsqueeze(-1).expand(-1, -1, val_dim)
+        slot_grads.scatter_add_(1, slot_idx, grads_flat)
+        slot_grads = slot_grads / (counts.unsqueeze(-1) + 1e-8)
+        nonzero_mask = counts > 0
+
+        curr_mom.mul_(self.momentum).add_(slot_grads)
+        curr_mom.clamp_(min=-50.0, max=50.0)
+
+        update_step = (curr_mom + self.weight_decay * curr_fast).mul(-current_lr)
+        curr_fast.mul_(retention_rate)
+        update_step = torch.where(nonzero_mask.unsqueeze(-1), update_step, torch.zeros_like(update_step))
+        curr_fast.add_(update_step)
+        curr_fast.clamp_(min=-50.0, max=50.0)
+
+        if getattr(self, "accumulate_deltas", False):
+            self.ltm_deltas.add_(update_step.sum(dim=0))
+
+        if timestamps is not None and sources is not None:
+            with torch.no_grad():
+                timestamps = timestamps.to(device=device)
+                sources = sources.to(device=device)
+                timestamps.masked_fill_(nonzero_mask, float(timestamp))
+                sources.masked_fill_(nonzero_mask, int(source))
+
+        return curr_fast, curr_mom
 
     def retrieve_topk(self, queries: torch.Tensor, topk: int = 4, min_timestamp: float = 0.0,
                       source_filter: Optional[int] = None, fast_vals: Optional[torch.Tensor] = None,
@@ -106,9 +270,13 @@ class LTMModule(nn.Module):
                     sim = torch.nan_to_num(sim, nan=-torch.inf, posinf=torch.finfo(sim.dtype).max, neginf=-torch.inf)
                     sim = torch.where(valid_mask, sim, self.neg_inf.to(dtype=sim.dtype))
 
-            num_valid_slots_per_query = sim.isfinite().sum(dim=-1)
-            num_valid_slots = num_valid_slots_per_query.min().item()
-            effective_topk = min(topk, int(num_valid_slots))
+            use_cuda_math = self._use_cuda_math(queries)
+            if use_cuda_math and min_timestamp <= 0.0 and source_filter is None:
+                effective_topk = min(topk, self.vals.shape[0])
+            else:
+                num_valid_slots_per_query = sim.isfinite().sum(dim=-1)
+                num_valid_slots = num_valid_slots_per_query.min().item()
+                effective_topk = min(topk, int(num_valid_slots))
 
             if effective_topk <= 0:
                 query_shape = list(queries.shape)
@@ -127,6 +295,30 @@ class LTMModule(nn.Module):
             
             effective_memory_size = self.vals.shape[0]
             idx_clamped = idx.clamp(min=0, max=effective_memory_size-1)
+
+            if use_cuda_math:
+                weighted_vals, ts_retrieved = self._gather_topk_cuda(
+                    idx_clamped,
+                    effective_memory,
+                    current_timestamps,
+                )
+                if effective_topk < topk:
+                    pad_size = topk - effective_topk
+                    batch_shape_list = list(idx_clamped.shape[:-1])
+
+                    idx_pad = torch.full(batch_shape_list + [pad_size], -1, device=idx.device, dtype=idx.dtype)
+                    idx_ret = torch.cat([idx, idx_pad], dim=-1)
+
+                    vals_pad = torch.zeros(batch_shape_list + [pad_size, weighted_vals.shape[-1]],
+                                           device=weighted_vals.device, dtype=weighted_vals.dtype)
+                    vals_ret = torch.cat([weighted_vals, vals_pad], dim=-2)
+
+                    ts_pad = torch.zeros(batch_shape_list + [pad_size],
+                                         device=ts_retrieved.device, dtype=ts_retrieved.dtype)
+                    ts_ret = torch.cat([ts_retrieved, ts_pad], dim=-1)
+
+                    return vals_ret, idx_ret, ts_ret
+                return weighted_vals, idx, ts_retrieved
             
             num_classes = effective_memory_size
             range_tensor = torch.arange(num_classes, device=idx_clamped.device)
@@ -181,6 +373,20 @@ class LTMModule(nn.Module):
         curr_mom = mom_vals if mom_vals is not None else self._mom_vals
 
         if curr_fast.dim() == 3:
+            if self._use_cuda_math(curr_fast):
+                return self._inner_update_batched_cuda(
+                    topk_idx=topk_idx,
+                    grads_tensor=grads_tensor,
+                    current_lr=current_lr,
+                    timestamp=timestamp,
+                    source=source,
+                    tokens_covered=tokens_covered,
+                    curr_fast=curr_fast,
+                    curr_mom=curr_mom,
+                    timestamps=timestamps,
+                    sources=sources,
+                    inplace=inplace
+                )
             return self._inner_update_batched(
                 topk_idx=topk_idx,
                 grads_tensor=grads_tensor,
@@ -197,6 +403,21 @@ class LTMModule(nn.Module):
         
         if grads_tensor is None: 
             return curr_fast, curr_mom
+
+        if self._use_cuda_math(curr_fast):
+            return self._inner_update_flat_cuda(
+                topk_idx=topk_idx,
+                grads_tensor=grads_tensor,
+                current_lr=current_lr,
+                timestamp=timestamp,
+                source=source,
+                tokens_covered=tokens_covered,
+                curr_fast=curr_fast,
+                curr_mom=curr_mom,
+                timestamps=timestamps,
+                sources=sources,
+                inplace=inplace
+            )
 
         device = curr_fast.device
         valid_mask = topk_idx >= 0

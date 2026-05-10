@@ -78,14 +78,62 @@ def compute_chunk_training_weights(labels: torch.Tensor, attention_mask: torch.T
 
     return chunks
 
+def compute_remaining_update_steps(dataloader_len: int, accumulation_steps: int, start_epoch: int,
+                                   total_epochs: int, start_step: int = 0) -> int:
+    """Count optimizer updates that will actually run after an epoch/mid-epoch resume."""
+    accumulation_steps = max(1, int(accumulation_steps))
+    remaining_epochs_after_current = max(0, int(total_epochs) - int(start_epoch) - 1)
+    remaining_batches = max(0, int(dataloader_len) - int(start_step))
+    remaining_batches += remaining_epochs_after_current * int(dataloader_len)
+    return max(1, remaining_batches // accumulation_steps)
+
+def trim_trailing_padding(input_ids: torch.Tensor, labels: torch.Tensor, attention_mask: torch.Tensor = None):
+    """Remove trailing columns that are padding for the entire batch."""
+    if attention_mask is None:
+        return input_ids, labels, attention_mask
+    if not isinstance(attention_mask, torch.Tensor):
+        return input_ids, labels, attention_mask
+    if input_ids.ndim != 2 or labels.ndim != 2 or attention_mask.ndim != 2:
+        return input_ids, labels, attention_mask
+    if attention_mask.shape[1] != input_ids.shape[1] or labels.shape[1] != input_ids.shape[1]:
+        return input_ids, labels, attention_mask
+
+    active_columns = attention_mask.bool().any(dim=0)
+    if not bool(active_columns.any().item()):
+        return input_ids, labels, attention_mask
+    trim_to = int(active_columns.nonzero(as_tuple=False)[-1].item()) + 1
+    if trim_to >= input_ids.shape[1]:
+        return input_ids, labels, attention_mask
+    return (
+        input_ids[:, :trim_to].contiguous(),
+        labels[:, :trim_to].contiguous(),
+        attention_mask[:, :trim_to].contiguous(),
+    )
+
+def set_dataloader_epoch(dataloader, epoch: int):
+    """Let length-grouped or distributed samplers reshuffle per epoch."""
+    for sampler in (
+        getattr(dataloader, "batch_sampler", None),
+        getattr(dataloader, "sampler", None),
+        getattr(dataloader, "dataset", None),
+    ):
+        set_epoch = getattr(sampler, "set_epoch", None)
+        if callable(set_epoch):
+            set_epoch(epoch)
+
 def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, running_states):
     """Training step with temporal chunking to match original hierarchos.py."""
     device = next(model.parameters()).device
     _nb = (device.type == 'cuda')  # non_blocking for async CUDA transfer
-    full_input_ids = batch['input_ids'].to(device, non_blocking=_nb)
+    full_input_ids = batch['input_ids']
     full_attention_mask = batch.get('attention_mask')
+    full_labels = batch['labels']
+    full_input_ids, full_labels, full_attention_mask = trim_trailing_padding(
+        full_input_ids, full_labels, full_attention_mask
+    )
+    full_input_ids = full_input_ids.to(device, non_blocking=_nb)
     if full_attention_mask is not None: full_attention_mask = full_attention_mask.to(device, non_blocking=_nb)
-    full_labels = batch['labels'].to(device, non_blocking=_nb)
+    full_labels = full_labels.to(device, non_blocking=_nb)
     
     # --- [NEW] Track Sequence Poisoning (Parity Fix) ---
     if torch.isnan(full_labels.float()).any():
@@ -590,13 +638,20 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     # Compile
     model.compile()
 
+    start_step = checkpoint.get('mid_epoch_step', 0) if checkpoint else 0
+
     # Scheduler
     # When override_scheduling is used during resume, calculate T_max based on REMAINING epochs
     # so that the LR decays properly to min_lr by the final epoch.
     if getattr(args, 'override_scheduling', False) and args.resume_from_ckpt:
-        remaining_epochs = args.epochs - start_epoch
-        num_update_steps = (dataloader_len // args.accumulation_steps) * remaining_epochs
-        print(f"INFO: --override-scheduling: Calculating LR schedule for REMAINING {remaining_epochs} epochs ({num_update_steps} update steps)")
+        num_update_steps = compute_remaining_update_steps(
+            dataloader_len,
+            args.accumulation_steps,
+            start_epoch,
+            args.epochs,
+            start_step,
+        )
+        print(f"INFO: --override-scheduling: Calculating LR schedule for remaining work ({num_update_steps} update steps)")
     else:
         num_update_steps = (dataloader_len // args.accumulation_steps) * args.epochs
     
@@ -605,8 +660,6 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         if args.resume_from_ckpt and not getattr(args, 'override_scheduling', False) and 'scheduler_state_dict' in checkpoint:
             try: scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             except: pass
-    start_step = checkpoint.get('mid_epoch_step', 0) if checkpoint else 0
-    
     # --- Evaluation Confirmation ---
     eval_tasks = getattr(args, 'eval_tasks', None)
     if eval_tasks:
@@ -616,6 +669,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     # --- Training Loop ---
     for epoch in range(start_epoch, args.epochs):
         model.train()
+        set_dataloader_epoch(dataloader, epoch)
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}")
         
         # [NEW] Restore running_states if resuming mid-epoch
@@ -640,6 +694,9 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
             if epoch == start_epoch and step < start_step:
                 if step == start_step - 1: # Print only once when we are about to start processing
                     print(f"INFO: Resuming from mid-epoch step {start_step}...")
+                continue
+
+            if batch is None:
                 continue
             
             # --- FIXED: Sequence-Level State Reset ---
@@ -977,6 +1034,7 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
 
     for epoch in range(start_epoch, args.epochs):
         print(f"\n--- LoRA Finetune Epoch {epoch + 1} / {args.epochs} ---")
+        set_dataloader_epoch(dataloader, epoch)
         pbar = tqdm(dataloader, desc=f"Finetune Epoch {epoch + 1}")
         total_loss = 0.0
         total_ponder_cost = 0.0
@@ -995,11 +1053,16 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
             if batch is None:
                 continue
 
-            input_ids = batch["input_ids"].to(device)
+            input_ids = batch["input_ids"]
             attention_mask = batch.get("attention_mask")
+            labels = batch["labels"]
+            input_ids, labels, attention_mask = trim_trailing_padding(
+                input_ids, labels, attention_mask
+            )
+            input_ids = input_ids.to(device)
             if attention_mask is not None:
                 attention_mask = attention_mask.to(device)
-            labels = batch["labels"].to(device)
+            labels = labels.to(device)
 
             autocast_device_type = 'cpu' if is_directml_device(device) else device.type
             with autocast(device_type=autocast_device_type, dtype=amp_dtype, enabled=use_amp):

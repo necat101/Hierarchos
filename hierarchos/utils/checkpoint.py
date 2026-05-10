@@ -1,3 +1,4 @@
+import json
 import os
 import torch
 import torch.nn as nn
@@ -31,38 +32,77 @@ class AttrDict(dict):
         super(AttrDict, self).__init__(*args, **kwargs)
         self.__dict__ = self
 
+def _resolve_weights_path(model_path: str) -> Tuple[str, str]:
+    """Resolve a Hierarchos model source to (weights_path, model_dir)."""
+    if not model_path:
+        raise FileNotFoundError("No model path was provided.")
+
+    resolved = os.path.abspath(os.path.expanduser(model_path))
+    if os.path.isfile(resolved):
+        if not resolved.lower().endswith(".pt"):
+            raise FileNotFoundError(f"Model file must be a .pt checkpoint: {resolved}")
+        return resolved, os.path.dirname(resolved)
+
+    if not os.path.isdir(resolved):
+        raise FileNotFoundError(f"Model path not found: {model_path}")
+
+    preferred = ("hierarchos.pt", "model.pt", "hierarchos_final.pt")
+    for name in preferred:
+        candidate = os.path.join(resolved, name)
+        if os.path.exists(candidate):
+            return candidate, resolved
+
+    pt_files = sorted(
+        f for f in os.listdir(resolved)
+        if f.lower().endswith(".pt")
+    )
+    if pt_files:
+        return os.path.join(resolved, pt_files[0]), resolved
+
+    raise FileNotFoundError(f"Model weights file not found in '{model_path}'")
+
+
+def _load_json_config(model_dir: str) -> Optional[Dict[str, Any]]:
+    for name in ("hierarchos_config.json", "config.json"):
+        path = os.path.join(model_dir, name)
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            return dict(loaded)
+    return None
+
+
 def load_full_model_with_config(model_path: str, device):
-    """Loads a full-precision model and its config from a directory."""
-    MODEL_WEIGHTS_NAME = "hierarchos.pt"
-    weights_path = os.path.join(model_path, MODEL_WEIGHTS_NAME)
-    if not os.path.exists(weights_path):
-        # Try finding any .pt file if hierarchos.pt is missing
-        pt_files = [f for f in os.listdir(model_path) if f.endswith('.pt')]
-        if pt_files:
-            weights_path = os.path.join(model_path, pt_files[0])
-        else:
-            raise FileNotFoundError(f"Model weights file not found in '{model_path}'")
+    """Loads a full-precision model from a directory or direct .pt file."""
+    weights_path, model_dir = _resolve_weights_path(model_path)
 
     try:
         # Compatibility with different PyTorch versions and custom classes
         try:
             from torch.serialization import safe_globals
             with safe_globals([AttrDict]):
-                checkpoint = torch.load(weights_path, map_location=device, weights_only=True)
+                checkpoint = torch.load(weights_path, map_location="cpu", weights_only=True)
         except (ImportError, AttributeError):
-            checkpoint = torch.load(weights_path, map_location=device)
+            checkpoint = torch.load(weights_path, map_location="cpu")
             
-        if 'config' not in checkpoint:
+        if not isinstance(checkpoint, dict) or ('config' not in checkpoint and 'model_state_dict' not in checkpoint):
             # Fallback for old style checkpoints
-            checkpoint = torch.load(weights_path, map_location=device, weights_only=False)
+            checkpoint = torch.load(weights_path, map_location="cpu", weights_only=False)
 
     except Exception as e:
         raise RuntimeError(f"Failed to load checkpoint: {e}")
 
-    if 'config' not in checkpoint:
-        raise ValueError("Model config not found in checkpoint.")
+    if not isinstance(checkpoint, dict):
+        raise ValueError("Unsupported checkpoint format: expected a dict-like .pt file.")
 
-    config_dict = checkpoint['config']
+    config_dict = checkpoint.get('config') or _load_json_config(model_dir)
+    if config_dict is None:
+        raise ValueError(
+            "Model config not found. Include 'config' in the checkpoint or add "
+            "hierarchos_config.json next to the .pt file."
+        )
+
+    config_dict = dict(config_dict)
     if 'model_type' not in config_dict: config_dict['model_type'] = 'hierarchos'
     config = AttrDict(config_dict)
 
@@ -71,7 +111,13 @@ def load_full_model_with_config(model_path: str, device):
     
     # Strip _orig_mod. prefix from compiled model checkpoints (torch.compile adds this)
     # Without this, strict=False silently drops ALL weights from compiled checkpoints
-    state_dict = sanitize_model_state_dict(checkpoint['model_state_dict'], reset_transient_ltm=False)
+    if 'model_state_dict' in checkpoint:
+        state_source = checkpoint['model_state_dict']
+    else:
+        state_source = {k: v for k, v in checkpoint.items() if torch.is_tensor(v)}
+        if not state_source:
+            raise ValueError("Model state_dict not found in checkpoint.")
+    state_dict = sanitize_model_state_dict(state_source, reset_transient_ltm=False)
     
     # Handle qproj shape mismatch (Old -> New Architecture)
     if 'qproj.weight' in state_dict:

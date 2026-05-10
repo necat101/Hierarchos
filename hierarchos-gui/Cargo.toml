@@ -1,0 +1,25 @@
+[package]
+name = "hierarchos-gui"
+version = "0.1.0"
+edition = "2021"
+description = "A premium GUI for the Hierarchos architecture — RWKV + Titans LTM + Hierarchical Reasoning"
+
+[dependencies]
+eframe = { version = "0.31", default-features = true, features = ["persistence"] }
+egui = "0.31"
+egui_extras = { version = "0.31", features = ["image"] }
+egui_plot = "0.31"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "process", "io-util", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+rfd = "0.15"
+reqwest = { version = "0.12", features = ["json", "stream", "blocking"] }
+directories = "6"
+sha2 = "0.10"
+bytes = "1"
+urlencoding = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

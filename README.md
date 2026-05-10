@@ -1,21 +1,25 @@
 -----
 
-# Hierarchos v0.18 (alpha): A Linear-Complexity Hierarchical Agent with RWKV v8 & Titans Memory
+# Hierarchos v0.19 (alpha): The Optimization and GUI Update
 
-**🧬 The "RWKV v8" Update** — Hierarchos has been upgraded from GRU-based cells to a full RWKV v8 backbone with linear attention, replacing O(T²) bottlenecks with O(1) inference cost. Combined with the Titans Neural Memory and a new CUDA auto-optimization pipeline, Hierarchos is now ready for datacenter-scale AGI training.
+**The "Optimization and GUI Update"** — Hierarchos now keeps its CPU-friendly math paths intact while automatically switching hot LTM memory operations to GPU-friendly gather/scatter math on CUDA. This release also highlights the Windows GUI bundle workflow for easier local inference and experimentation.
 
 A novel AI architecture that synergistically integrates Google's Titans memory system with a Hierarchical Reasoning Model (HRM) and RWKV linear attention to move beyond the limitations of scale and take a decisive step on the path to AGI.
 
-UPDATE 5/4/2026 CONFIRMED TO NOW WORK ON NVIDIA HARDWARE FOR TRAINING!! UPDATE YOUR LOCAL REPO TO THE CURRENT STATE! NEW DOCUMENTATION AND RELEASE COMING SOON!
-
 -----
 
-### 🚀 **New in v0.18: The "RWKV v8 & CUDA Datacenter" Update**
+### 🚀 **New in v0.19: The "Optimization and GUI Update"**
+
+#### Optimization and GUI
+- **Internal CUDA Math Switch**: LTM retrieval and memory updates automatically use CUDA-friendly gather/scatter paths on NVIDIA GPUs while preserving the existing CPU-friendly dense math on CPU.
+- **No User Flag Required**: The architecture selects the math path internally based on tensor device placement, keeping CLI and GUI configuration simple.
+- **ROSA Preserved**: ROSA remains CPU-side and VRAM-light by design.
+- **Windows GUI Release Flow**: The README documents the portable GUI bundle workflow for shipping `Hierarchos.exe` with the bundled backend.
 
 #### 🧠 Architecture
 - **RWKV v8 Backbone**: Replaced GRU cells with full RWKV v8 (Receptance Weighted Key Value) cells featuring linear attention, Time Mixing with WKV recurrence, and SwiGLU Channel Mixing.
 - **DeepEmbed (4x Scale)**: New learnable token embeddings at 4× hidden dimension that gate the RWKV channel mixing FFN, providing richer per-token modulation.
-- **ROSA (Rapid Online Suffix Automaton)**: A neurosymbolic inner monologue — a CPU-side Suffix Automaton predicts likely next tokens, which are embedded and added to the input representation. Gives the model a "heads up" about upcoming patterns.
+- **ROSA (Receptive Ordered Suffix Automaton)**: A neurosymbolic inner monologue — a CPU-side Suffix Automaton predicts likely next tokens, which are embedded and added to the input representation. Gives the model a "heads up" about upcoming patterns.
 - **V7 Backward Compatibility**: Set `use_deepembed=False, use_rosa=False` in config to run in pure V7 mode. All V7 checkpoints load cleanly.
 
 #### ⚡ CUDA Datacenter Optimizations (Zero Config)
@@ -81,7 +85,9 @@ A powerful, data-efficient, and deep reasoning engine. Its dual-module design (a
 ## Features ✨
 
   * 🔄 **RWKV v8 Backbone**: Linear-complexity attention with O(1) inference cost. WKV recurrence, SwiGLU FFN, DeepEmbed gating, and ROSA neurosymbolic embeddings.
+  * ⚙️ **Adaptive CPU/CUDA LTM Math**: Keeps CPU-friendly dense LTM math on CPU while automatically using GPU-friendly gather/scatter retrieval and update paths on CUDA.
   * ⚡ **CUDA Datacenter Ready**: Auto-enables AMP (bfloat16 on Ampere+), TF32 matmul, cuDNN benchmark, torch.compile, non-blocking transfers, and pinned memory — zero configuration needed.
+  * 🪟 **Windows GUI Bundle**: Build a portable GUI release with `Hierarchos.exe` and a bundled backend for normal inference without requiring users to clone the repo.
   * 📊 **Integrated Benchmarking**: Optional support for `lm-evaluation-harness`. Track model accuracy on standard benchmarks (HellaSwag, ARC, etc.) during or after training with `--eval-tasks`.
   * 🎮 **AMD GPU Support (DirectML/ZLUDA)**: Train on AMD Radeon GPUs using DirectML backend on Windows. Opt-in via `--device dml` with automatic compatibility handling and optimized fallbacks.
   * 🎓 **Proper Temporal Learning**: Configurable truncated BPTT (`--detach-every-n-steps`) enables learning across multiple timesteps while managing memory. Default 32-step gradients flow allows the model to **learn temporal dependencies** effectively.
@@ -185,7 +191,7 @@ This guide covers common scenarios from data preparation to inference.
 | Entry Point | Status | Description |
 |-------------|--------|-------------|
 | `hierarchos_cli.py` | ✅ **Recommended** | Modular CLI - faster, stable, actively maintained |
-| `hierarchos.py` | ⚠️ **Legacy** | Unmaintained monolith (5,600 lines). Kept only as reference for agentic AI workflows. |
+| `hierarchos.py` | ⚠️ **Legacy** | Unmaintained monolith (5,600 lines). Kept only as reference for agentic AI workflows. | <-- DO NOT USE THIS! ITS 15 VERSIONS OUT OF DATE!!
 
 **Example:**
 ```bash
@@ -452,6 +458,21 @@ my_inference_model/
 └── merges.txt
 ```
 
+### Windows GUI Release Bundle
+
+Build a portable Windows GUI bundle with a bundled PyTorch/Transformers backend:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\tools\build_windows_release.ps1
+```
+
+The release is written to `dist\Hierarchos-Windows\` and can be zipped for
+distribution. Users run `Hierarchos.exe`; the GUI launches
+`backend\hierarchos-backend.exe`, so they do not need to clone this repo or
+install Python for normal inference. The GUI accepts a Hugging Face repo id,
+a local model directory containing `hierarchos.pt` or `model.pt`, or a direct
+`.pt` checkpoint with embedded config or a neighboring `hierarchos_config.json`.
+
 ### Workflow 10: Benchmark Evaluation (lm-eval)
 
 Run standardized LLM benchmarks on your model. Requires `pip install lm-eval` (automatically installed through the setup script if you used it).
@@ -650,6 +671,14 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
   * **DirectML/ZLUDA communities** for enabling AMD GPU acceleration on Windows.
 
 ## Changelog
+
+### v0.19 (alpha)
+
+  * **Optimization and GUI Update**: Release focus for CUDA/CPU math selection and the Windows GUI workflow.
+  * **Adaptive LTM Math Paths**: LTM retrieval and memory updates keep the existing CPU-friendly dense one-hot/matmul path on CPU, while CUDA tensors automatically use gather/scatter-based math for better GPU utilization.
+  * **Zero-Config Device Selection**: The architecture chooses the GPU-friendly LTM path internally when running on CUDA; no new CLI or GUI flag is required.
+  * **ROSA Remains CPU-Side**: ROSA is intentionally unchanged so it stays fast, VRAM-light, and CPU-friendly.
+  * **GUI Release Documentation**: Windows GUI bundle instructions are called out for portable `Hierarchos.exe` distribution with the bundled backend.
 
 ### v0.18 (alpha)
 

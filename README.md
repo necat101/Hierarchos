@@ -1,6 +1,10 @@
 -----
 
-# Hierarchos v0.19 (alpha): The Optimization and GUI Update
+# Hierarchos v0.19.1 (alpha): The Optimization and GUI Update
+
+**hierarchos/models/ltm.py** (line 122): CUDA LTM updates now aggregate only touched slots with torch.unique plus indexed writes, avoiding full dense [slots, val_dim] and [batch, slots, val_dim] scatter buffers.
+
+**hierarchos/models/core.py** (line 628): added _compute_cuda_chunked_lm_loss, matching dense CE plus z-loss behavior while chunking lm_head rows for large-vocab CUDA memory pressure.
 
 **The "Optimization and GUI Update"** — Hierarchos now keeps its CPU-friendly math paths intact while automatically switching hot LTM memory operations to GPU-friendly gather/scatter math on CUDA. This release also highlights the Windows GUI bundle workflow for easier local inference and experimentation.
 

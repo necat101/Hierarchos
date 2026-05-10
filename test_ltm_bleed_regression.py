@@ -3,7 +3,11 @@ import torch.nn.functional as F
 
 from hierarchos import AttrDict, HierarchosCore, LTMModule
 from hierarchos.inference.chat import extract_correction_text, parse_temperature_setting, passive_response_quality
-from hierarchos.training.trainer import compute_chunk_training_weights, compute_remaining_update_steps
+from hierarchos.training.trainer import (
+    compute_chunk_training_weights,
+    compute_remaining_update_steps,
+    estimate_cuda_loss_chunk_rows,
+)
 
 
 def _config():
@@ -497,6 +501,41 @@ def test_training_chunk_token_weights_ignore_padding_only_chunks():
     assert weights[2]["real_tokens"] == 0
     assert weights[2]["token_ratio"] == 0.0
     assert abs(sum(chunk["token_ratio"] for chunk in weights) - 1.0) < 1e-8
+
+
+def test_cuda_loss_chunk_rows_scale_from_free_vram_and_batch_shape():
+    vocab_size = 50257
+    rows_96gb = estimate_cuda_loss_chunk_rows(
+        free_bytes=int(80 * 1024 ** 3),
+        batch_size=82,
+        chunk_size=128,
+        vocab_size=vocab_size,
+    )
+    assert rows_96gb == 16834
+
+    larger_batch_rows = estimate_cuda_loss_chunk_rows(
+        free_bytes=int(80 * 1024 ** 3),
+        batch_size=192,
+        chunk_size=128,
+        vocab_size=vocab_size,
+    )
+    assert larger_batch_rows >= int(192 * 127 * 1.05)
+
+    constrained_rows = estimate_cuda_loss_chunk_rows(
+        free_bytes=int(8 * 1024 ** 3),
+        batch_size=192,
+        chunk_size=128,
+        vocab_size=vocab_size,
+    )
+    assert constrained_rows < rows_96gb
+
+    assert estimate_cuda_loss_chunk_rows(
+        free_bytes=int(80 * 1024 ** 3),
+        batch_size=82,
+        chunk_size=128,
+        vocab_size=vocab_size,
+        requested_rows=12345,
+    ) == 12345
 
 
 def test_masked_padding_tokens_do_not_change_training_costs():

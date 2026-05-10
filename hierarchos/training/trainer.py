@@ -8,6 +8,7 @@ from tqdm import tqdm
 import sys
 import traceback
 import numpy as np
+import math
 
 from .optimizers import DirectMLAdamW
 from ..utils.device import is_directml_device, set_threads
@@ -86,6 +87,80 @@ def compute_remaining_update_steps(dataloader_len: int, accumulation_steps: int,
     remaining_batches = max(0, int(dataloader_len) - int(start_step))
     remaining_batches += remaining_epochs_after_current * int(dataloader_len)
     return max(1, remaining_batches // accumulation_steps)
+
+def estimate_cuda_loss_chunk_rows(free_bytes: int, batch_size: int, chunk_size: int,
+                                  vocab_size: int, requested_rows: int = 0) -> int:
+    """
+    Pick a CUDA lm_head loss chunk size from live free VRAM and current batch shape.
+
+    On 96GB-class GPUs this targets 16834 rows by default, which is large enough
+    to cover batch sizes around 132 at a 128-token TBPTT chunk in one loss pass.
+    """
+    requested_rows = int(requested_rows or 0)
+    if requested_rows > 0:
+        return requested_rows
+
+    free_bytes = max(0, int(free_bytes or 0))
+    batch_size = max(1, int(batch_size or 1))
+    chunk_size = max(1, int(chunk_size or 1))
+    vocab_size = max(1, int(vocab_size or 1))
+
+    free_gb = free_bytes / float(1024 ** 3)
+    if free_gb >= 72.0:
+        base_rows = 16834
+    elif free_gb >= 48.0:
+        base_rows = 12288
+    elif free_gb >= 24.0:
+        base_rows = 8192
+    elif free_gb >= 12.0:
+        base_rows = 4096
+    else:
+        base_rows = 2048
+
+    batch_rows = batch_size * max(1, chunk_size - 1)
+    batch_target_rows = int(math.ceil(batch_rows * 1.05))
+
+    # FP32 logits dominate; reserve room for backward/temp buffers and leave most
+    # free VRAM for activations, optimizer state, CUDA graphs, and fragmentation.
+    estimated_bytes_per_row = vocab_size * 4 * 3
+    memory_budget = max(512 * 1024 ** 2, int(free_bytes * 0.20))
+    memory_cap_rows = max(512, memory_budget // max(1, estimated_bytes_per_row))
+
+    rows = max(base_rows, min(batch_target_rows, memory_cap_rows))
+    rows = min(rows, memory_cap_rows)
+    return max(512, int(rows))
+
+def tune_cuda_loss_chunk_rows_once(model, args, batch_size: int, chunk_size: int):
+    """Auto-tune CUDA loss chunking once after startup/model allocation."""
+    if not (torch.cuda.is_available() and getattr(args, 'cuda_chunked_lm_loss', True)):
+        return
+    if not getattr(args, '_auto_cuda_loss_chunk_rows', False):
+        return
+
+    device = next(model.parameters()).device
+    if device.type != 'cuda':
+        return
+
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    vocab_size = int(getattr(model.config, 'vocab_size', getattr(args, 'vocab_size', 1)))
+    rows = estimate_cuda_loss_chunk_rows(
+        free_bytes=free_bytes,
+        batch_size=batch_size,
+        chunk_size=chunk_size,
+        vocab_size=vocab_size,
+    )
+
+    previous = int(getattr(args, 'cuda_loss_chunk_rows', 0) or 0)
+    if rows != previous:
+        args.cuda_loss_chunk_rows = rows
+        if hasattr(model, 'config'):
+            model.config.cuda_loss_chunk_rows = rows
+        free_gb = free_bytes / (1024 ** 3)
+        total_gb = total_bytes / (1024 ** 3)
+        print(
+            f"INFO: Startup CUDA loss chunk rows set to {rows} "
+            f"(free VRAM {free_gb:.1f}/{total_gb:.1f} GB, batch={batch_size}, chunk={chunk_size})."
+        )
 
 def trim_trailing_padding(input_ids: torch.Tensor, labels: torch.Tensor, attention_mask: torch.Tensor = None):
     """Remove trailing columns that are padding for the entire batch."""
@@ -481,17 +556,17 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         if getattr(args, 'cuda_chunked_lm_loss', True):
             loss_chunk_rows = int(getattr(args, 'cuda_loss_chunk_rows', 0) or 0)
             if loss_chunk_rows <= 0:
-                if gpu_mem >= 48:
-                    loss_chunk_rows = 8192
-                elif gpu_mem >= 16:
-                    loss_chunk_rows = 4096
-                else:
-                    loss_chunk_rows = 2048
-                args.cuda_loss_chunk_rows = loss_chunk_rows
+                args._auto_cuda_loss_chunk_rows = True
+                config.cuda_loss_chunk_rows = 0
+                print("INFO: CUDA chunked LM loss enabled (startup auto rows from free VRAM and batch shape).")
+            else:
+                args._auto_cuda_loss_chunk_rows = False
+                config.cuda_loss_chunk_rows = loss_chunk_rows
+                print(f"INFO: CUDA chunked LM loss enabled ({loss_chunk_rows} fixed rows/chunk, logits omitted in train_step).")
             config.cuda_loss_chunk_rows = loss_chunk_rows
             config.cuda_chunked_lm_loss = True
-            print(f"INFO: CUDA chunked LM loss enabled ({loss_chunk_rows} rows/chunk, logits omitted in train_step).")
         else:
+            args._auto_cuda_loss_chunk_rows = False
             config.cuda_chunked_lm_loss = False
 
         # Multi-GPU info
@@ -665,6 +740,12 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
 
     # Compile
     model.compile()
+    tune_cuda_loss_chunk_rows_once(
+        model,
+        args,
+        batch_size=getattr(args, 'batch_size', 1),
+        chunk_size=getattr(args, 'training_chunk_size', 128),
+    )
 
     start_step = checkpoint.get('mid_epoch_step', 0) if checkpoint else 0
 

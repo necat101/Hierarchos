@@ -625,6 +625,51 @@ class HierarchosCore(nn.Module):
             "ltm_memory_state": (curr_fast_vals, curr_mom_vals, new_past_tokens, new_rosa_states, memory_timestamps, memory_sources),
         }
 
+    def _compute_cuda_chunked_lm_loss(self, hidden: torch.Tensor, labels: torch.Tensor,
+                                      z_loss_weight: float = 1e-4) -> torch.Tensor:
+        """
+        Memory-friendly CUDA loss path for large vocabularies.
+
+        This intentionally recomputes lm_head by row chunks instead of materializing
+        the full shifted logits tensor for loss calculation. The reduction matches
+        PyTorch's mean cross-entropy with ignore_index=-100, and the z-loss is
+        averaged over the same valid-token rows as the dense path.
+        """
+        shift_hidden = hidden[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+        flat_hidden = shift_hidden.view(-1, hidden.shape[-1])
+        flat_labels = shift_labels.view(-1)
+
+        valid_mask = flat_labels != -100
+        valid_count = valid_mask.sum()
+        if valid_count.item() == 0:
+            return torch.zeros((), device=hidden.device, dtype=torch.float32, requires_grad=True)
+
+        chunk_rows = int(getattr(self.config, "cuda_loss_chunk_rows", 0) or 0)
+        if chunk_rows <= 0:
+            chunk_rows = flat_hidden.shape[0]
+
+        total_ce = torch.zeros((), device=hidden.device, dtype=torch.float32)
+        total_z = torch.zeros((), device=hidden.device, dtype=torch.float32)
+
+        for start in range(0, flat_hidden.shape[0], chunk_rows):
+            end = min(start + chunk_rows, flat_hidden.shape[0])
+            chunk_hidden = flat_hidden[start:end]
+            chunk_labels = flat_labels[start:end]
+            chunk_logits = torch.clamp(self.lm_head(chunk_hidden), min=-30.0, max=30.0).float()
+
+            total_ce = total_ce + F.cross_entropy(chunk_logits, chunk_labels, reduction="sum")
+
+            if z_loss_weight > 0:
+                chunk_valid = chunk_labels != -100
+                if chunk_valid.any():
+                    total_z = total_z + torch.logsumexp(chunk_logits[chunk_valid], dim=-1).pow(2).sum()
+
+        loss = total_ce / valid_count.to(dtype=torch.float32)
+        if z_loss_weight > 0:
+            loss = loss + (total_z / valid_count.to(dtype=torch.float32)) * z_loss_weight
+        return loss
+
     def prepare_inputs_for_generation(self, input_ids, **kwargs):
         return {"input_ids": input_ids, **kwargs}
 

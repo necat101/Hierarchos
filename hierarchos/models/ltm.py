@@ -142,37 +142,42 @@ class LTMModule(nn.Module):
         grads_flat = grads_tensor[valid_mask].reshape(-1, self.vals.size(1)).contiguous()
 
         num_slots = self.vals.size(0)
-        counts = torch.zeros(num_slots, dtype=torch.float32, device=device)
-        counts.index_add_(0, idx_flat, torch.ones_like(idx_flat, dtype=torch.float32))
+        unique_idx, inverse, counts = torch.unique(
+            idx_flat,
+            sorted=False,
+            return_inverse=True,
+            return_counts=True,
+        )
+        slot_grads = grads_flat.new_zeros((unique_idx.numel(), self.vals.size(1)))
+        slot_grads.index_add_(0, inverse, grads_flat)
+        slot_grads = slot_grads / (counts.to(dtype=torch.float32).unsqueeze(-1) + 1e-8)
 
-        slot_grads = torch.zeros(num_slots, self.vals.size(1), dtype=torch.float32, device=device)
-        slot_grads.index_add_(0, idx_flat, grads_flat)
-        slot_grads = slot_grads / (counts.unsqueeze(-1) + 1e-8)
-        nonzero_mask = counts > 0
-
-        curr_mom.mul_(self.momentum).add_(slot_grads)
-        curr_mom.clamp_(min=-50.0, max=50.0)
+        curr_mom.mul_(self.momentum)
+        touched_mom = curr_mom.index_select(0, unique_idx).add(slot_grads)
+        touched_mom.clamp_(min=-50.0, max=50.0)
+        curr_mom.index_copy_(0, unique_idx, touched_mom)
 
         if tokens_covered is None:
             tokens_covered = self.reference_chunk_len
         retention_rate = (1.0 - self.forget_rate) ** (tokens_covered / float(self.reference_chunk_len))
 
-        update_step = (curr_mom + self.weight_decay * curr_fast).mul(-current_lr)
+        touched_fast = curr_fast.index_select(0, unique_idx)
+        update_step = (touched_mom + self.weight_decay * touched_fast).mul(-current_lr)
         curr_fast.mul_(retention_rate)
-        update_step = torch.where(nonzero_mask.unsqueeze(-1), update_step, torch.zeros_like(update_step))
-        curr_fast.add_(update_step)
-        curr_fast.clamp_(min=-50.0, max=50.0)
+        touched_fast = touched_fast.mul(retention_rate).add(update_step)
+        touched_fast.clamp_(min=-50.0, max=50.0)
+        curr_fast.index_copy_(0, unique_idx, touched_fast)
 
         if getattr(self, "accumulate_deltas", False):
-            self.ltm_deltas.add_(update_step)
+            self.ltm_deltas.index_add_(0, unique_idx, update_step)
 
         target_timestamps = timestamps if timestamps is not None else self.timestamps
         target_sources = sources if sources is not None else self.sources
         with torch.no_grad():
             target_timestamps = target_timestamps.to(device=device)
             target_sources = target_sources.to(device=device)
-            target_timestamps.masked_fill_(nonzero_mask, float(timestamp))
-            target_sources.masked_fill_(nonzero_mask, int(source))
+            target_timestamps.index_fill_(0, unique_idx, float(timestamp))
+            target_sources.index_fill_(0, unique_idx, int(source))
 
         return curr_fast, curr_mom
 
@@ -202,36 +207,45 @@ class LTMModule(nn.Module):
         batch_size, num_slots, val_dim = curr_fast.shape
         idx_safe = topk_idx.clamp(min=0)
         flat_idx = idx_safe.reshape(batch_size, -1)
-        valid_flat = valid_mask.reshape(batch_size, -1).float()
-        grads_flat = grads_tensor.reshape(batch_size, -1, val_dim) * valid_flat.unsqueeze(-1)
+        valid_flat = valid_mask.reshape(batch_size, -1)
+        batch_offsets = torch.arange(batch_size, device=device).unsqueeze(1) * num_slots
+        linear_idx = (flat_idx + batch_offsets)[valid_flat].reshape(-1)
+        grads_flat = grads_tensor.reshape(batch_size, -1, val_dim)[valid_flat].reshape(-1, val_dim).contiguous()
 
-        counts = torch.zeros(batch_size, num_slots, dtype=torch.float32, device=device)
-        counts.scatter_add_(1, flat_idx, valid_flat)
+        unique_linear, inverse, counts = torch.unique(
+            linear_idx,
+            sorted=False,
+            return_inverse=True,
+            return_counts=True,
+        )
+        slot_grads = grads_flat.new_zeros((unique_linear.numel(), val_dim))
+        slot_grads.index_add_(0, inverse, grads_flat)
+        slot_grads = slot_grads / (counts.to(dtype=torch.float32).unsqueeze(-1) + 1e-8)
 
-        slot_grads = torch.zeros(batch_size, num_slots, val_dim, dtype=torch.float32, device=device)
-        slot_idx = flat_idx.unsqueeze(-1).expand(-1, -1, val_dim)
-        slot_grads.scatter_add_(1, slot_idx, grads_flat)
-        slot_grads = slot_grads / (counts.unsqueeze(-1) + 1e-8)
-        nonzero_mask = counts > 0
+        batch_idx = torch.div(unique_linear, num_slots, rounding_mode='floor')
+        slot_idx = unique_linear.remainder(num_slots)
 
-        curr_mom.mul_(self.momentum).add_(slot_grads)
-        curr_mom.clamp_(min=-50.0, max=50.0)
+        curr_mom.mul_(self.momentum)
+        touched_mom = curr_mom[batch_idx, slot_idx].add(slot_grads)
+        touched_mom.clamp_(min=-50.0, max=50.0)
+        curr_mom[batch_idx, slot_idx] = touched_mom
 
-        update_step = (curr_mom + self.weight_decay * curr_fast).mul(-current_lr)
+        touched_fast = curr_fast[batch_idx, slot_idx]
+        update_step = (touched_mom + self.weight_decay * touched_fast).mul(-current_lr)
         curr_fast.mul_(retention_rate)
-        update_step = torch.where(nonzero_mask.unsqueeze(-1), update_step, torch.zeros_like(update_step))
-        curr_fast.add_(update_step)
-        curr_fast.clamp_(min=-50.0, max=50.0)
+        touched_fast = touched_fast.mul(retention_rate).add(update_step)
+        touched_fast.clamp_(min=-50.0, max=50.0)
+        curr_fast[batch_idx, slot_idx] = touched_fast
 
         if getattr(self, "accumulate_deltas", False):
-            self.ltm_deltas.add_(update_step.sum(dim=0))
+            self.ltm_deltas.index_add_(0, slot_idx, update_step)
 
         if timestamps is not None and sources is not None:
             with torch.no_grad():
                 timestamps = timestamps.to(device=device)
                 sources = sources.to(device=device)
-                timestamps.masked_fill_(nonzero_mask, float(timestamp))
-                sources.masked_fill_(nonzero_mask, int(source))
+                timestamps[batch_idx, slot_idx] = float(timestamp)
+                sources[batch_idx, slot_idx] = int(source)
 
         return curr_fast, curr_mom
 

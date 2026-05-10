@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 
 from hierarchos import AttrDict, HierarchosCore, LTMModule
 from hierarchos.inference.chat import extract_correction_text, parse_temperature_setting, passive_response_quality
@@ -149,6 +150,148 @@ def test_ltm_2d_update_matches_trainer_batched_update():
     assert torch.allclose(mom_2d, mom_3d[0], atol=1e-6)
 
 
+def test_cuda_friendly_flat_update_matches_dense_cpu_math():
+    torch.manual_seed(18)
+    ltm = LTMModule(n_slots=9, key_dim=4, val_dim=5, momentum=0.8, wd=0.03, forget_rate=0.04)
+
+    topk_idx = torch.tensor([[[0, 1, 1], [4, -1, 8]], [[2, 2, 4], [8, 0, -1]]], dtype=torch.long)
+    grads = torch.randn(2, 2, 3, 5)
+    fast = torch.randn(9, 5)
+    mom = torch.randn(9, 5) * 0.1
+    timestamps = torch.zeros(9)
+    sources = torch.zeros(9, dtype=torch.long)
+
+    dense_fast, dense_mom = ltm.inner_update(
+        topk_idx,
+        grads,
+        current_lr=0.025,
+        timestamp=11.0,
+        source=LTMModule.SRC_TRAINING_DATA,
+        tokens_covered=3,
+        fast_vals=fast.clone(),
+        mom_vals=mom.clone(),
+        timestamps=timestamps.clone(),
+        sources=sources.clone(),
+        inplace=True,
+    )
+
+    cuda_timestamps = timestamps.clone()
+    cuda_sources = sources.clone()
+    sparse_fast, sparse_mom = ltm._inner_update_flat_cuda(
+        topk_idx=topk_idx,
+        grads_tensor=grads,
+        current_lr=0.025,
+        timestamp=11.0,
+        source=LTMModule.SRC_TRAINING_DATA,
+        tokens_covered=3,
+        curr_fast=fast.clone(),
+        curr_mom=mom.clone(),
+        timestamps=cuda_timestamps,
+        sources=cuda_sources,
+        inplace=True,
+    )
+
+    assert torch.allclose(sparse_fast, dense_fast, atol=1e-6)
+    assert torch.allclose(sparse_mom, dense_mom, atol=1e-6)
+
+
+def test_cuda_friendly_batched_update_matches_dense_cpu_math_and_deltas():
+    torch.manual_seed(20)
+    dense_ltm = LTMModule(n_slots=10, key_dim=4, val_dim=6, momentum=0.7, wd=0.02, forget_rate=0.03)
+    sparse_ltm = LTMModule(n_slots=10, key_dim=4, val_dim=6, momentum=0.7, wd=0.02, forget_rate=0.03)
+    dense_ltm.accumulate_deltas = True
+    sparse_ltm.accumulate_deltas = True
+
+    topk_idx = torch.tensor(
+        [
+            [[0, 1], [3, 1], [-1, 4]],
+            [[2, 2], [9, -1], [0, 9]],
+        ],
+        dtype=torch.long,
+    )
+    grads = torch.randn(2, 3, 2, 6)
+    fast = torch.randn(2, 10, 6)
+    mom = torch.randn(2, 10, 6) * 0.1
+    timestamps = torch.zeros(2, 10)
+    sources = torch.zeros(2, 10, dtype=torch.long)
+
+    dense_fast, dense_mom = dense_ltm.inner_update(
+        topk_idx,
+        grads,
+        current_lr=0.015,
+        timestamp=13.0,
+        source=LTMModule.SRC_TRAINING_DATA,
+        tokens_covered=5,
+        fast_vals=fast.clone(),
+        mom_vals=mom.clone(),
+        timestamps=timestamps.clone(),
+        sources=sources.clone(),
+        inplace=True,
+    )
+
+    sparse_fast, sparse_mom = sparse_ltm._inner_update_batched_cuda(
+        topk_idx=topk_idx,
+        grads_tensor=grads,
+        current_lr=0.015,
+        timestamp=13.0,
+        source=LTMModule.SRC_TRAINING_DATA,
+        tokens_covered=5,
+        curr_fast=fast.clone(),
+        curr_mom=mom.clone(),
+        timestamps=timestamps.clone(),
+        sources=sources.clone(),
+        inplace=True,
+    )
+
+    assert torch.allclose(sparse_fast, dense_fast, atol=1e-6)
+    assert torch.allclose(sparse_mom, dense_mom, atol=1e-6)
+    assert torch.allclose(sparse_ltm.ltm_deltas, dense_ltm.ltm_deltas, atol=1e-6)
+
+
+def test_cuda_friendly_retrieve_matches_dense_cpu_math_with_filter():
+    torch.manual_seed(22)
+    dense_ltm = LTMModule(n_slots=7, key_dim=4, val_dim=3)
+    sparse_ltm = LTMModule(n_slots=7, key_dim=4, val_dim=3)
+    sparse_ltm.load_state_dict(dense_ltm.state_dict())
+    sparse_ltm._use_cuda_math = lambda tensor: True
+
+    queries = torch.randn(2, 4)
+    fast_vals = torch.randn(7, 3) * 0.1
+    timestamps = torch.tensor([0.0, 1.0, 4.0, 2.0, 5.0, 0.5, 3.0])
+    sources = torch.tensor([
+        LTMModule.SRC_UNKNOWN,
+        LTMModule.SRC_TRAINING_DATA,
+        LTMModule.SRC_TRAINING_DATA,
+        LTMModule.SRC_USER_INTERACTION,
+        LTMModule.SRC_TRAINING_DATA,
+        LTMModule.SRC_CORRECTION,
+        LTMModule.SRC_TRAINING_DATA,
+    ])
+
+    dense_vals, dense_idx, dense_ts = dense_ltm.retrieve_topk(
+        queries,
+        topk=3,
+        min_timestamp=1.0,
+        source_filter=LTMModule.SRC_TRAINING_DATA,
+        fast_vals=fast_vals,
+        timestamps=timestamps,
+        sources=sources,
+    )
+    sparse_vals, sparse_idx, sparse_ts = sparse_ltm.retrieve_topk(
+        queries,
+        topk=3,
+        min_timestamp=1.0,
+        source_filter=LTMModule.SRC_TRAINING_DATA,
+        fast_vals=fast_vals,
+        timestamps=timestamps,
+        sources=sources,
+    )
+
+    assert torch.allclose(sparse_vals, dense_vals, atol=1e-6)
+    assert torch.equal(sparse_idx, dense_idx)
+    assert torch.allclose(sparse_ts, dense_ts, atol=1e-6)
+
+
 def test_hebbian_update_uses_same_rule_as_negative_value_gradient():
     torch.manual_seed(19)
     ltm = LTMModule(n_slots=8, key_dim=4, val_dim=4, momentum=0.9, wd=0.01, forget_rate=0.02)
@@ -207,6 +350,43 @@ def test_feedback_path_raw_topk_tensors_receive_gradients():
     )
 
     assert grad_norm > 0
+
+
+def test_chunked_lm_loss_matches_full_logits_objective_and_gradients():
+    torch.manual_seed(27)
+    cfg = _config()
+    cfg.vocab_size = 257
+    cfg.z_loss_weight = 1e-4
+    cfg.cuda_loss_chunk_rows = 7
+    model = HierarchosCore(cfg)
+    model.train()
+
+    hidden_a = torch.randn(3, 17, cfg.context_dim, requires_grad=True)
+    hidden_b = hidden_a.detach().clone().requires_grad_(True)
+    labels = torch.randint(0, cfg.vocab_size, (3, 17), dtype=torch.long)
+    labels[0, :5] = -100
+    labels[1, 8:12] = -100
+    labels[2, -3:] = -100
+
+    logits = torch.clamp(model.lm_head(hidden_a), min=-30.0, max=30.0)
+    flat_logits = logits[:, :-1, :].contiguous().view(-1, cfg.vocab_size).float()
+    flat_labels = labels[:, 1:].contiguous().view(-1)
+    full_loss = F.cross_entropy(flat_logits, flat_labels)
+    valid_logits = flat_logits[flat_labels != -100]
+    full_loss = full_loss + torch.logsumexp(valid_logits, dim=-1).pow(2).mean() * cfg.z_loss_weight
+
+    model.zero_grad(set_to_none=True)
+    full_loss.backward()
+    full_hidden_grad = hidden_a.grad.detach().clone()
+    full_head_grad = model.lm_head.weight.grad.detach().clone()
+
+    model.zero_grad(set_to_none=True)
+    chunked_loss = model._compute_cuda_chunked_lm_loss(hidden_b, labels, cfg.z_loss_weight)
+    chunked_loss.backward()
+
+    assert torch.allclose(chunked_loss, full_loss.detach(), atol=1e-6)
+    assert torch.allclose(hidden_b.grad, full_hidden_grad, atol=1e-6)
+    assert torch.allclose(model.lm_head.weight.grad, full_head_grad, atol=1e-6)
 
 
 def test_inplace_ltm_update_accumulates_deltas_like_state_delta():

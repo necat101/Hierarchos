@@ -131,7 +131,6 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
     full_input_ids, full_labels, full_attention_mask = trim_trailing_padding(
         full_input_ids, full_labels, full_attention_mask
     )
-    B, T = full_input_ids.shape
     full_input_ids = full_input_ids.to(device, non_blocking=_nb)
     if full_attention_mask is not None: full_attention_mask = full_attention_mask.to(device, non_blocking=_nb)
     full_labels = full_labels.to(device, non_blocking=_nb)
@@ -143,6 +142,7 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
         return None, running_states
     # --------------------------------------------------
     
+    B, T = full_input_ids.shape
     h_state, l_state, prev_ctx, target_ctx, drift_state, ltm_state = running_states
     
     autocast_device = 'cpu' if is_directml_device(device) else device.type

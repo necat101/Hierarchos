@@ -31,7 +31,6 @@ class WorkerLoop:
         self.max_l_steps = config.max_l_steps
         self.l_conv_atol = getattr(config, 'l_conv_atol', 0.01)
         self.commitment_threshold = getattr(config, 'commitment_threshold', 0.1)
-        self._cuda_friendly_math = True
 
     def __call__(self, enc: torch.Tensor, static_context: torch.Tensor, l_state: torch.Tensor, 
                 initial_drift: torch.Tensor, timestep: Optional[int] = None, l_deepemb_vec: Optional[torch.Tensor] = None):
@@ -56,8 +55,6 @@ class WorkerLoop:
         l_input = torch.clamp(l_input, min=-50.0, max=50.0)
         
         check_idx = [0, 1, 2, 4]
-
-        use_cuda_math = bool(self._cuda_friendly_math and enc.device.type == "cuda")
 
         if not self.l_rnn.training:
             prev_shadow = shadow_l_state.clone()
@@ -92,9 +89,7 @@ class WorkerLoop:
                 l_input_vec = torch.cat([current_enc, dynamic_context], dim=-1)
                 l_input = self.l_input_proj(l_input_vec)
                 
-                # CUDA training avoids this data-dependent host sync and runs the
-                # fixed worker depth. CPU keeps the early-exit math.
-                if not use_cuda_math and torch.mean(torch.abs(drift_delta)) < self.l_conv_atol:
+                if torch.mean(torch.abs(drift_delta)) < self.l_conv_atol:
                    break
 
         # Use original l_state (not shadow) for the actual state update
@@ -265,6 +260,50 @@ class HierarchosCore(nn.Module):
             print(f"Warning: Compilation failed! Falling back to eager mode. {e}")
             self.config.compile = False
 
+    def _compute_cuda_chunked_lm_loss(self, final: torch.Tensor, labels: torch.Tensor,
+                                      z_loss_weight: float) -> torch.Tensor:
+        """
+        CUDA-only training loss that avoids materializing [B, T, vocab] logits.
+
+        CPU keeps the full-logits path below because dense row-major work is fast
+        there and it preserves the original debug-friendly behavior.
+        """
+        device = final.device
+        shift_hidden = final[:, :-1, :].contiguous().view(-1, final.shape[-1])
+        shift_labels = labels[:, 1:].contiguous().view(-1)
+        valid_weight = (shift_labels != -100).to(dtype=torch.float32)
+        valid_count = valid_weight.sum()
+
+        chunk_rows = int(getattr(self.config, "cuda_loss_chunk_rows", 2048))
+        chunk_rows = max(1, chunk_rows)
+        ce_sum = torch.zeros((), device=device, dtype=torch.float32)
+        z_sum = torch.zeros((), device=device, dtype=torch.float32)
+
+        for start in range(0, shift_hidden.shape[0], chunk_rows):
+            end = min(start + chunk_rows, shift_hidden.shape[0])
+            logits_chunk = self.lm_head(shift_hidden[start:end]).float()
+            logits_chunk = torch.clamp(logits_chunk, min=-30.0, max=30.0)
+            labels_chunk = shift_labels[start:end]
+            ce_sum = ce_sum + F.cross_entropy(
+                logits_chunk,
+                labels_chunk,
+                ignore_index=-100,
+                reduction="sum",
+            )
+
+            if z_loss_weight > 0:
+                weight_chunk = valid_weight[start:end]
+                z_terms = torch.logsumexp(logits_chunk, dim=-1).pow(2)
+                z_sum = z_sum + (z_terms * weight_chunk).sum()
+
+        denom = valid_count.clamp_min(1.0)
+        loss = ce_sum / denom
+        if z_loss_weight > 0:
+            loss = loss + (z_sum / denom) * z_loss_weight
+
+        zero_loss = final.sum() * 0.0
+        return torch.where(valid_count > 0, loss, zero_loss)
+
     def forward(self, input_ids, attention_mask=None, labels=None, 
                 h_state=None, l_state=None, 
                 prev_context=None, target_context=None,
@@ -275,7 +314,6 @@ class HierarchosCore(nn.Module):
         """
         B, T = input_ids.shape
         device = input_ids.device
-        debug_tensor_checks = bool(getattr(self.config, 'debug_tensor_checks', False) or device.type != 'cuda')
         allow_hebbian_update = kwargs.pop("allow_hebbian_update", False)
         suppress_hebbian = kwargs.pop("suppress_hebbian", getattr(self, "suppress_hebbian", True))
         if allow_hebbian_update:
@@ -445,7 +483,7 @@ class HierarchosCore(nn.Module):
             h_out_real, h_state = self.h_rnn(enc_with_feedback, h_state, timestep=t, deepemb_vec=h_deepemb_vec)
             h_out_real = torch.clamp(h_out_real, min=-100.0, max=100.0)
             
-            if debug_tensor_checks and (torch.isnan(h_out_real).any() or torch.isinf(h_out_real).any()):
+            if torch.isnan(h_out_real).any() or torch.isinf(h_out_real).any():
                 print(f"WARNING: NaN/Inf detected in h_out_real at step {t}")
             
             step_ponder_cost = torch.zeros(B, device=device, dtype=enc.dtype)
@@ -560,26 +598,38 @@ class HierarchosCore(nn.Module):
         # 5. FINAL OUTPUTS
         # ==================================================================
         final = self.out_norm(torch.stack(final_embs, dim=1))
-        logits = self.lm_head(final)
+        use_cuda_chunked_loss = bool(
+            labels is not None
+            and self.training
+            and device.type == 'cuda'
+            and getattr(self.config, 'cuda_chunked_lm_head', True)
+        )
+        logits = None if use_cuda_chunked_loss else self.lm_head(final)
         
-        if debug_tensor_checks and (torch.isnan(logits).any() or torch.isinf(logits).any()):
+        if logits is not None and (torch.isnan(logits).any() or torch.isinf(logits).any()):
             print("WARNING: NaN/Inf detected in logits. Replacing with zeros and clamping...")
             logits = torch.nan_to_num(logits, nan=0.0, posinf=30.0, neginf=-30.0)
         
-        logits = torch.clamp(logits, min=-30.0, max=30.0)
+        if logits is not None:
+            logits = torch.clamp(logits, min=-30.0, max=30.0)
 
         loss = None
         ponder_cost_out = None
         commitment_cost_out = None
 
         if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            
             valid_mask = shift_labels != -100
-            if not valid_mask.any():
+            if use_cuda_chunked_loss:
+                loss = self._compute_cuda_chunked_lm_loss(
+                    final,
+                    labels,
+                    getattr(self.config, 'z_loss_weight', 1e-4),
+                )
+            elif not valid_mask.any():
                 loss = torch.tensor(0.0, device=device, requires_grad=True)
             else:
+                shift_logits = logits[..., :-1, :].contiguous()
                 flat_logits = shift_logits.view(-1, self.config.vocab_size).float()
                 flat_labels = shift_labels.view(-1)
                 
@@ -614,13 +664,6 @@ class HierarchosCore(nn.Module):
                 cost_tensor = torch.stack([c.float().view(B) for c in costs], dim=0)
                 weight_tensor = torch.stack(weights, dim=0).float()
                 denom = weight_tensor.sum()
-                if device.type == 'cuda':
-                    weighted_mean = (cost_tensor * weight_tensor).sum() / denom.clamp_min(1.0)
-                    return torch.where(
-                        denom > 0,
-                        weighted_mean,
-                        torch.zeros((), device=device, dtype=cost_tensor.dtype),
-                    )
                 if denom <= 0:
                     return torch.zeros((), device=device, dtype=cost_tensor.dtype)
                 return (cost_tensor * weight_tensor).sum() / denom

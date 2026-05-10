@@ -131,6 +131,14 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
     full_input_ids, full_labels, full_attention_mask = trim_trailing_padding(
         full_input_ids, full_labels, full_attention_mask
     )
+    B, T = full_input_ids.shape
+    chunk_size = getattr(args, 'training_chunk_size', 128)
+    if chunk_size <= 0 or chunk_size > T:
+        chunk_size = T
+    # Build the chunk plan while labels/masks are still CPU tensors. The plan
+    # uses .item(); doing it after the CUDA transfer serializes the GPU once per
+    # chunk on long sequences.
+    chunk_plan = compute_chunk_training_weights(full_labels, full_attention_mask, chunk_size)
     full_input_ids = full_input_ids.to(device, non_blocking=_nb)
     if full_attention_mask is not None: full_attention_mask = full_attention_mask.to(device, non_blocking=_nb)
     full_labels = full_labels.to(device, non_blocking=_nb)
@@ -142,7 +150,6 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
         return None, running_states
     # --------------------------------------------------
     
-    B, T = full_input_ids.shape
     h_state, l_state, prev_ctx, target_ctx, drift_state, ltm_state = running_states
     
     autocast_device = 'cpu' if is_directml_device(device) else device.type
@@ -181,9 +188,6 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
             ltm_state = tuple(s.detach() if isinstance(s, torch.Tensor) else s for s in ltm_state)
     
     # Temporal chunking (critical for RWKV-based models)
-    chunk_size = getattr(args, 'training_chunk_size', 128)
-    if chunk_size <= 0 or chunk_size > T: chunk_size = T
-    chunk_plan = compute_chunk_training_weights(full_labels, full_attention_mask, chunk_size)
     num_chunks = len(chunk_plan)
     
     total_loss = 0.0
@@ -296,10 +300,7 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                         _clip_val = getattr(args, 'grad_clip', 1.0)
                         if _clip_val > 0:
                             _grad_norm = ltm_grads_tensor.norm()
-                            if device.type == 'cuda':
-                                _clip_coef = (_clip_val / (_grad_norm + 1e-8)).clamp(max=1.0)
-                                ltm_grads_tensor = ltm_grads_tensor * _clip_coef
-                            elif _grad_norm > _clip_val:
+                            if _grad_norm > _clip_val:
                                 ltm_grads_tensor = ltm_grads_tensor * (_clip_val / (_grad_norm + 1e-8))
                         
                         # Unpack current LTM state for the update

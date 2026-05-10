@@ -583,22 +583,16 @@ class HierarchosCore(nn.Module):
                 # Z-Loss Regularization built to prevent exploding logits
                 z_loss_weight = getattr(self.config, 'z_loss_weight', 1e-4)
                 if z_loss_weight > 0:
-                    # Keep z-loss branchless for CUDA: no boolean-index gather,
-                    # no masked_scatter_ backward, and no extra compacted tensor.
+                    # AMP FIX: Disable autocast for the z-loss block. Boolean indexing
+                    # (flat_logits[valid_mask_flat]) uses masked_scatter_ in its backward
+                    # pass. Under BFloat16 AMP, logsumexp can produce BF16 gradients that
+                    # flow back into the float32 flat_logits via masked_scatter_, crashing
+                    # with "expected self and source to have same dtypes".
                     _zloss_device = device.type if device.type in ('cuda', 'cpu') else 'cpu'
                     with torch.amp.autocast(device_type=_zloss_device, enabled=False):
                         valid_mask_flat = flat_labels != -100
-                        if device.type == 'cuda':
-                            # CUDA path: compact to supervised rows only. The previous
-                            # branchless masking avoided masked_scatter_ but did a
-                            # logsumexp over every padded/prompt row, which explodes on
-                            # long batches. index_select keeps gradients safe and bounded.
-                            valid_idx = valid_mask_flat.nonzero(as_tuple=False).flatten()
-                            valid_logits = flat_logits.index_select(0, valid_idx)
-                            z_loss = torch.logsumexp(valid_logits, dim=-1).pow(2).mean() * z_loss_weight
-                        else:
-                            valid_logits = flat_logits[valid_mask_flat]
-                            z_loss = torch.logsumexp(valid_logits, dim=-1).pow(2).mean() * z_loss_weight
+                        valid_logits = flat_logits[valid_mask_flat]
+                        z_loss = torch.logsumexp(valid_logits, dim=-1).pow(2).mean() * z_loss_weight
                     loss = loss + z_loss
             
             # Compute auxiliary costs for reporting (trainer handles loss composition)

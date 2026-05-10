@@ -31,6 +31,7 @@ class WorkerLoop:
         self.max_l_steps = config.max_l_steps
         self.l_conv_atol = getattr(config, 'l_conv_atol', 0.01)
         self.commitment_threshold = getattr(config, 'commitment_threshold', 0.1)
+        self._cuda_friendly_math = True
 
     def __call__(self, enc: torch.Tensor, static_context: torch.Tensor, l_state: torch.Tensor, 
                 initial_drift: torch.Tensor, timestep: Optional[int] = None, l_deepemb_vec: Optional[torch.Tensor] = None):
@@ -55,6 +56,8 @@ class WorkerLoop:
         l_input = torch.clamp(l_input, min=-50.0, max=50.0)
         
         check_idx = [0, 1, 2, 4]
+
+        use_cuda_math = bool(self._cuda_friendly_math and enc.device.type == "cuda")
 
         if not self.l_rnn.training:
             prev_shadow = shadow_l_state.clone()
@@ -89,7 +92,9 @@ class WorkerLoop:
                 l_input_vec = torch.cat([current_enc, dynamic_context], dim=-1)
                 l_input = self.l_input_proj(l_input_vec)
                 
-                if torch.mean(torch.abs(drift_delta)) < self.l_conv_atol:
+                # CUDA training avoids this data-dependent host sync and runs the
+                # fixed worker depth. CPU keeps the early-exit math.
+                if not use_cuda_math and torch.mean(torch.abs(drift_delta)) < self.l_conv_atol:
                    break
 
         # Use original l_state (not shadow) for the actual state update
@@ -270,6 +275,7 @@ class HierarchosCore(nn.Module):
         """
         B, T = input_ids.shape
         device = input_ids.device
+        debug_tensor_checks = bool(getattr(self.config, 'debug_tensor_checks', False) or device.type != 'cuda')
         allow_hebbian_update = kwargs.pop("allow_hebbian_update", False)
         suppress_hebbian = kwargs.pop("suppress_hebbian", getattr(self, "suppress_hebbian", True))
         if allow_hebbian_update:
@@ -439,7 +445,7 @@ class HierarchosCore(nn.Module):
             h_out_real, h_state = self.h_rnn(enc_with_feedback, h_state, timestep=t, deepemb_vec=h_deepemb_vec)
             h_out_real = torch.clamp(h_out_real, min=-100.0, max=100.0)
             
-            if torch.isnan(h_out_real).any() or torch.isinf(h_out_real).any():
+            if debug_tensor_checks and (torch.isnan(h_out_real).any() or torch.isinf(h_out_real).any()):
                 print(f"WARNING: NaN/Inf detected in h_out_real at step {t}")
             
             step_ponder_cost = torch.zeros(B, device=device, dtype=enc.dtype)
@@ -556,7 +562,7 @@ class HierarchosCore(nn.Module):
         final = self.out_norm(torch.stack(final_embs, dim=1))
         logits = self.lm_head(final)
         
-        if torch.isnan(logits).any() or torch.isinf(logits).any():
+        if debug_tensor_checks and (torch.isnan(logits).any() or torch.isinf(logits).any()):
             print("WARNING: NaN/Inf detected in logits. Replacing with zeros and clamping...")
             logits = torch.nan_to_num(logits, nan=0.0, posinf=30.0, neginf=-30.0)
         
@@ -583,16 +589,19 @@ class HierarchosCore(nn.Module):
                 # Z-Loss Regularization built to prevent exploding logits
                 z_loss_weight = getattr(self.config, 'z_loss_weight', 1e-4)
                 if z_loss_weight > 0:
-                    # AMP FIX: Disable autocast for the z-loss block. Boolean indexing
-                    # (flat_logits[valid_mask_flat]) uses masked_scatter_ in its backward
-                    # pass. Under BFloat16 AMP, logsumexp can produce BF16 gradients that
-                    # flow back into the float32 flat_logits via masked_scatter_, crashing
-                    # with "expected self and source to have same dtypes".
+                    # Keep z-loss branchless for CUDA: no boolean-index gather,
+                    # no masked_scatter_ backward, and no extra compacted tensor.
                     _zloss_device = device.type if device.type in ('cuda', 'cpu') else 'cpu'
                     with torch.amp.autocast(device_type=_zloss_device, enabled=False):
                         valid_mask_flat = flat_labels != -100
-                        valid_logits = flat_logits[valid_mask_flat]
-                        z_loss = torch.logsumexp(valid_logits, dim=-1).pow(2).mean() * z_loss_weight
+                        if device.type == 'cuda':
+                            valid_weight = valid_mask_flat.to(dtype=flat_logits.dtype)
+                            valid_count = valid_weight.sum().clamp_min(1.0)
+                            z_terms = torch.logsumexp(flat_logits, dim=-1).pow(2)
+                            z_loss = ((z_terms * valid_weight).sum() / valid_count) * z_loss_weight
+                        else:
+                            valid_logits = flat_logits[valid_mask_flat]
+                            z_loss = torch.logsumexp(valid_logits, dim=-1).pow(2).mean() * z_loss_weight
                     loss = loss + z_loss
             
             # Compute auxiliary costs for reporting (trainer handles loss composition)
@@ -602,6 +611,13 @@ class HierarchosCore(nn.Module):
                 cost_tensor = torch.stack([c.float().view(B) for c in costs], dim=0)
                 weight_tensor = torch.stack(weights, dim=0).float()
                 denom = weight_tensor.sum()
+                if device.type == 'cuda':
+                    weighted_mean = (cost_tensor * weight_tensor).sum() / denom.clamp_min(1.0)
+                    return torch.where(
+                        denom > 0,
+                        weighted_mean,
+                        torch.zeros((), device=device, dtype=cost_tensor.dtype),
+                    )
                 if denom <= 0:
                     return torch.zeros((), device=device, dtype=cost_tensor.dtype)
                 return (cost_tensor * weight_tensor).sum() / denom

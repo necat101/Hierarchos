@@ -296,7 +296,10 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                         _clip_val = getattr(args, 'grad_clip', 1.0)
                         if _clip_val > 0:
                             _grad_norm = ltm_grads_tensor.norm()
-                            if _grad_norm > _clip_val:
+                            if device.type == 'cuda':
+                                _clip_coef = (_clip_val / (_grad_norm + 1e-8)).clamp(max=1.0)
+                                ltm_grads_tensor = ltm_grads_tensor * _clip_coef
+                            elif _grad_norm > _clip_val:
                                 ltm_grads_tensor = ltm_grads_tensor * (_clip_val / (_grad_norm + 1e-8))
                         
                         # Unpack current LTM state for the update

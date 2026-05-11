@@ -252,6 +252,34 @@ def test_cuda_friendly_batched_update_matches_dense_cpu_math_and_deltas():
     assert torch.allclose(sparse_ltm.ltm_deltas, dense_ltm.ltm_deltas, atol=1e-6)
 
 
+def test_cuda_friendly_update_with_no_valid_slots_is_read_only():
+    torch.manual_seed(21)
+    ltm = LTMModule(n_slots=5, key_dim=3, val_dim=4, momentum=0.7, wd=0.02, forget_rate=0.1)
+    topk_idx = torch.full((2, 3, 2), -1, dtype=torch.long)
+    grads = torch.randn(2, 3, 2, 4)
+    fast = torch.randn(2, 5, 4)
+    mom = torch.randn(2, 5, 4)
+    timestamps = torch.randn(2, 5)
+    sources = torch.ones(2, 5, dtype=torch.long)
+
+    new_fast, new_mom = ltm._inner_update_batched_cuda(
+        topk_idx=topk_idx,
+        grads_tensor=grads,
+        current_lr=0.02,
+        timestamp=9.0,
+        source=LTMModule.SRC_TRAINING_DATA,
+        tokens_covered=3,
+        curr_fast=fast.clone(),
+        curr_mom=mom.clone(),
+        timestamps=timestamps.clone(),
+        sources=sources.clone(),
+        inplace=True,
+    )
+
+    assert torch.allclose(new_fast, fast)
+    assert torch.allclose(new_mom, mom)
+
+
 def test_cuda_friendly_retrieve_matches_dense_cpu_math_with_filter():
     torch.manual_seed(22)
     dense_ltm = LTMModule(n_slots=7, key_dim=4, val_dim=3)
@@ -452,6 +480,25 @@ def test_chunked_lm_loss_matches_full_logits_objective_and_gradients():
     assert torch.allclose(chunked_loss, full_loss.detach(), atol=1e-6)
     assert torch.allclose(hidden_b.grad, full_hidden_grad, atol=1e-6)
     assert torch.allclose(model.lm_head.weight.grad, full_head_grad, atol=1e-6)
+
+
+def test_chunked_lm_loss_all_ignored_rows_is_zero_with_zero_gradients():
+    torch.manual_seed(27)
+    cfg = _config()
+    cfg.vocab_size = 257
+    cfg.cuda_loss_chunk_rows = 5
+    model = HierarchosCore(cfg)
+    model.train()
+
+    hidden = torch.randn(2, 9, cfg.context_dim, requires_grad=True)
+    labels = torch.full((2, 9), -100, dtype=torch.long)
+
+    loss = model._compute_cuda_chunked_lm_loss(hidden, labels, z_loss_weight=1e-4)
+    loss.backward()
+
+    assert loss.item() == 0.0
+    assert hidden.grad is not None
+    assert hidden.grad.abs().sum().item() == 0.0
 
 
 def test_training_forward_can_skip_logits_while_preserving_ltm_gradients():

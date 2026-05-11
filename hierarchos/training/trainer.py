@@ -374,15 +374,19 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                     for t_val in outputs["raw_topk_vals"]:
                         t_val.grad = None
                     outputs["raw_topk_vals"] = None  # Free tensor references (BUG #3: memory leak fix)
+                    ltm_grads_tensor = torch.nan_to_num(ltm_grads_tensor, nan=0.0, posinf=0.0, neginf=0.0)
 
-                    if torch.isfinite(ltm_grads_tensor).all():
+                    if ltm_grads_tensor is not None:
                         # Direct tensor clipping (clip_grad_norm_ expects parameters with .grad,
                         # but ltm_grads_tensor IS the gradient data itself — no .grad attribute)
                         _clip_val = getattr(args, 'grad_clip', 1.0)
                         if _clip_val > 0:
                             _grad_norm = ltm_grads_tensor.norm()
-                            if _grad_norm > _clip_val:
-                                ltm_grads_tensor = ltm_grads_tensor * (_clip_val / (_grad_norm + 1e-8))
+                            _clip_coef = torch.clamp(
+                                ltm_grads_tensor.new_tensor(float(_clip_val)) / (_grad_norm + 1e-8),
+                                max=1.0,
+                            )
+                            ltm_grads_tensor = ltm_grads_tensor * _clip_coef
                         
                         # Unpack current LTM state for the update
                         curr_ltm = outputs.get('ltm_memory_state')

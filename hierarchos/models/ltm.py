@@ -123,7 +123,7 @@ class LTMModule(nn.Module):
     def _inject_score_gradients(self, gathered_vals: torch.Tensor, selected_sim: torch.Tensor) -> torch.Tensor:
         """Give the address path gradients without changing retrieved values."""
         scale = getattr(self, "score_grad_scale", 1.0)
-        if scale == 0.0 or not torch.is_grad_enabled() or not selected_sim.requires_grad:
+        if selected_sim is None or scale == 0.0 or not torch.is_grad_enabled() or not selected_sim.requires_grad:
             return gathered_vals
         score_signal = (selected_sim - selected_sim.detach()).unsqueeze(-1)
         return gathered_vals + score_signal.to(dtype=gathered_vals.dtype) * gathered_vals.detach() * scale
@@ -141,8 +141,7 @@ class LTMModule(nn.Module):
         topk_idx = topk_idx.to(device=device, dtype=torch.long)
         grads_tensor = grads_tensor.to(device=device).float()
         valid_mask = topk_idx >= 0
-        if not valid_mask.any():
-            return curr_fast, curr_mom
+        has_valid = valid_mask.any()
 
         curr_fast = curr_fast.float() if inplace else curr_fast.float().clone()
         curr_mom = curr_mom.float() if inplace else curr_mom.float().clone()
@@ -161,7 +160,12 @@ class LTMModule(nn.Module):
         slot_grads.index_add_(0, inverse, grads_flat)
         slot_grads = slot_grads / (counts.to(dtype=torch.float32).unsqueeze(-1) + 1e-8)
 
-        curr_mom.mul_(self.momentum)
+        momentum_factor = torch.where(
+            has_valid,
+            curr_mom.new_tensor(float(self.momentum)),
+            curr_mom.new_tensor(1.0),
+        )
+        curr_mom.mul_(momentum_factor)
         touched_mom = curr_mom.index_select(0, unique_idx).add(slot_grads)
         touched_mom.clamp_(min=-50.0, max=50.0)
         curr_mom.index_copy_(0, unique_idx, touched_mom)
@@ -169,6 +173,11 @@ class LTMModule(nn.Module):
         if tokens_covered is None:
             tokens_covered = self.reference_chunk_len
         retention_rate = (1.0 - self.forget_rate) ** (tokens_covered / float(self.reference_chunk_len))
+        retention_rate = torch.where(
+            has_valid,
+            curr_fast.new_tensor(float(retention_rate)),
+            curr_fast.new_tensor(1.0),
+        )
 
         touched_fast = curr_fast.index_select(0, unique_idx)
         update_step = (touched_mom + self.weight_decay * touched_fast).mul(-current_lr)
@@ -203,8 +212,7 @@ class LTMModule(nn.Module):
         topk_idx = topk_idx.to(device=device, dtype=torch.long)
         grads_tensor = grads_tensor.to(device=device).float()
         valid_mask = topk_idx >= 0
-        if not valid_mask.any():
-            return curr_fast, curr_mom
+        has_valid = valid_mask.any()
 
         curr_fast = curr_fast.float() if inplace else curr_fast.float().clone()
         curr_mom = curr_mom.float() if inplace else curr_mom.float().clone()
@@ -212,6 +220,11 @@ class LTMModule(nn.Module):
         if tokens_covered is None:
             tokens_covered = self.reference_chunk_len
         retention_rate = (1.0 - self.forget_rate) ** (tokens_covered / float(self.reference_chunk_len))
+        retention_rate = torch.where(
+            has_valid,
+            curr_fast.new_tensor(float(retention_rate)),
+            curr_fast.new_tensor(1.0),
+        )
 
         batch_size, num_slots, val_dim = curr_fast.shape
         idx_safe = topk_idx.clamp(min=0)
@@ -234,7 +247,12 @@ class LTMModule(nn.Module):
         batch_idx = torch.div(unique_linear, num_slots, rounding_mode='floor')
         slot_idx = unique_linear.remainder(num_slots)
 
-        curr_mom.mul_(self.momentum)
+        momentum_factor = torch.where(
+            has_valid,
+            curr_mom.new_tensor(float(self.momentum)),
+            curr_mom.new_tensor(1.0),
+        )
+        curr_mom.mul_(momentum_factor)
         touched_mom = curr_mom[batch_idx, slot_idx].add(slot_grads)
         touched_mom.clamp_(min=-50.0, max=50.0)
         curr_mom[batch_idx, slot_idx] = touched_mom
@@ -318,7 +336,9 @@ class LTMModule(nn.Module):
             
             effective_memory_size = self.vals.shape[0]
             idx_clamped = idx.clamp(min=0, max=effective_memory_size-1)
-            selected_sim = torch.gather(sim, dim=-1, index=idx_clamped)
+            selected_sim = None
+            if torch.is_grad_enabled() and getattr(self, "score_grad_scale", 1.0) != 0.0 and sim.requires_grad:
+                selected_sim = torch.gather(sim, dim=-1, index=idx_clamped)
 
             if use_cuda_math:
                 weighted_vals, ts_retrieved = self._gather_topk_cuda(

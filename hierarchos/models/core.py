@@ -667,8 +667,12 @@ class HierarchosCore(nn.Module):
         flat_labels = shift_labels.view(-1)
 
         valid_mask = flat_labels != -100
-        valid_count = valid_mask.sum()
-        denom = valid_count.clamp_min(1).to(dtype=torch.float32)
+        valid_hidden = flat_hidden[valid_mask]
+        valid_labels = flat_labels[valid_mask]
+        valid_count = valid_labels.shape[0]
+        if valid_count == 0:
+            return hidden.sum() * 0.0
+        denom = torch.tensor(float(valid_count), device=hidden.device, dtype=torch.float32)
 
         chunk_rows = int(getattr(self.config, "cuda_loss_chunk_rows", 0) or 0)
         if chunk_rows <= 0:
@@ -677,17 +681,17 @@ class HierarchosCore(nn.Module):
         total_ce = torch.zeros((), device=hidden.device, dtype=torch.float32)
         total_z = torch.zeros((), device=hidden.device, dtype=torch.float32)
 
-        for start in range(0, flat_hidden.shape[0], chunk_rows):
-            end = min(start + chunk_rows, flat_hidden.shape[0])
-            chunk_hidden = flat_hidden[start:end]
-            chunk_labels = flat_labels[start:end]
+        for start in range(0, valid_count, chunk_rows):
+            end = min(start + chunk_rows, valid_count)
+            chunk_hidden = valid_hidden[start:end]
+            chunk_labels = valid_labels[start:end]
             chunk_logits = torch.clamp(self.lm_head(chunk_hidden), min=-30.0, max=30.0).float()
 
             total_ce = total_ce + F.cross_entropy(chunk_logits, chunk_labels, reduction="sum")
 
             if z_loss_weight > 0:
                 row_z = torch.logsumexp(chunk_logits, dim=-1).pow(2)
-                total_z = total_z + (row_z * (chunk_labels != -100).to(dtype=row_z.dtype)).sum()
+                total_z = total_z + row_z.sum()
 
         loss = total_ce / denom
         if z_loss_weight > 0:

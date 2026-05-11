@@ -1,16 +1,26 @@
 -----
 
-# Hierarchos v0.19.1 (alpha): The Optimization and GUI Update
+# Hierarchos v0.19.2 (alpha): DataLoader Throughput Tuning
 
 **hierarchos/models/ltm.py** (line 122): CUDA LTM updates now aggregate only touched slots with torch.unique plus indexed writes, avoiding full dense [slots, val_dim] and [batch, slots, val_dim] scatter buffers.
 
 **hierarchos/models/core.py** (line 628): added _compute_cuda_chunked_lm_loss, matching dense CE plus z-loss behavior while chunking lm_head rows for large-vocab CUDA memory pressure.
 
-**The "Optimization and GUI Update"** — Hierarchos now keeps its CPU-friendly math paths intact while automatically switching hot LTM memory operations to GPU-friendly gather/scatter math on CUDA. This release also highlights the Windows GUI bundle workflow for easier local inference and experimentation.
+**The "DataLoader Throughput Tuning" update** — Hierarchos now keeps CUDA input queues bounded by tying auto prefetch to worker count, uses conservative CUDA worker defaults for pre-tokenized datasets, and keeps pinned memory specific to CUDA training.
+
+**The "Optimization and GUI Update"** — Hierarchos keeps its CPU-friendly math paths intact while automatically switching hot LTM memory operations to GPU-friendly gather/scatter math on CUDA. This release also highlights the Windows GUI bundle workflow for easier local inference and experimentation.
 
 A novel AI architecture that synergistically integrates Google's Titans memory system with a Hierarchical Reasoning Model (HRM) and RWKV linear attention to move beyond the limitations of scale and take a decisive step on the path to AGI.
 
 -----
+
+### 🚀 **New in v0.19.2: DataLoader Throughput Tuning**
+
+#### CUDA/CPU Input Pipeline
+- **Conservative CUDA Auto Workers**: `--num_workers -1` now auto-selects a smaller CUDA worker pool, targeting the common pre-tokenized sweet spot instead of oversubscribing CPU and pinned-memory bandwidth.
+- **Worker-Tied Prefetch**: When `--prefetch-factor` is omitted, total queued batches stay bounded relative to worker count. More workers lower per-worker prefetch instead of silently multiplying queued batches.
+- **CUDA-Only Pinned Memory**: DataLoader pinning is enabled for CUDA training and avoided for CPU/DirectML paths where it adds overhead without async H2D benefit.
+- **Override Still Available**: Use explicit `--num_workers` and `--prefetch-factor` when slow storage, Hugging Face tokenization, or JSON parsing makes the input pipeline the bottleneck.
 
 ### 🚀 **New in v0.19: The "Optimization and GUI Update"**
 
@@ -33,7 +43,8 @@ A novel AI architecture that synergistically integrates Google's Titans memory s
 - **cuDNN Benchmark**: Auto-tunes convolution kernels for hardware.
 - **torch.compile Auto-Enable**: Worker loop compiled on CUDA (no Windows CPU hang issue).
 - **Non-blocking Transfers**: Host-to-device copies overlap with GPU computation via `non_blocking=True`.
-- **Pinned Memory**: DataLoader always uses `pin_memory=True` on CUDA.
+- **Pinned Memory**: DataLoader uses `pin_memory=True` for CUDA training.
+- **Bounded DataLoader Prefetch**: Auto prefetch is tied to worker count to avoid over-queuing pinned batches.
 - **`--no-amp` Flag**: Explicitly disable AMP if needed.
 
 #### 🧪 Test Suite
@@ -90,7 +101,7 @@ A powerful, data-efficient, and deep reasoning engine. Its dual-module design (a
 
   * 🔄 **RWKV v8 Backbone**: Linear-complexity attention with O(1) inference cost. WKV recurrence, SwiGLU FFN, DeepEmbed gating, and ROSA neurosymbolic embeddings.
   * ⚙️ **Adaptive CPU/CUDA LTM Math**: Keeps CPU-friendly dense LTM math on CPU while automatically using GPU-friendly gather/scatter retrieval and update paths on CUDA.
-  * ⚡ **CUDA Datacenter Ready**: Auto-enables AMP (bfloat16 on Ampere+), TF32 matmul, cuDNN benchmark, torch.compile, non-blocking transfers, and pinned memory — zero configuration needed.
+  * ⚡ **CUDA Datacenter Ready**: Auto-enables AMP (bfloat16 on Ampere+), TF32 matmul, cuDNN benchmark, torch.compile, non-blocking transfers, CUDA pinned memory, and bounded DataLoader prefetch — zero configuration needed.
   * 🪟 **Windows GUI Bundle**: Build a portable GUI release with `Hierarchos.exe` and a bundled backend for normal inference without requiring users to clone the repo.
   * 📊 **Integrated Benchmarking**: Optional support for `lm-evaluation-harness`. Track model accuracy on standard benchmarks (HellaSwag, ARC, etc.) during or after training with `--eval-tasks`.
   * 🎮 **AMD GPU Support (DirectML/ZLUDA)**: Train on AMD Radeon GPUs using DirectML backend on Windows. Opt-in via `--device dml` with automatic compatibility handling and optimized fallbacks.
@@ -317,7 +328,7 @@ python hierarchos_cli.py train \
 💡 **CUDA Auto-Optimization:** On NVIDIA GPUs, AMP, TF32, cuDNN benchmark, and torch.compile are **auto-enabled** — no flags needed. Use `--no-amp` to disable.
 💾 **Training on Low Memory:** Use `--gradient-checkpointing` to significantly reduce VRAM usage at the cost of some extra computation.
 🎮 **AMD GPU Training:** Use `--device dml` to train on AMD Radeon GPUs via DirectML. AMP is automatically disabled for stability.
-🚀 **Datacenter Training:** `--num_workers 8 --batch_size 32 --training-chunk-size 512 --persist-state` for maximum GPU utilization.
+🚀 **Datacenter Training:** start with auto workers or `--num_workers 4 --batch_size 32 --training-chunk-size 512 --persist-state`, then benchmark higher worker counts only if the input pipeline is still the bottleneck.
 
 ## ⚠️ **HRM Convergence & Training Speed:** Higher `--max_h_steps` and `--max_l_steps` allow deeper reasoning but **significantly increase training time** per batch due to the iterative HRM process. Adjust based on your task and compute resources.
 
@@ -588,7 +599,9 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.5 --top-
 | `--force-compile`              | `train`, `finetune`                 | Force torch.compile even on Windows CPU (overrides safety check).                                                                         | `False`                 |
 | `--amp`                        | `train`, `finetune`, `chat`         | **Enable Automatic Mixed Precision (auto-enabled on CUDA).**                                                                                     | `False`                 |
 | `--no-amp`                     | `train`, `finetune`                 | **Explicitly disable AMP** (overrides auto-detection on CUDA).                                                                                   | N/A                     |
-| `--num_workers`                | `train`, `finetune`                 | Number of CPU workers for data loading (and HF dataset mapping if applicable).                                                         | `0`                     |
+| `--num_workers`                | `train`, `finetune`                 | Number of CPU workers for data loading (`-1` = auto; CUDA defaults conservatively, CPU/DML use 0).                                      | `-1`                    |
+| `--prefetch-factor`            | `train`, `finetune`                 | Batches prefetched per DataLoader worker. Omit it to keep total queued batches tied to worker count.                                    | `None`                  |
+| `--pt-cache-size`              | `train`, `finetune`                 | Number of `.pt` chunk files to keep hot per worker when using `--pre_pt_dataset`.                                                       | `2`                     |
 | `--lora_r`                     | `finetune`                          | LoRA rank 'r'.                                                                                                                           | `8`                     |
 | `--lora_alpha`                 | `finetune`                          | LoRA alpha scaling factor.                                                                                                               | `16`                    |\n| `--finetune-unlock-percent`    | `finetune`                          | Target % of params to train (approx.). Overrides `--lora_r` if set.                                                                     | `None`                  |
 | `--kayla`                      | `train`, `finetune`                 | Enable Kayla-style instruction tuning format (with thought-process). **Ignored if using pre-chunked formats or --text\_column.** | `False`                 |
@@ -676,6 +689,13 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
 
 ## Changelog
 
+### v0.19.2 (alpha)
+
+  * **DataLoader Throughput Tuning**: CUDA auto worker selection now defaults to a conservative worker pool for pre-tokenized training, avoiding unnecessary CPU contention and pinned-memory churn.
+  * **Worker-Tied Prefetch**: Auto `prefetch_factor` now keeps total queued batches bounded relative to `num_workers`; explicit `--prefetch-factor` still overrides this when the input pipeline is truly the bottleneck.
+  * **CUDA-Only Pinning**: DataLoader pinned memory is selected from the requested device, so CPU and DirectML training avoid pinning overhead while CUDA keeps async host-to-device transfers.
+  * **Chunked Dataset Efficiency**: Pre-tokenized JSONL workers shard by file byte range, and `.pt` chunk loading keeps a small hot cache per worker.
+
 ### v0.19 (alpha)
 
   * **Optimization and GUI Update**: Release focus for CUDA/CPU math selection and the Windows GUI workflow.
@@ -704,7 +724,8 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
       * **cuDNN benchmark**: Auto-tunes kernel selection for hardware.
       * **torch.compile auto-enable**: Worker loop compiled on CUDA.
       * **Non-blocking transfers**: `to(device, non_blocking=True)` for async H2D.
-      * **pin_memory always on CUDA**: Regardless of num_workers.
+      * **pin_memory on CUDA**: Enables async H2D when CUDA training is active.
+      * **bounded DataLoader prefetch**: Auto prefetch stays tied to worker count.
       * **drop_last on CUDA**: Prevents irregular batch OOM.
   * **🧪 Test Suite Modernized**: 11/11 tests pass. Rewrote 3 stale tests (`test_forward.py`, `test_inference.py`, `verify_parity_deep.py`) to be self-contained — create models in-memory instead of loading hardcoded checkpoints.
   * **🛡️ Stability Hardening**:

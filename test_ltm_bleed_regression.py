@@ -7,6 +7,7 @@ from hierarchos.training.trainer import (
     compute_chunk_training_weights,
     compute_remaining_update_steps,
     estimate_cuda_loss_chunk_rows,
+    train_step,
 )
 
 
@@ -324,6 +325,103 @@ def test_cuda_friendly_retrieve_matches_dense_cpu_math_with_filter():
     assert torch.allclose(sparse_ts, dense_ts, atol=1e-6)
 
 
+def test_cpu_gather_retrieval_default_matches_dense_cpu_math():
+    torch.manual_seed(221)
+    dense_ltm = LTMModule(n_slots=11, key_dim=5, val_dim=4, cpu_gather_retrieval=False)
+    gather_ltm = LTMModule(n_slots=11, key_dim=5, val_dim=4, cpu_gather_retrieval=True)
+    gather_ltm.load_state_dict(dense_ltm.state_dict())
+
+    queries = torch.randn(3, 5)
+    fast_vals = torch.randn(11, 4) * 0.1
+    timestamps = torch.arange(11, dtype=torch.float32)
+    sources = torch.tensor([
+        LTMModule.SRC_TRAINING_DATA,
+        LTMModule.SRC_USER_INTERACTION,
+        LTMModule.SRC_TRAINING_DATA,
+        LTMModule.SRC_TRAINING_DATA,
+        LTMModule.SRC_CORRECTION,
+        LTMModule.SRC_TRAINING_DATA,
+        LTMModule.SRC_UNKNOWN,
+        LTMModule.SRC_TRAINING_DATA,
+        LTMModule.SRC_USER_INTERACTION,
+        LTMModule.SRC_TRAINING_DATA,
+        LTMModule.SRC_TRAINING_DATA,
+    ])
+
+    dense_vals, dense_idx, dense_ts = dense_ltm.retrieve_topk(
+        queries,
+        topk=4,
+        min_timestamp=2.0,
+        source_filter=LTMModule.SRC_TRAINING_DATA,
+        fast_vals=fast_vals,
+        timestamps=timestamps,
+        sources=sources,
+    )
+    gather_vals, gather_idx, gather_ts = gather_ltm.retrieve_topk(
+        queries,
+        topk=4,
+        min_timestamp=2.0,
+        source_filter=LTMModule.SRC_TRAINING_DATA,
+        fast_vals=fast_vals,
+        timestamps=timestamps,
+        sources=sources,
+    )
+
+    assert torch.allclose(gather_vals, dense_vals, atol=1e-6)
+    assert torch.equal(gather_idx, dense_idx)
+    assert torch.allclose(gather_ts, dense_ts, atol=1e-6)
+
+
+def test_cpu_sparse_update_default_matches_dense_cpu_math():
+    torch.manual_seed(222)
+    dense_ltm = LTMModule(n_slots=12, key_dim=4, val_dim=5, momentum=0.8, wd=0.02, forget_rate=0.04, cpu_sparse_update=False)
+    sparse_ltm = LTMModule(n_slots=12, key_dim=4, val_dim=5, momentum=0.8, wd=0.02, forget_rate=0.04, cpu_sparse_update=True)
+    sparse_ltm.load_state_dict(dense_ltm.state_dict())
+
+    topk_idx = torch.tensor(
+        [
+            [[0, 1], [5, 1], [11, -1]],
+            [[2, 2], [8, -1], [0, 8]],
+        ],
+        dtype=torch.long,
+    )
+    grads = torch.randn(2, 3, 2, 5)
+    fast = torch.randn(2, 12, 5)
+    mom = torch.randn(2, 12, 5) * 0.1
+    timestamps = torch.zeros(2, 12)
+    sources = torch.zeros(2, 12, dtype=torch.long)
+
+    dense_fast, dense_mom = dense_ltm.inner_update(
+        topk_idx,
+        grads,
+        current_lr=0.015,
+        timestamp=13.0,
+        source=LTMModule.SRC_TRAINING_DATA,
+        tokens_covered=5,
+        fast_vals=fast.clone(),
+        mom_vals=mom.clone(),
+        timestamps=timestamps.clone(),
+        sources=sources.clone(),
+        inplace=True,
+    )
+    sparse_fast, sparse_mom = sparse_ltm.inner_update(
+        topk_idx,
+        grads,
+        current_lr=0.015,
+        timestamp=13.0,
+        source=LTMModule.SRC_TRAINING_DATA,
+        tokens_covered=5,
+        fast_vals=fast.clone(),
+        mom_vals=mom.clone(),
+        timestamps=timestamps.clone(),
+        sources=sources.clone(),
+        inplace=True,
+    )
+
+    assert torch.allclose(sparse_fast, dense_fast, atol=1e-6)
+    assert torch.allclose(sparse_mom, dense_mom, atol=1e-6)
+
+
 def test_hebbian_update_uses_same_rule_as_negative_value_gradient():
     torch.manual_seed(19)
     ltm = LTMModule(n_slots=8, key_dim=4, val_dim=4, momentum=0.9, wd=0.01, forget_rate=0.02)
@@ -451,6 +549,7 @@ def test_chunked_lm_loss_matches_full_logits_objective_and_gradients():
     cfg.vocab_size = 257
     cfg.z_loss_weight = 1e-4
     cfg.cuda_loss_chunk_rows = 7
+    cfg.cpu_loss_chunk_rows = 7
     model = HierarchosCore(cfg)
     model.train()
 
@@ -487,6 +586,7 @@ def test_chunked_lm_loss_all_ignored_rows_is_zero_with_zero_gradients():
     cfg = _config()
     cfg.vocab_size = 257
     cfg.cuda_loss_chunk_rows = 5
+    cfg.cpu_loss_chunk_rows = 5
     model = HierarchosCore(cfg)
     model.train()
 
@@ -537,6 +637,59 @@ def test_training_forward_can_skip_logits_while_preserving_ltm_gradients():
     )
 
     assert grad_norm > 0
+
+
+def test_train_step_uses_cpu_supervised_row_loss_path_by_default():
+    class RecordingCore(HierarchosCore):
+        def __init__(self, config):
+            super().__init__(config)
+            self.seen_return_logits = []
+
+        def forward(self, *args, **kwargs):
+            self.seen_return_logits.append(kwargs.get("return_logits", True))
+            return super().forward(*args, **kwargs)
+
+    torch.manual_seed(281)
+    cfg = _config()
+    cfg.vocab_size = 96
+    cfg.cpu_chunked_lm_loss = True
+    cfg.cpu_loss_chunk_rows = 3
+    model = RecordingCore(cfg)
+    model.train()
+
+    batch = {
+        "input_ids": torch.tensor([[21, 22, 23, 24, 25, 26]], dtype=torch.long),
+        "attention_mask": torch.ones(1, 6, dtype=torch.long),
+        "labels": torch.tensor([[-100, -100, 23, 24, 25, 26]], dtype=torch.long),
+    }
+    args = AttrDict(
+        training_chunk_size=6,
+        amp=False,
+        amp_dtype="float16",
+        persist_state=False,
+        cpu_chunked_lm_loss=True,
+        cuda_chunked_lm_loss=True,
+        grad_clip=1.0,
+        ltm_lr=0.001,
+        ponder_loss_weight=0.01,
+        commitment_loss_weight=0.5,
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+
+    outputs, _ = train_step(
+        model,
+        batch,
+        optimizer,
+        scaler=None,
+        accumulation_steps=1,
+        step=0,
+        args=args,
+        running_states=(None, None, None, None, None, None),
+    )
+
+    assert model.seen_return_logits == [False]
+    assert outputs is not None
+    assert torch.isfinite(outputs["loss"]).all()
 
 
 def test_inplace_ltm_update_accumulates_deltas_like_state_delta():

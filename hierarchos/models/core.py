@@ -163,7 +163,9 @@ class HierarchosCore(nn.Module):
             wd=getattr(config, 'ltm_weight_decay', 1e-4),
             forget_rate=getattr(config, 'ltm_forget_rate', 0.01),
             reference_chunk_len=getattr(config, 'reference_chunk_len', getattr(config, 'training_chunk_size', 128)),
-            score_grad_scale=getattr(config, 'ltm_score_grad_scale', 1.0)
+            score_grad_scale=getattr(config, 'ltm_score_grad_scale', 1.0),
+            cpu_gather_retrieval=getattr(config, 'ltm_cpu_gather_retrieval', True),
+            cpu_sparse_update=getattr(config, 'ltm_cpu_sparse_update', True)
         )
         self.qproj = nn.Linear(config.context_dim * 2, config.ltm_key_dim, bias=False)
         self.val_proj = nn.Linear(config.context_dim, config.ltm_val_dim, bias=False)
@@ -654,7 +656,7 @@ class HierarchosCore(nn.Module):
     def _compute_cuda_chunked_lm_loss(self, hidden: torch.Tensor, labels: torch.Tensor,
                                       z_loss_weight: float = 1e-4) -> torch.Tensor:
         """
-        Memory-friendly CUDA loss path for large vocabularies.
+        Memory-friendly supervised-row loss path for large vocabularies.
 
         This intentionally recomputes lm_head by row chunks instead of materializing
         the full shifted logits tensor for loss calculation. The reduction matches
@@ -674,7 +676,10 @@ class HierarchosCore(nn.Module):
             return hidden.sum() * 0.0
         denom = torch.tensor(float(valid_count), device=hidden.device, dtype=torch.float32)
 
-        chunk_rows = int(getattr(self.config, "cuda_loss_chunk_rows", 0) or 0)
+        if hidden.device.type == "cpu":
+            chunk_rows = int(getattr(self.config, "cpu_loss_chunk_rows", 0) or 0)
+        else:
+            chunk_rows = int(getattr(self.config, "cuda_loss_chunk_rows", 0) or 0)
         if chunk_rows <= 0:
             chunk_rows = flat_hidden.shape[0]
 

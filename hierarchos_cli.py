@@ -119,7 +119,16 @@ def main():
     train_group.add_argument("--training-chunk-size", "--training_chunk_size", type=int, default=128, help="TBPTT chunk size (Default: 128).")
     train_group.add_argument("--cuda-loss-chunk-rows", "--cuda_loss_chunk_rows", type=int, default=0, help="Rows per lm_head loss chunk on CUDA (0 = auto).")
     train_group.add_argument("--no-cuda-chunked-lm-loss", dest="cuda_chunked_lm_loss", action="store_false", help="Disable CUDA chunked LM loss and return full logits during training.")
-    train_group.set_defaults(cuda_chunked_lm_loss=True)
+    train_group.add_argument("--cpu-loss-chunk-rows", "--cpu_loss_chunk_rows", type=int, default=0, help="Rows per lm_head loss chunk on CPU (0 = all supervised rows).")
+    train_group.add_argument("--no-cpu-chunked-lm-loss", dest="cpu_chunked_lm_loss", action="store_false", help="Disable CPU supervised-row LM loss and return full logits during training.")
+    train_group.add_argument("--no-ltm-cpu-gather-retrieval", dest="ltm_cpu_gather_retrieval", action="store_false", help="Use the old dense one-hot CPU retrieval path.")
+    train_group.add_argument("--no-ltm-cpu-sparse-update", dest="ltm_cpu_sparse_update", action="store_false", help="Use the old dense one-hot CPU LTM update path.")
+    train_group.set_defaults(
+        cuda_chunked_lm_loss=True,
+        cpu_chunked_lm_loss=True,
+        ltm_cpu_gather_retrieval=True,
+        ltm_cpu_sparse_update=True,
+    )
     train_group.add_argument("--debug-numerics", action="store_true", help="Enable per-token NaN/Inf debug checks. Slower on CUDA.")
     train_group.add_argument("--save-steps", type=int, default=0, help="Save a checkpoint/adapter every N steps during training/finetuning (0 to disable).")
     train_group.add_argument("--num_workers", type=int, default=0, help="DataLoader workers. Set to 4-8 for GPU training.")

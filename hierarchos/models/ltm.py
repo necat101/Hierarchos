@@ -17,7 +17,7 @@ class LTMModule(nn.Module):
     SRC_TRAINING_DATA = 2
     SRC_CORRECTION = 3 
 
-    def __init__(self, n_slots=1024, key_dim=64, val_dim=64, lr=1e-3, momentum=0.9, wd=1e-4, forget_rate=0.01, reference_chunk_len=128, score_grad_scale=1.0):
+    def __init__(self, n_slots=1024, key_dim=64, val_dim=64, lr=1e-3, momentum=0.9, wd=1e-4, forget_rate=0.01, reference_chunk_len=128, score_grad_scale=1.0, cpu_gather_retrieval=True, cpu_sparse_update=True):
         super().__init__()
         
         # --- Slow Weights (Long-Term Consolidation) ---
@@ -39,6 +39,8 @@ class LTMModule(nn.Module):
         self.forget_rate = forget_rate 
         self.reference_chunk_len = reference_chunk_len
         self.score_grad_scale = float(score_grad_scale)
+        self.cpu_gather_retrieval = bool(cpu_gather_retrieval)
+        self.cpu_sparse_update = bool(cpu_sparse_update)
 
         # Buffers for tracking history context
         self.register_buffer("timestamps", torch.zeros(n_slots, dtype=torch.float32))
@@ -54,8 +56,8 @@ class LTMModule(nn.Module):
         # <<< NEW: Online Learning Accumulator >>>
         self.register_buffer("ltm_deltas", torch.zeros(n_slots, val_dim), persistent=False)
         self.accumulate_deltas = False
-        # Internal architecture switch: CUDA uses gather/scatter-heavy math,
-        # CPU keeps the dense one-hot path that benchmarks well on small tensors.
+        # Internal architecture switch: CUDA stays on the existing gather/scatter path.
+        # CPU can opt into the same sparse math to avoid large one-hot tensors.
         self._cuda_friendly_math = True
 
     def reset_working_memory(self):
@@ -71,6 +73,16 @@ class LTMModule(nn.Module):
 
     def _use_cuda_math(self, tensor: torch.Tensor) -> bool:
         return bool(self._cuda_friendly_math and tensor.device.type == "cuda")
+
+    def _use_gather_retrieval(self, tensor: torch.Tensor) -> bool:
+        return self._use_cuda_math(tensor) or bool(
+            self.cpu_gather_retrieval and tensor.device.type == "cpu"
+        )
+
+    def _use_sparse_update(self, tensor: torch.Tensor) -> bool:
+        return self._use_cuda_math(tensor) or bool(
+            self.cpu_sparse_update and tensor.device.type == "cpu"
+        )
 
     @staticmethod
     def _expand_slot_tensor_for_index(tensor: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
@@ -312,6 +324,7 @@ class LTMModule(nn.Module):
                     sim = torch.where(valid_mask, sim, self.neg_inf.to(dtype=sim.dtype))
 
             use_cuda_math = self._use_cuda_math(queries)
+            use_gather_retrieval = self._use_gather_retrieval(queries)
             if use_cuda_math and min_timestamp <= 0.0 and source_filter is None:
                 effective_topk = min(topk, self.vals.shape[0])
             else:
@@ -340,7 +353,7 @@ class LTMModule(nn.Module):
             if torch.is_grad_enabled() and getattr(self, "score_grad_scale", 1.0) != 0.0 and sim.requires_grad:
                 selected_sim = torch.gather(sim, dim=-1, index=idx_clamped)
 
-            if use_cuda_math:
+            if use_gather_retrieval:
                 weighted_vals, ts_retrieved = self._gather_topk_cuda(
                     idx_clamped,
                     effective_memory,
@@ -415,7 +428,7 @@ class LTMModule(nn.Module):
         curr_mom = mom_vals if mom_vals is not None else self._mom_vals
 
         if curr_fast.dim() == 3:
-            if self._use_cuda_math(curr_fast):
+            if self._use_sparse_update(curr_fast):
                 return self._inner_update_batched_cuda(
                     topk_idx=topk_idx,
                     grads_tensor=grads_tensor,
@@ -446,7 +459,7 @@ class LTMModule(nn.Module):
         if grads_tensor is None: 
             return curr_fast, curr_mom
 
-        if self._use_cuda_math(curr_fast):
+        if self._use_sparse_update(curr_fast):
             return self._inner_update_flat_cuda(
                 topk_idx=topk_idx,
                 grads_tensor=grads_tensor,

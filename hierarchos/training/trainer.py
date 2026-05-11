@@ -270,9 +270,9 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
     has_commitment = False
     chunks_processed = 0
     final_outputs = None
-    cuda_fast_lm_loss = (
-        device.type == 'cuda'
-        and getattr(args, 'cuda_chunked_lm_loss', True)
+    fast_lm_loss = (
+        (device.type == 'cuda' and getattr(args, 'cuda_chunked_lm_loss', True))
+        or (device.type == 'cpu' and getattr(args, 'cpu_chunked_lm_loss', True))
     )
     
     try:
@@ -299,7 +299,7 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                     h_state=h_state, l_state=l_state, prev_context=prev_ctx,
                     target_context=target_ctx, drift_state=drift_state, ltm_memory_state=ltm_state,
                     global_pos_offset=start_t,
-                    return_logits=not cuda_fast_lm_loss,
+                    return_logits=not fast_lm_loss,
                     return_topk_values=False
                 )
                 
@@ -727,6 +727,11 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         if model.ltm.reference_chunk_len != training_chunk_size:
             print(f"INFO: Updating LTM reference chunk length from {model.ltm.reference_chunk_len} to {training_chunk_size}")
             model.ltm.reference_chunk_len = training_chunk_size
+        model.ltm.cpu_gather_retrieval = bool(getattr(args, 'ltm_cpu_gather_retrieval', True))
+        model.ltm.cpu_sparse_update = bool(getattr(args, 'ltm_cpu_sparse_update', True))
+    if hasattr(model, 'config'):
+        model.config.cpu_chunked_lm_loss = bool(getattr(args, 'cpu_chunked_lm_loss', True))
+        model.config.cpu_loss_chunk_rows = int(getattr(args, 'cpu_loss_chunk_rows', 0) or 0)
     # ----------------------------------------------------
 
     # --- Print Model Stats ---

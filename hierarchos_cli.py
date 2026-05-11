@@ -98,6 +98,7 @@ def main():
     train_group.add_argument("--min-lr", type=float, default=1e-6)
     train_group.add_argument("--disable-lr-schedule", action="store_true")
     train_group.add_argument("--ltm_lr", type=float, default=1e-3)
+    train_group.add_argument("--ltm-score-grad-scale", "--ltm_score_grad_scale", type=float, default=1.0, help="Straight-through gradient scale for LTM query/key addressing. Set 0 to keep retrieval addressing frozen.")
     train_group.add_argument("--kayla", action="store_true")
     train_group.add_argument("--lora_r", type=int, default=8)
     train_group.add_argument("--lora_alpha", type=int, default=16)

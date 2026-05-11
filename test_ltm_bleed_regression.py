@@ -356,6 +356,67 @@ def test_feedback_path_raw_topk_tensors_receive_gradients():
     assert grad_norm > 0
 
 
+def test_memory_addressing_parameters_receive_gradients():
+    torch.manual_seed(24)
+    model = HierarchosCore(_config())
+    model.train()
+
+    input_ids = torch.tensor([[15, 16, 17, 18]], dtype=torch.long)
+    labels = input_ids.clone()
+
+    outputs = model(input_ids=input_ids, labels=labels, suppress_hebbian=True)
+    outputs["loss"].backward()
+
+    assert model.qproj.weight.grad is not None
+    assert model.qproj.weight.grad.abs().sum().item() > 0
+    assert model.ltm.keys.grad is not None
+    assert model.ltm.keys.grad.abs().sum().item() > 0
+
+
+def test_ltm_score_gradients_do_not_change_retrieved_values():
+    torch.manual_seed(25)
+    ltm = LTMModule(n_slots=8, key_dim=4, val_dim=4)
+    queries = torch.randn(2, 4, requires_grad=True)
+
+    ltm.score_grad_scale = 0.0
+    vals_without, idx_without, ts_without = ltm.retrieve_topk(queries, topk=3)
+
+    ltm.score_grad_scale = 1.0
+    vals_with, idx_with, ts_with = ltm.retrieve_topk(queries, topk=3)
+
+    assert torch.allclose(vals_with, vals_without, atol=0.0)
+    assert torch.equal(idx_with, idx_without)
+    assert torch.allclose(ts_with, ts_without, atol=0.0)
+
+
+def test_drift_state_argument_seeds_next_forward_call():
+    torch.manual_seed(26)
+    cfg = _config()
+    cfg.max_l_steps = 1
+    model = HierarchosCore(cfg)
+    model.eval()
+
+    prefix = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+    next_ids = torch.tensor([[5]], dtype=torch.long)
+
+    with torch.no_grad():
+        base = model(prefix)
+        common_kwargs = dict(
+            input_ids=next_ids,
+            h_state=base["h_state"],
+            l_state=base["l_state"],
+            prev_context=base["prev_context"],
+            target_context=base["target_context"],
+            ltm_memory_state=base["ltm_memory_state"],
+            global_pos_offset=prefix.shape[1],
+        )
+        out_zero = model(**common_kwargs, drift_state=torch.zeros_like(base["drift_state"]))
+        out_seeded = model(**common_kwargs, drift_state=torch.ones_like(base["drift_state"]) * 4.0)
+
+    assert not torch.allclose(out_zero["logits"], out_seeded["logits"], atol=1e-6)
+    assert not torch.allclose(out_zero["drift_state"], out_seeded["drift_state"], atol=1e-6)
+
+
 def test_chunked_lm_loss_matches_full_logits_objective_and_gradients():
     torch.manual_seed(27)
     cfg = _config()

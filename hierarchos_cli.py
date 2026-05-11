@@ -56,13 +56,15 @@ def resolve_num_workers(requested_workers, device, batch_size):
 
     cpu_count = os.cpu_count() or 1
     if getattr(device, "type", "cpu") == "cuda":
-        # Enough workers to keep pinned batches ready without duplicating huge
-        # in-memory datasets across too many spawned Windows worker processes.
-        by_cpu = max(1, cpu_count // 2)
-        if cpu_count >= 4:
-            by_cpu = max(2, by_cpu)
+        # Four workers is the usual sweet spot for pre-tokenized CUDA training:
+        # enough to keep pinned batches ready without spending too much CPU/RAM
+        # bandwidth on loader overhead. Users can still override for heavy HF
+        # tokenization or slow remote storage.
+        by_cpu = max(1, cpu_count // 4)
+        if cpu_count >= 8:
+            by_cpu = max(4, by_cpu)
         by_batch = max(1, int(batch_size or 1) * 2)
-        return min(8, by_cpu, by_batch)
+        return min(4, by_cpu, by_batch)
 
     # CPU and DirectML training usually want the cores for model math. Users can
     # still override this for tokenizer-heavy Hugging Face datasets.
@@ -152,7 +154,7 @@ def main():
     train_group.add_argument("--debug-numerics", action="store_true", help="Enable per-token NaN/Inf debug checks. Slower on CUDA.")
     train_group.add_argument("--save-steps", type=int, default=0, help="Save a checkpoint/adapter every N steps during training/finetuning (0 to disable).")
     train_group.add_argument("--num_workers", type=int, default=-1, help="DataLoader workers (-1 = auto; CUDA uses prefetched workers, CPU/DML uses 0).")
-    train_group.add_argument("--prefetch-factor", "--prefetch_factor", dest="prefetch_factor", type=int, default=None, help="Batches prefetched per DataLoader worker (auto when omitted).")
+    train_group.add_argument("--prefetch-factor", "--prefetch_factor", dest="prefetch_factor", type=int, default=None, help="Batches prefetched per DataLoader worker (auto keeps total queued batches tied to worker count).")
     train_group.add_argument("--pt-cache-size", "--pt_cache_size", dest="pt_cache_size", type=int, default=2, help="Number of .pt chunk files to keep hot per worker for --pre_pt_dataset.")
     train_group.add_argument("--amp", action="store_true", help="Enable mixed precision (auto-enabled on CUDA).")
     train_group.add_argument("--no-amp", dest="amp", action="store_false", help="Explicitly disable mixed precision.")

@@ -114,6 +114,15 @@ def _worker_init_fn(_worker_id):
     # Keep loader workers from each spinning up a full BLAS/OpenMP thread pool.
     torch.set_num_threads(1)
 
+def _resolve_prefetch_factor(num_workers: int, prefetch_factor=None, pin_memory: bool = False):
+    if num_workers <= 0:
+        return None
+    if prefetch_factor is not None:
+        return max(1, int(prefetch_factor))
+
+    target_prefetched_batches = 8 if pin_memory else 4
+    return max(1, (target_prefetched_batches + num_workers - 1) // num_workers)
+
 def _create_dataloader(dataset, *, batch_size=None, collate_fn=None, num_workers=0,
                        pin_memory=False, shuffle=None, drop_last=False,
                        batch_sampler=None, prefetch_factor=None):
@@ -138,7 +147,11 @@ def _create_dataloader(dataset, *, batch_size=None, collate_fn=None, num_workers
     if kwargs["num_workers"] > 0:
         kwargs["persistent_workers"] = True
         kwargs["worker_init_fn"] = _worker_init_fn
-        kwargs["prefetch_factor"] = max(1, int(prefetch_factor or (4 if pin_memory else 2)))
+        kwargs["prefetch_factor"] = _resolve_prefetch_factor(
+            kwargs["num_workers"],
+            prefetch_factor=prefetch_factor,
+            pin_memory=kwargs["pin_memory"],
+        )
     else:
         kwargs["persistent_workers"] = False
 

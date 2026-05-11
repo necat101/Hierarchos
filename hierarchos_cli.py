@@ -49,6 +49,26 @@ def configure_tokenizer_length(tokenizer, max_length):
         pass
 
 
+def resolve_num_workers(requested_workers, device, batch_size):
+    requested_workers = int(requested_workers)
+    if requested_workers >= 0:
+        return requested_workers
+
+    cpu_count = os.cpu_count() or 1
+    if getattr(device, "type", "cpu") == "cuda":
+        # Enough workers to keep pinned batches ready without duplicating huge
+        # in-memory datasets across too many spawned Windows worker processes.
+        by_cpu = max(1, cpu_count // 2)
+        if cpu_count >= 4:
+            by_cpu = max(2, by_cpu)
+        by_batch = max(1, int(batch_size or 1) * 2)
+        return min(8, by_cpu, by_batch)
+
+    # CPU and DirectML training usually want the cores for model math. Users can
+    # still override this for tokenizer-heavy Hugging Face datasets.
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description="hierarchos: A Hybrid Memory-Reasoning Architecture")
     parser.add_argument("mode", type=str, choices=["train", "finetune", "chat", "quantize", "merge-lora", "ckpt-2-inf"], help="Operation mode.")
@@ -131,7 +151,9 @@ def main():
     )
     train_group.add_argument("--debug-numerics", action="store_true", help="Enable per-token NaN/Inf debug checks. Slower on CUDA.")
     train_group.add_argument("--save-steps", type=int, default=0, help="Save a checkpoint/adapter every N steps during training/finetuning (0 to disable).")
-    train_group.add_argument("--num_workers", type=int, default=0, help="DataLoader workers. Set to 4-8 for GPU training.")
+    train_group.add_argument("--num_workers", type=int, default=-1, help="DataLoader workers (-1 = auto; CUDA uses prefetched workers, CPU/DML uses 0).")
+    train_group.add_argument("--prefetch-factor", "--prefetch_factor", dest="prefetch_factor", type=int, default=None, help="Batches prefetched per DataLoader worker (auto when omitted).")
+    train_group.add_argument("--pt-cache-size", "--pt_cache_size", dest="pt_cache_size", type=int, default=2, help="Number of .pt chunk files to keep hot per worker for --pre_pt_dataset.")
     train_group.add_argument("--amp", action="store_true", help="Enable mixed precision (auto-enabled on CUDA).")
     train_group.add_argument("--no-amp", dest="amp", action="store_false", help="Explicitly disable mixed precision.")
     train_group.add_argument("--dataset-size", type=int, default=None, help="Force a specific dataset size (total samples) to calculate steps for the LR scheduler.")
@@ -194,6 +216,8 @@ def main():
     if args.compile or args.force_compile:
         setup_msvc_environment()
     pt_device = pick_device(args)
+    args.num_workers = resolve_num_workers(args.num_workers, pt_device, args.batch_size)
+    print(f"INFO: DataLoader workers set to {args.num_workers} for device={pt_device}.")
     
     # Tokenizer Loading
     tokenizer = None
@@ -243,14 +267,14 @@ def main():
             hf_dataset = temp_ds if 'temp_ds' in locals() else load_hf_dataset(args.hf_dataset, args.hf_dataset_config, split=args.hf_dataset_split)
             dataset = HuggingFaceMapStyleDataset(hf_dataset, 
                                                 tokenizer, args.max_length, args.kayla, args.text_column, args.prompt_column, args.completion_column)
-            dataloader = create_map_style_dataloader(dataset, args.batch_size, tokenizer.pad_token_id, args.num_workers)
+            dataloader = create_map_style_dataloader(dataset, args.batch_size, tokenizer.pad_token_id, args.num_workers, device=pt_device, prefetch_factor=args.prefetch_factor)
         elif args.pre_chunked_dataset:
-            dataloader = create_dataloader_for_chunked(args.train, args.max_length, args.batch_size, args.num_workers)
+            dataloader = create_dataloader_for_chunked(args.train, args.max_length, args.batch_size, args.num_workers, device=pt_device, prefetch_factor=args.prefetch_factor)
         elif args.pre_pt_dataset:
-            dataloader = create_dataloader_pt_chunked(args.train, args.max_length, args.batch_size, args.num_workers)
+            dataloader = create_dataloader_pt_chunked(args.train, args.max_length, args.batch_size, args.num_workers, device=pt_device, prefetch_factor=args.prefetch_factor, cache_size=args.pt_cache_size)
         elif args.train and isinstance(args.train, str):
             dataset = OriginalJSONLDataset(args.train, tokenizer, args.max_length, args.kayla)
-            dataloader = create_map_style_dataloader(dataset, args.batch_size, tokenizer.pad_token_id, args.num_workers)
+            dataloader = create_map_style_dataloader(dataset, args.batch_size, tokenizer.pad_token_id, args.num_workers, device=pt_device, prefetch_factor=args.prefetch_factor)
         
         if dataloader is None:
             print("ERROR: No dataset provided for training. Use --train or --hf_dataset."); sys.exit(1)
@@ -300,14 +324,14 @@ def main():
             temp_ds = load_hf_dataset(args.hf_dataset, args.hf_dataset_config, split=args.hf_dataset_split)
             dataset = HuggingFaceMapStyleDataset(temp_ds, tokenizer, args.max_length, args.kayla, 
                                                    args.text_column, args.prompt_column, args.completion_column)
-            dataloader = create_map_style_dataloader(dataset, args.batch_size, tokenizer.pad_token_id, args.num_workers)
+            dataloader = create_map_style_dataloader(dataset, args.batch_size, tokenizer.pad_token_id, args.num_workers, device=pt_device, prefetch_factor=args.prefetch_factor)
         elif args.pre_chunked_dataset:
-            dataloader = create_dataloader_for_chunked(args.train, args.max_length, args.batch_size, args.num_workers)
+            dataloader = create_dataloader_for_chunked(args.train, args.max_length, args.batch_size, args.num_workers, device=pt_device, prefetch_factor=args.prefetch_factor)
         elif args.pre_pt_dataset:
-            dataloader = create_dataloader_pt_chunked(args.train, args.max_length, args.batch_size, args.num_workers)
+            dataloader = create_dataloader_pt_chunked(args.train, args.max_length, args.batch_size, args.num_workers, device=pt_device, prefetch_factor=args.prefetch_factor, cache_size=args.pt_cache_size)
         elif args.train and isinstance(args.train, str):
             dataset = OriginalJSONLDataset(args.train, tokenizer, args.max_length, args.kayla)
-            dataloader = create_map_style_dataloader(dataset, args.batch_size, tokenizer.pad_token_id, args.num_workers)
+            dataloader = create_map_style_dataloader(dataset, args.batch_size, tokenizer.pad_token_id, args.num_workers, device=pt_device, prefetch_factor=args.prefetch_factor)
         
         if dataloader is None:
             print("ERROR: No dataset provided for finetuning. Use --train or --hf_dataset."); sys.exit(1)

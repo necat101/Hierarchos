@@ -208,7 +208,7 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
     )
     
     # --- [NEW] Track Sequence Poisoning (Parity Fix) ---
-    if torch.isnan(full_labels.float()).any():
+    if full_labels.is_floating_point() and torch.isnan(full_labels).any():
         print(f"\nCRITICAL: NaNs detected in labels at step {step}! Skipping batch.")
         optimizer.zero_grad(set_to_none=True)
         return None, running_states
@@ -1177,10 +1177,11 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
             input_ids, labels, attention_mask = trim_trailing_padding(
                 input_ids, labels, attention_mask
             )
-            input_ids = input_ids.to(device)
+            non_blocking = device.type == 'cuda'
+            input_ids = input_ids.to(device, non_blocking=non_blocking)
             if attention_mask is not None:
-                attention_mask = attention_mask.to(device)
-            labels = labels.to(device)
+                attention_mask = attention_mask.to(device, non_blocking=non_blocking)
+            labels = labels.to(device, non_blocking=non_blocking)
 
             autocast_device_type = 'cpu' if is_directml_device(device) else device.type
             with autocast(device_type=autocast_device_type, dtype=amp_dtype, enabled=use_amp):

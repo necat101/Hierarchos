@@ -3,6 +3,7 @@ import json
 import torch
 import traceback
 import functools
+from collections import OrderedDict
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader, IterableDataset, Sampler
 from typing import Optional, List, Dict, Any
@@ -94,6 +95,55 @@ def _get_dataset_sample_lengths(dataset):
         return _normalize_sample_lengths(dataset, getter())
     return None
 
+def _device_type(device=None):
+    if device is None:
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    if isinstance(device, torch.device):
+        return device.type
+    device_str = str(device).lower()
+    if device_str.startswith("cuda"):
+        return "cuda"
+    if device_str.startswith("dml") or device_str.startswith("privateuseone"):
+        return "dml"
+    return "cpu"
+
+def _pin_memory_for_device(device=None):
+    return _device_type(device) == "cuda" and torch.cuda.is_available()
+
+def _worker_init_fn(_worker_id):
+    # Keep loader workers from each spinning up a full BLAS/OpenMP thread pool.
+    torch.set_num_threads(1)
+
+def _create_dataloader(dataset, *, batch_size=None, collate_fn=None, num_workers=0,
+                       pin_memory=False, shuffle=None, drop_last=False,
+                       batch_sampler=None, prefetch_factor=None):
+    resolved_num_workers = int(num_workers or 0)
+    if resolved_num_workers < 0:
+        resolved_num_workers = 0
+
+    kwargs = {
+        "dataset": dataset,
+        "collate_fn": collate_fn,
+        "num_workers": resolved_num_workers,
+        "pin_memory": bool(pin_memory),
+    }
+    if batch_sampler is not None:
+        kwargs["batch_sampler"] = batch_sampler
+    else:
+        kwargs["batch_size"] = batch_size
+        if shuffle is not None:
+            kwargs["shuffle"] = shuffle
+        kwargs["drop_last"] = drop_last
+
+    if kwargs["num_workers"] > 0:
+        kwargs["persistent_workers"] = True
+        kwargs["worker_init_fn"] = _worker_init_fn
+        kwargs["prefetch_factor"] = max(1, int(prefetch_factor or (4 if pin_memory else 2)))
+    else:
+        kwargs["persistent_workers"] = False
+
+    return DataLoader(**kwargs)
+
 def _as_long_tensor(value):
     if isinstance(value, torch.Tensor):
         return value.to(dtype=torch.long)
@@ -102,6 +152,13 @@ def _as_long_tensor(value):
 def _sample_effective_length(item, fallback_length: Optional[int] = None):
     if item is None:
         return fallback_length or 1
+
+    for key in ("_length", "length", "valid_length", "seq_len"):
+        if key in item and item[key] is not None:
+            try:
+                return max(1, int(item[key]))
+            except (TypeError, ValueError):
+                pass
 
     attention_mask = item.get("attention_mask")
     if attention_mask is not None:
@@ -194,9 +251,24 @@ class IterableChunkedJSONLDataset(IterableDataset):
         generator.manual_seed((torch.initial_seed() + self.epoch + worker_id) % (2**63 - 1))
 
         try:
-            with open(self.path, "r", encoding="utf-8") as f:
-                for line_num, line in enumerate(f):
-                    if line_num % num_workers != worker_id: continue
+            file_size = os.path.getsize(self.path)
+            start_byte = (file_size * worker_id) // num_workers
+            end_byte = (file_size * (worker_id + 1)) // num_workers
+            with open(self.path, "rb") as f:
+                f.seek(start_byte)
+                if start_byte > 0:
+                    f.readline()
+                while True:
+                    if worker_id != num_workers - 1 and f.tell() >= end_byte:
+                        break
+                    raw_line = f.readline()
+                    if not raw_line:
+                        break
+                    try:
+                        line = raw_line.decode("utf-8")
+                    except UnicodeDecodeError:
+                        skipped_count += 1
+                        continue
                     line = line.strip()
                     if not line: continue
                     try:
@@ -208,11 +280,20 @@ class IterableChunkedJSONLDataset(IterableDataset):
                         if seq_len != self.max_length:
                             skipped_count += 1
                             continue
+                        attention_mask = obj["attention_mask"]
+                        try:
+                            valid_length = 0
+                            for mask_idx, mask_value in enumerate(attention_mask):
+                                if int(mask_value) != 0:
+                                    valid_length = mask_idx + 1
+                        except Exception:
+                            valid_length = seq_len
                         processed_count += 1
                         item = {
                             "input_ids": torch.tensor(obj["input_ids"], dtype=torch.long),
                             "labels": torch.tensor(obj["labels"], dtype=torch.long),
-                            "attention_mask": torch.tensor(obj["attention_mask"], dtype=torch.long)
+                            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+                            "_length": valid_length,
                         }
                         if self.bucket_size > 0:
                             bucket.append(item)
@@ -232,7 +313,8 @@ class IterableChunkedJSONLDataset(IterableDataset):
         print(f"[Worker {worker_id}] Finished. Processed: {processed_count}, Skipped: {skipped_count}")
 
 def create_dataloader_for_chunked(path, max_length, batch_size, num_workers=0,
-                                  use_length_bucketing=True, bucket_size=None):
+                                  use_length_bucketing=True, bucket_size=None,
+                                  device=None, prefetch_factor=None):
     streaming_bucket_size = int(bucket_size or (batch_size * 50)) if use_length_bucketing and batch_size > 1 else 0
     dataset = IterableChunkedJSONLDataset(
         path,
@@ -242,20 +324,27 @@ def create_dataloader_for_chunked(path, max_length, batch_size, num_workers=0,
         shuffle_buckets=True,
     )
     collate_fn_simple = functools.partial(_collate_training_batch, pad_token_id=0)
-    pin_memory = torch.cuda.is_available()
-    return DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn_simple,
-                      num_workers=num_workers, pin_memory=pin_memory,
-                      persistent_workers=(num_workers > 0))
+    pin_memory = _pin_memory_for_device(device)
+    return _create_dataloader(
+        dataset,
+        batch_size=batch_size,
+        collate_fn=collate_fn_simple,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        prefetch_factor=prefetch_factor,
+    )
 
 class PTChunkedDataset(Dataset):
-    def __init__(self, directory_path: str, max_length: int):
+    def __init__(self, directory_path: str, max_length: int, cache_size: int = 2):
         super().__init__()
         self.directory_path = directory_path
         self.max_length = max_length
+        self.cache_size = max(1, int(cache_size or 1))
         self.chunk_pointers = []
         self.sample_lengths = []
         self.last_loaded_path = None
         self.last_loaded_data = None
+        self._chunk_cache = OrderedDict()
         manifest_file = os.path.join(directory_path, "manifest.jsonl")
         if not os.path.exists(manifest_file):
             raise FileNotFoundError(f"Manifest file not found: {manifest_file}")
@@ -272,12 +361,32 @@ class PTChunkedDataset(Dataset):
                     self.sample_lengths.append(None)
 
     def __len__(self): return len(self.chunk_pointers)
+    def _get_chunk(self, path):
+        cached = self._chunk_cache.get(path)
+        if cached is not None:
+            self._chunk_cache.move_to_end(path)
+            self.last_loaded_path = path
+            self.last_loaded_data = cached
+            return cached
+
+        data = torch.load(path, map_location='cpu')
+        self._chunk_cache[path] = data
+        self._chunk_cache.move_to_end(path)
+        while len(self._chunk_cache) > self.cache_size:
+            self._chunk_cache.popitem(last=False)
+        self.last_loaded_path = path
+        self.last_loaded_data = data
+        return data
+
     def __getitem__(self, idx):
         path, index = self.chunk_pointers[idx]
-        if path != self.last_loaded_path:
-            self.last_loaded_data = torch.load(path, map_location='cpu')
-            self.last_loaded_path = path
-        return self.last_loaded_data[index]
+        item = self._get_chunk(path)[index]
+        if isinstance(item, dict):
+            length = self.sample_lengths[idx] if idx < len(self.sample_lengths) else None
+            if length is not None and "_length" not in item:
+                item = dict(item)
+                item["_length"] = length
+        return item
     def get_sample_lengths(self):
         if self.sample_lengths and all(length is not None for length in self.sample_lengths):
             return self.sample_lengths
@@ -303,10 +412,11 @@ class PTChunkedDataset(Dataset):
         return self.sample_lengths
 
 def create_dataloader_pt_chunked(directory_path, max_length, batch_size, num_workers=0,
-                                 use_length_bucketing=True, bucket_size=None):
-    dataset = PTChunkedDataset(directory_path, max_length=max_length)
+                                 use_length_bucketing=True, bucket_size=None,
+                                 device=None, prefetch_factor=None, cache_size: int = 2):
+    dataset = PTChunkedDataset(directory_path, max_length=max_length, cache_size=cache_size)
     collate_fn_pt = functools.partial(_collate_training_batch, pad_token_id=0)
-    use_cuda = torch.cuda.is_available()
+    use_cuda = _pin_memory_for_device(device)
     drop_last = False
     lengths = _get_dataset_sample_lengths(dataset) if use_length_bucketing and batch_size > 1 else None
     if lengths:
@@ -317,13 +427,24 @@ def create_dataloader_pt_chunked(directory_path, max_length, batch_size, num_wor
             drop_last=drop_last,
             bucket_size=bucket_size,
         )
-        return DataLoader(dataset, batch_sampler=batch_sampler, collate_fn=collate_fn_pt,
-                          num_workers=num_workers, pin_memory=use_cuda,
-                          persistent_workers=(num_workers > 0))
+        return _create_dataloader(
+            dataset,
+            batch_sampler=batch_sampler,
+            collate_fn=collate_fn_pt,
+            num_workers=num_workers,
+            pin_memory=use_cuda,
+            prefetch_factor=prefetch_factor,
+        )
 
-    return DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn_pt, shuffle=True,
-                      num_workers=num_workers, pin_memory=torch.cuda.is_available(),
-                      persistent_workers=(num_workers > 0))
+    return _create_dataloader(
+        dataset,
+        batch_size=batch_size,
+        collate_fn=collate_fn_pt,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=use_cuda,
+        prefetch_factor=prefetch_factor,
+    )
 
 def process_text_sample(tokenizer, text_dict: dict, max_length: int, kayla_mode: bool = False,
                          text_column: Optional[str] = None,
@@ -360,7 +481,11 @@ def process_text_sample(tokenizer, text_dict: dict, max_length: int, kayla_mode:
                 labels = ([-100] * len(p_ids)) + c_ids + [tokenizer.eos_token_id]
         else: return None
         if len(ids) > max_length: ids, labels = ids[:max_length-1] + [tokenizer.eos_token_id], labels[:max_length-1] + [tokenizer.eos_token_id]
-        return {"input_ids": torch.tensor(ids, dtype=torch.long), "labels": torch.tensor(labels, dtype=torch.long)}
+        return {
+            "input_ids": torch.tensor(ids, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
+            "_length": len(ids),
+        }
     except: return None
 
 class OriginalJSONLDataset(Dataset):
@@ -453,9 +578,10 @@ def _collate_fn_dynamic_padding(batch, pad_token_id):
     return _collate_training_batch(batch, pad_token_id)
 
 def create_map_style_dataloader(dataset, batch_size, pad_token_id, num_workers=0, shuffle=True,
-                                use_length_bucketing=True, bucket_size=None):
+                                use_length_bucketing=True, bucket_size=None,
+                                device=None, prefetch_factor=None):
     collate = functools.partial(_collate_fn_dynamic_padding, pad_token_id=pad_token_id)
-    use_cuda = torch.cuda.is_available()
+    use_cuda = _pin_memory_for_device(device)
     drop_last = use_cuda and len(dataset) > batch_size
     lengths = _get_dataset_sample_lengths(dataset) if use_length_bucketing and shuffle and batch_size > 1 else None
     if lengths:
@@ -466,11 +592,22 @@ def create_map_style_dataloader(dataset, batch_size, pad_token_id, num_workers=0
             drop_last=drop_last,
             bucket_size=bucket_size,
         )
-        return DataLoader(dataset, batch_sampler=batch_sampler, collate_fn=collate,
-                          num_workers=num_workers, pin_memory=use_cuda,
-                          persistent_workers=(num_workers > 0))
+        return _create_dataloader(
+            dataset,
+            batch_sampler=batch_sampler,
+            collate_fn=collate,
+            num_workers=num_workers,
+            pin_memory=use_cuda,
+            prefetch_factor=prefetch_factor,
+        )
 
-    return DataLoader(dataset, batch_size=batch_size, collate_fn=collate, shuffle=shuffle,
-                      num_workers=num_workers, pin_memory=use_cuda,
-                      persistent_workers=(num_workers > 0),
-                      drop_last=drop_last)
+    return _create_dataloader(
+        dataset,
+        batch_size=batch_size,
+        collate_fn=collate,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=use_cuda,
+        drop_last=drop_last,
+        prefetch_factor=prefetch_factor,
+    )

@@ -217,7 +217,8 @@ class QuantizedHierarchos:
                                  momentum=getattr(self.config, 'ltm_momentum', 0.9),
                                  wd=getattr(self.config, 'ltm_weight_decay', 1e-4),
                                  forget_rate=getattr(self.config, 'ltm_forget_rate', 0.01),
-                                 reference_chunk_len=getattr(self.config, 'reference_chunk_len', getattr(self.config, 'training_chunk_size', 128)))
+                                 reference_chunk_len=getattr(self.config, 'reference_chunk_len', getattr(self.config, 'training_chunk_size', 128)),
+                                 score_grad_scale=getattr(self.config, 'ltm_score_grad_scale', 1.0))
                                  
             ltm_state = {}
             for k in ['ltm.keys', 'ltm.vals', 'ltm.timestamps', 'ltm.sources']:
@@ -330,6 +331,16 @@ class QuantizedHierarchos:
                 
         curr_prev_context = prev_context.to(device if device == 'vulkan' else 'cpu')
         curr_target_context = target_context.to(device if device == 'vulkan' else 'cpu')
+
+        drift_seed = None
+        if drift_state is not None:
+            drift_seed = drift_state.to(device if device == 'vulkan' else 'cpu')
+            if drift_seed.dim() == 1:
+                drift_seed = drift_seed.unsqueeze(0)
+            if drift_seed.shape[0] == 1 and B > 1:
+                drift_seed = drift_seed.expand(B, -1)
+            if drift_seed.shape != (B, self.config.context_dim):
+                drift_seed = None
         
         all_topk_vals, all_topk_idx = [], []
 
@@ -404,7 +415,9 @@ class QuantizedHierarchos:
             alpha = (abs_t % stride) / float(stride)
             static_context = curr_prev_context + (curr_target_context - curr_prev_context) * alpha
 
-            if self.context_drift_proj is not None:
+            if t == 0 and drift_seed is not None:
+                current_drift = torch.clamp(drift_seed.to(device), min=-5.0, max=5.0)
+            elif self.context_drift_proj is not None:
                 current_drift = torch.clamp(torch.tanh(self.context_drift_proj(l_state[:, :, 0].to(device), device=device)), min=-5.0, max=5.0)
             else:
                 current_drift = torch.zeros_like(static_context)

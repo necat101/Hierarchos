@@ -17,7 +17,7 @@ class LTMModule(nn.Module):
     SRC_TRAINING_DATA = 2
     SRC_CORRECTION = 3 
 
-    def __init__(self, n_slots=1024, key_dim=64, val_dim=64, lr=1e-3, momentum=0.9, wd=1e-4, forget_rate=0.01, reference_chunk_len=128):
+    def __init__(self, n_slots=1024, key_dim=64, val_dim=64, lr=1e-3, momentum=0.9, wd=1e-4, forget_rate=0.01, reference_chunk_len=128, score_grad_scale=1.0):
         super().__init__()
         
         # --- Slow Weights (Long-Term Consolidation) ---
@@ -38,6 +38,7 @@ class LTMModule(nn.Module):
         # Base forget rate per REFERENCE chunk size
         self.forget_rate = forget_rate 
         self.reference_chunk_len = reference_chunk_len
+        self.score_grad_scale = float(score_grad_scale)
 
         # Buffers for tracking history context
         self.register_buffer("timestamps", torch.zeros(n_slots, dtype=torch.float32))
@@ -118,6 +119,14 @@ class LTMModule(nn.Module):
             ts_retrieved = torch.gather(ts_view, dim=-1, index=idx_clamped)
 
         return gathered_vals.contiguous(), ts_retrieved
+
+    def _inject_score_gradients(self, gathered_vals: torch.Tensor, selected_sim: torch.Tensor) -> torch.Tensor:
+        """Give the address path gradients without changing retrieved values."""
+        scale = getattr(self, "score_grad_scale", 1.0)
+        if scale == 0.0 or not torch.is_grad_enabled() or not selected_sim.requires_grad:
+            return gathered_vals
+        score_signal = (selected_sim - selected_sim.detach()).unsqueeze(-1)
+        return gathered_vals + score_signal.to(dtype=gathered_vals.dtype) * gathered_vals.detach() * scale
 
     def _inner_update_flat_cuda(self, topk_idx: torch.LongTensor, grads_tensor: torch.Tensor,
                                 current_lr: float, timestamp: float, source: int,
@@ -309,6 +318,7 @@ class LTMModule(nn.Module):
             
             effective_memory_size = self.vals.shape[0]
             idx_clamped = idx.clamp(min=0, max=effective_memory_size-1)
+            selected_sim = torch.gather(sim, dim=-1, index=idx_clamped)
 
             if use_cuda_math:
                 weighted_vals, ts_retrieved = self._gather_topk_cuda(
@@ -316,6 +326,7 @@ class LTMModule(nn.Module):
                     effective_memory,
                     current_timestamps,
                 )
+                weighted_vals = self._inject_score_gradients(weighted_vals, selected_sim)
                 if effective_topk < topk:
                     pad_size = topk - effective_topk
                     batch_shape_list = list(idx_clamped.shape[:-1])
@@ -340,16 +351,13 @@ class LTMModule(nn.Module):
             range_tensor = range_tensor.view(*view_shape)
             
             one_hot = (idx_clamped.unsqueeze(-1) == range_tensor).float()
-            
-            sim_expanded = sim.unsqueeze(-2)
-            sim_topk = (one_hot * sim_expanded).sum(dim=-1)
-            
+
             gathered_vals = torch.matmul(one_hot, effective_memory.float())
             
             # --- FINAL LTM FIX: Clean Concatenation Signal ---
             # With normalization handling the bleeding, we can now use the 
             # raw memories as the model expects. Softmax is no longer needed.
-            weighted_vals = gathered_vals.contiguous()
+            weighted_vals = self._inject_score_gradients(gathered_vals.contiguous(), selected_sim)
             
             ts_for_gather = current_timestamps.to(device=one_hot.device, dtype=one_hot.dtype)
             while ts_for_gather.ndim < one_hot.ndim:

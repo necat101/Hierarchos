@@ -162,7 +162,8 @@ class HierarchosCore(nn.Module):
             momentum=getattr(config, 'ltm_momentum', 0.9),
             wd=getattr(config, 'ltm_weight_decay', 1e-4),
             forget_rate=getattr(config, 'ltm_forget_rate', 0.01),
-            reference_chunk_len=getattr(config, 'reference_chunk_len', getattr(config, 'training_chunk_size', 128))
+            reference_chunk_len=getattr(config, 'reference_chunk_len', getattr(config, 'training_chunk_size', 128)),
+            score_grad_scale=getattr(config, 'ltm_score_grad_scale', 1.0)
         )
         self.qproj = nn.Linear(config.context_dim * 2, config.ltm_key_dim, bias=False)
         self.val_proj = nn.Linear(config.context_dim, config.ltm_val_dim, bias=False)
@@ -381,6 +382,16 @@ class HierarchosCore(nn.Module):
             memory_timestamps = memory_timestamps.to(device)
             memory_sources = memory_sources.to(device)
 
+        drift_seed = None
+        if drift_state is not None:
+            drift_seed = drift_state.to(device)
+            if drift_seed.dim() == 1:
+                drift_seed = drift_seed.unsqueeze(0)
+            if drift_seed.shape[0] == 1 and B > 1:
+                drift_seed = drift_seed.expand(B, -1)
+            if drift_seed.shape != (B, self.config.context_dim):
+                drift_seed = None
+
         final_embs = []
         ponder_costs = []
         ponder_weights = []
@@ -501,7 +512,9 @@ class HierarchosCore(nn.Module):
             # ==================================================================
             # 4. WORKER STEP
             # ==================================================================
-            if self.context_drift_proj is not None:
+            if t == 0 and drift_seed is not None:
+                initial_drift = torch.clamp(drift_seed, min=-5.0, max=5.0)
+            elif self.context_drift_proj is not None:
                 prev_worker_h = l_state[:, :, 0].to(device)
                 initial_drift = torch.tanh(self.context_drift_proj(prev_worker_h))
                 initial_drift = torch.clamp(initial_drift, min=-5.0, max=5.0)

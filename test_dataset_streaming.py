@@ -256,6 +256,48 @@ def test_cli_detects_jsonl_shard_directory():
         assert hierarchos_cli.count_jsonl_source_rows(tmpdir) == 2
 
 
+def test_cli_prefers_indexed_hf_for_single_streaming_shard_by_default():
+    import hierarchos_cli
+    from hierarchos.training.datasets import HuggingFaceMapStyleDataset
+
+    class SingleShardStream(FakeHFStream):
+        num_shards = 1
+
+    original_loader = hierarchos_cli.load_hf_dataset
+    rows = [{"text": f"hf row {idx}"} for idx in range(8)]
+
+    def fake_loader(*args, **kwargs):
+        if kwargs.get("streaming"):
+            return SingleShardStream(rows)
+        return list(rows)
+
+    try:
+        hierarchos_cli.load_hf_dataset = fake_loader
+        args = types.SimpleNamespace(
+            hf_dataset="fake/hf",
+            hf_dataset_config=None,
+            hf_dataset_split="train",
+            max_length=64,
+            kayla=False,
+            text_column=None,
+            prompt_column=None,
+            completion_column=None,
+            batch_size=4,
+            num_workers=4,
+            length_bucketing=True,
+            length_bucket_size=None,
+            streaming_datasets=True,
+            hf_auto_shard=False,
+            hf_streaming_shuffle_buffer=100,
+            prefetch_factor=None,
+        )
+        dataloader = hierarchos_cli.create_hf_training_dataloader(args, TinyTokenizer(), torch.device("cpu"))
+    finally:
+        hierarchos_cli.load_hf_dataset = original_loader
+
+    assert isinstance(dataloader.dataset, HuggingFaceMapStyleDataset)
+
+
 def test_hf_streaming_dataloader_batches():
     tokenizer = TinyTokenizer()
     hf_rows = FakeHFStream({"text": f"streamed sample {idx}"} for idx in range(10))
@@ -413,6 +455,7 @@ def main():
         test_hf_materialization_partitions_rows_without_copying_shards,
         test_streaming_jsonl_reads_pretokenized_rows_without_tokenizer,
         test_cli_detects_jsonl_shard_directory,
+        test_cli_prefers_indexed_hf_for_single_streaming_shard_by_default,
         test_hf_streaming_dataloader_batches,
         test_hf_worker_shards_cover_samples_once,
         test_streaming_jsonl_length_buckets_reduce_padding,

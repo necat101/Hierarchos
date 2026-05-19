@@ -222,7 +222,6 @@ def materialize_hf_dataset_pt_cache(args, tokenizer, num_shards):
         buffer = shard_buffers[shard_idx]
         if not buffer:
             return
-        buffer.sort(key=lambda item: int(item.get("_length", item["input_ids"].numel())), reverse=True)
         filename = f"shard_{shard_idx:05d}_part_{shard_parts[shard_idx]:05d}.pt"
         path = os.path.join(tmp_dir, filename)
         torch.save(buffer, path)
@@ -335,7 +334,7 @@ def create_hf_training_dataloader(args, tokenizer, device):
             except (TypeError, ValueError):
                 hf_num_shards = None
             if hf_num_shards is not None and hf_num_shards > 0 and hf_num_workers > hf_num_shards:
-                if getattr(args, "hf_auto_shard", True) and hf_num_workers > 1:
+                if getattr(args, "hf_auto_shard", False) and hf_num_workers > 1:
                     shard_dir = materialize_hf_dataset_shards(args, tokenizer, hf_num_workers)
                     print(
                         "INFO: Using local tokenized PT shard cache for HF dataset "
@@ -355,8 +354,7 @@ def create_hf_training_dataloader(args, tokenizer, device):
                 return create_indexed_hf_dataloader(
                     "HF streaming exposes "
                     f"{hf_num_shards} physical shard(s), but --num_workers={hf_num_workers}. "
-                    "Using indexed HF loading so PyTorch can use all requested workers. "
-                    "For true multi-worker iterable streaming, publish/download the dataset as multiple data files."
+                    "Using indexed HF loading with length bucketing so PyTorch can use all requested workers."
                 )
             dataloader = create_dataloader_for_hf_streaming(
                 hf_dataset,
@@ -549,7 +547,9 @@ def main():
     train_group.add_argument("--length-bucket-size", "--length_bucket_size", dest="length_bucket_size", type=int, default=None, help="Samples per length bucket/window. Larger lowers padding; smaller lowers streaming latency.")
     train_group.add_argument("--no-streaming-datasets", dest="streaming_datasets", action="store_false", help="Disable streaming for raw JSONL/Hugging Face datasets and use map-style loading.")
     train_group.add_argument("--hf-streaming-shuffle-buffer", "--hf_streaming_shuffle_buffer", dest="hf_streaming_shuffle_buffer", type=int, default=10000, help="Buffered shuffle size for Hugging Face streaming datasets.")
-    train_group.add_argument("--no-hf-auto-shard", dest="hf_auto_shard", action="store_false", help="Disable automatic local tokenized shard caching for single-shard HF streaming datasets.")
+    train_group.add_argument("--hf-auto-shard", dest="hf_auto_shard", action="store_true", help="Opt into local tokenized shard caching for single-shard HF streaming datasets.")
+    train_group.add_argument("--no-hf-auto-shard", dest="hf_auto_shard", action="store_false", help="Use indexed HF loading instead of local tokenized shard caching for single-shard HF datasets.")
+    train_group.set_defaults(hf_auto_shard=False)
     train_group.add_argument("--hf-shard-cache-dir", "--hf_shard_cache_dir", dest="hf_shard_cache_dir", type=str, default=None, help="Directory for cached local HF tokenized shard files.")
     train_group.add_argument("--refresh-hf-shards", "--refresh_hf_shards", dest="refresh_hf_shards", action="store_true", help="Rebuild cached local HF tokenized shards before training.")
     train_group.add_argument("--hf-cache-chunks-per-file", "--hf_cache_chunks_per_file", dest="hf_cache_chunks_per_file", type=int, default=2048, help="Tokenized samples per cached HF .pt shard chunk.")

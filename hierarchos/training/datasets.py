@@ -63,10 +63,16 @@ class LengthGroupedBatchSampler(Sampler):
             bucket = indices[bucket_start:bucket_start + self.bucket_size]
             if self.shuffle:
                 bucket.sort(key=self.lengths.__getitem__, reverse=True)
+            bucket_batches = []
             for batch_start in range(0, len(bucket), self.batch_size):
                 batch = bucket[batch_start:batch_start + self.batch_size]
                 if len(batch) == self.batch_size or not self.drop_last:
-                    batches.append(batch)
+                    bucket_batches.append(batch)
+            if self.shuffle and self.preserve_order and len(bucket_batches) > 1:
+                order = torch.randperm(len(bucket_batches), generator=generator).tolist()
+                batches.extend(bucket_batches[batch_idx] for batch_idx in order)
+            else:
+                batches.extend(bucket_batches)
 
         if self.shuffle and not self.preserve_order and len(batches) > 1:
             order = torch.randperm(len(batches), generator=generator).tolist()

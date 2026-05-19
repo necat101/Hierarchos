@@ -83,7 +83,6 @@ def write_pt_cache(directory, rows, tokenizer, max_length, num_shards=4, chunks_
         buffer = buffers[shard_idx]
         if not buffer:
             return
-        buffer.sort(key=lambda item: int(item["_length"]), reverse=True)
         filename = f"shard_{shard_idx:05d}_part_{parts[shard_idx]:05d}.pt"
         import torch
         torch.save(buffer, os.path.join(directory, filename))

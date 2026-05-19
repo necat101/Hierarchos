@@ -3,6 +3,7 @@ import json
 import torch
 import traceback
 import functools
+import itertools
 from collections import OrderedDict
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader, IterableDataset, Sampler
@@ -112,6 +113,7 @@ def _pin_memory_for_device(device=None):
 
 def _worker_init_fn(_worker_id):
     # Keep loader workers from each spinning up a full BLAS/OpenMP thread pool.
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     torch.set_num_threads(1)
 
 def _resolve_prefetch_factor(num_workers: int, prefetch_factor=None, pin_memory: bool = False):
@@ -212,10 +214,50 @@ def _yield_length_bucket(buffer, batch_size: int, shuffle: bool, generator: torc
         for item in buffer:
             yield item
 
+_TEXT_COLUMN_CANDIDATES = ("text", "content")
+_PROMPT_COMPLETION_COLUMN_CANDIDATES = (
+    ("instruction", "output"),
+    ("prompt", "completion"),
+    ("question", "answer"),
+)
+
+def _column_has_value(sample: dict, column: Optional[str]) -> bool:
+    if not column or column not in sample:
+        return False
+    value = sample.get(column)
+    return value is not None and str(value).strip() != ""
+
+def _resolve_text_sample_columns(text_dict: dict, text_column: Optional[str] = None,
+                                 prompt_column: Optional[str] = None,
+                                 completion_column: Optional[str] = None):
+    if text_column:
+        return text_column, None, None
+    if prompt_column or completion_column:
+        return None, prompt_column, completion_column
+
+    for candidate in _TEXT_COLUMN_CANDIDATES:
+        if _column_has_value(text_dict, candidate):
+            return candidate, None, None
+
+    for candidate_prompt, candidate_completion in _PROMPT_COMPLETION_COLUMN_CANDIDATES:
+        if (
+            _column_has_value(text_dict, candidate_prompt)
+            or _column_has_value(text_dict, candidate_completion)
+        ):
+            return None, candidate_prompt, candidate_completion
+
+    return None, None, None
+
 def _estimate_text_token_length(text_dict: dict, max_length: int, kayla_mode: bool,
                                 text_column: Optional[str] = None,
                                 prompt_column: Optional[str] = None,
                                 completion_column: Optional[str] = None):
+    text_column, prompt_column, completion_column = _resolve_text_sample_columns(
+        text_dict,
+        text_column=text_column,
+        prompt_column=prompt_column,
+        completion_column=completion_column,
+    )
     if text_column:
         text_len = len(str(text_dict.get(text_column, "")))
     elif prompt_column and completion_column:
@@ -463,14 +505,27 @@ def process_text_sample(tokenizer, text_dict: dict, max_length: int, kayla_mode:
                          text_column: Optional[str] = None,
                          prompt_column: Optional[str] = None, completion_column: Optional[str] = None):
     try:
+        if not isinstance(text_dict, dict):
+            return None
+
+        text_column, prompt_column, completion_column = _resolve_text_sample_columns(
+            text_dict,
+            text_column=text_column,
+            prompt_column=prompt_column,
+            completion_column=completion_column,
+        )
+
         if text_column:
             text = str(text_dict.get(text_column, ""))
-            if not text: return None
+            if not text.strip(): return None
             ids = tokenizer.encode(text) + [tokenizer.eos_token_id]
             labels = list(ids)
         elif prompt_column and completion_column:
             instruction = str(text_dict.get(prompt_column, ""))
             output = str(text_dict.get(completion_column, ""))
+            inp = str(text_dict.get('input', "")).strip()
+            if not instruction.strip() and not output.strip() and not inp:
+                return None
             if kayla_mode:
                 feelings = str(text_dict.get('feelings', ''))
                 thought = str(text_dict.get('thought-process', ''))
@@ -483,7 +538,6 @@ def process_text_sample(tokenizer, text_dict: dict, max_length: int, kayla_mode:
                 ids = p_ids + t_ids + r_ids + [tokenizer.eos_token_id]
                 labels = ([-100] * len(p_ids)) + t_ids + r_ids + [tokenizer.eos_token_id]
             else:
-                inp = str(text_dict.get('input', "")).strip()
                 if inp:
                     prompt = f"User: {inp}\n\nUser: {instruction}\n\nAssistant: "
                 else:
@@ -502,12 +556,51 @@ def process_text_sample(tokenizer, text_dict: dict, max_length: int, kayla_mode:
     except: return None
 
 class OriginalJSONLDataset(Dataset):
-    def __init__(self, path, tokenizer, max_length, kayla_mode=False):
+    def __init__(self, path, tokenizer, max_length, kayla_mode=False,
+                 text_column: Optional[str] = None,
+                 prompt_column: Optional[str] = None,
+                 completion_column: Optional[str] = None):
         super().__init__()
         self.tokenizer, self.max_length, self.kayla_mode, self.samples = tokenizer, max_length, kayla_mode, []
         self.sample_lengths = []
         skipped = 0
+        line_num = 0
+
+        def add_sample(data):
+            processed = process_text_sample(
+                tokenizer,
+                data,
+                max_length,
+                kayla_mode,
+                text_column=text_column,
+                prompt_column=prompt_column,
+                completion_column=completion_column,
+            )
+            if processed:
+                self.samples.append(processed)
+                self.sample_lengths.append(len(processed["input_ids"]))
+                return True
+            return False
+
         with open(path, "r", encoding="utf-8") as f:
+            if not str(path).lower().endswith((".jsonl", ".ndjson")):
+                try:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        data = [data]
+                    if not isinstance(data, list):
+                        raise ValueError("JSON dataset must be an object, a list of objects, or JSONL.")
+                    for obj in tqdm(data, desc="Loading JSON"):
+                        if not add_sample(obj):
+                            skipped += 1
+                    if skipped:
+                        print(f"WARNING: Skipped {skipped} invalid JSON samples.")
+                    return
+                except json.JSONDecodeError:
+                    f.seek(0)
+                except Exception:
+                    f.seek(0)
+
             for line_num, line in enumerate(tqdm(f, desc="Loading JSONL"), 1):
                 line = line.strip()
                 if not line: continue
@@ -518,16 +611,212 @@ class OriginalJSONLDataset(Dataset):
                     if skipped <= 5:
                         print(f"WARNING: Skipping malformed JSON at line {line_num} (char preview: {line[:80]}...)")
                     continue
-                # Pass kwargs explicitly to allow overriding in the CLI
-                processed = process_text_sample(tokenizer, data, max_length, kayla_mode, prompt_column='instruction', completion_column='output')
-                if processed:
-                    self.samples.append(processed)
-                    self.sample_lengths.append(len(processed["input_ids"]))
+                if not add_sample(data):
+                    skipped += 1
         if skipped:
             print(f"WARNING: Skipped {skipped} malformed JSONL lines out of {line_num} total.")
     def __len__(self): return len(self.samples)
     def __getitem__(self, idx): return self.samples[idx]
     def get_sample_lengths(self): return self.sample_lengths
+
+def _iter_jsonl_lines_for_worker(path: str, worker_id: int, num_workers: int):
+    if num_workers <= 1:
+        with open(path, "r", encoding="utf-8") as f:
+            for line_num, line in enumerate(f, 1):
+                yield line_num, line
+        return
+
+    file_size = os.path.getsize(path)
+    start_byte = (file_size * worker_id) // num_workers
+    end_byte = (file_size * (worker_id + 1)) // num_workers
+    with open(path, "rb") as f:
+        f.seek(start_byte)
+        if start_byte > 0:
+            f.readline()
+        while True:
+            if worker_id != num_workers - 1 and f.tell() >= end_byte:
+                break
+            raw_line = f.readline()
+            if not raw_line:
+                break
+            try:
+                yield None, raw_line.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+
+class StreamingJSONLDataset(IterableDataset):
+    """
+    Stream raw JSONL text samples from disk and tokenize inside DataLoader
+    workers. This avoids materializing a tokenized tensor list before training.
+    """
+    def __init__(self, path, tokenizer, max_length, kayla_mode=False,
+                 text_column: Optional[str] = None,
+                 prompt_column: Optional[str] = None,
+                 completion_column: Optional[str] = None,
+                 bucket_size: int = 0, batch_size: int = 1,
+                 shuffle_buckets: bool = True):
+        super().__init__()
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Dataset file not found: {path}")
+        self.path = path
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.kayla_mode = kayla_mode
+        self.text_column = text_column
+        self.prompt_column = prompt_column
+        self.completion_column = completion_column
+        self.bucket_size = max(0, int(bucket_size or 0))
+        self.batch_size = max(1, int(batch_size))
+        self.shuffle_buckets = bool(shuffle_buckets)
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int):
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
+        num_workers = worker_info.num_workers if worker_info is not None else 1
+
+        bucket = []
+        generator = torch.Generator()
+        generator.manual_seed((torch.initial_seed() + self.epoch + worker_id) % (2**63 - 1))
+
+        for _line_num, line in _iter_jsonl_lines_for_worker(self.path, worker_id, num_workers):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            processed = process_text_sample(
+                self.tokenizer,
+                obj,
+                self.max_length,
+                self.kayla_mode,
+                text_column=self.text_column,
+                prompt_column=self.prompt_column,
+                completion_column=self.completion_column,
+            )
+            if processed is None:
+                continue
+            if self.bucket_size > 0:
+                bucket.append(processed)
+                if len(bucket) >= self.bucket_size:
+                    yield from _yield_length_bucket(bucket, self.batch_size, self.shuffle_buckets, generator)
+                    bucket.clear()
+            else:
+                yield processed
+
+        if bucket:
+            yield from _yield_length_bucket(bucket, self.batch_size, self.shuffle_buckets, generator)
+
+def _maybe_shuffle_hf_dataset(hf_dataset, shuffle: bool, shuffle_buffer_size: int, seed: int):
+    if not shuffle or shuffle_buffer_size <= 0:
+        return hf_dataset
+    shuffle_fn = getattr(hf_dataset, "shuffle", None)
+    if not callable(shuffle_fn):
+        return hf_dataset
+    try:
+        return shuffle_fn(buffer_size=int(shuffle_buffer_size), seed=int(seed))
+    except TypeError:
+        try:
+            return shuffle_fn(seed=int(seed))
+        except Exception:
+            return hf_dataset
+    except Exception:
+        return hf_dataset
+
+def _iter_hf_worker_samples(hf_dataset, worker_id: int, num_workers: int):
+    dataset = hf_dataset
+    sharded = False
+    if num_workers > 1:
+        shard_fn = getattr(dataset, "shard", None)
+        if callable(shard_fn):
+            try:
+                dataset = shard_fn(num_shards=num_workers, index=worker_id, contiguous=False)
+                sharded = True
+            except TypeError:
+                try:
+                    dataset = shard_fn(num_shards=num_workers, index=worker_id)
+                    sharded = True
+                except Exception:
+                    sharded = False
+            except Exception:
+                sharded = False
+
+    iterator = iter(dataset)
+    if num_workers > 1 and not sharded:
+        iterator = itertools.islice(iterator, worker_id, None, num_workers)
+    return iterator
+
+class HuggingFaceStreamingDataset(IterableDataset):
+    """
+    Iterable wrapper for Hugging Face streaming datasets. It performs buffered
+    stream shuffling, worker sharding, tokenization, and optional length buckets
+    without building a full tokenized dataset in memory.
+    """
+    def __init__(self, hf_dataset, tokenizer, max_length, kayla_mode=False,
+                 text_column=None, prompt_column=None, completion_column=None,
+                 bucket_size: int = 0, batch_size: int = 1,
+                 shuffle: bool = True, shuffle_buffer_size: int = 10000):
+        super().__init__()
+        self.hf_dataset = hf_dataset
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.kayla_mode = kayla_mode
+        self.text_column = text_column
+        self.prompt_column = prompt_column
+        self.completion_column = completion_column
+        self.bucket_size = max(0, int(bucket_size or 0))
+        self.batch_size = max(1, int(batch_size))
+        self.shuffle = bool(shuffle)
+        self.shuffle_buffer_size = max(0, int(shuffle_buffer_size or 0))
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int):
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
+        num_workers = worker_info.num_workers if worker_info is not None else 1
+        seed = int((torch.initial_seed() + (self.epoch * 100003) + worker_id) % (2**32 - 1))
+        dataset = _maybe_shuffle_hf_dataset(
+            self.hf_dataset,
+            shuffle=self.shuffle,
+            shuffle_buffer_size=self.shuffle_buffer_size,
+            seed=seed,
+        )
+        iterator = _iter_hf_worker_samples(dataset, worker_id, num_workers)
+
+        bucket = []
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+
+        for sample in iterator:
+            processed = process_text_sample(
+                self.tokenizer,
+                sample,
+                self.max_length,
+                self.kayla_mode,
+                self.text_column,
+                self.prompt_column,
+                self.completion_column,
+            )
+            if processed is None:
+                continue
+            if self.bucket_size > 0:
+                bucket.append(processed)
+                if len(bucket) >= self.bucket_size:
+                    yield from _yield_length_bucket(bucket, self.batch_size, self.shuffle, generator)
+                    bucket.clear()
+            else:
+                yield processed
+
+        if bucket:
+            yield from _yield_length_bucket(bucket, self.batch_size, self.shuffle, generator)
 
 class HuggingFaceMapStyleDataset(Dataset):
     def __init__(self, hf_dataset, tokenizer, max_length, kayla_mode=False, text_column=None, prompt_column=None, completion_column=None):
@@ -589,6 +878,69 @@ def _collate_training_batch(batch, pad_token_id):
 
 def _collate_fn_dynamic_padding(batch, pad_token_id):
     return _collate_training_batch(batch, pad_token_id)
+
+def _streaming_bucket_size(batch_size: int, use_length_bucketing: bool, bucket_size=None):
+    return int(bucket_size or (batch_size * 50)) if use_length_bucketing and batch_size > 1 else 0
+
+def create_dataloader_for_jsonl(path, tokenizer, max_length, batch_size, pad_token_id,
+                                num_workers=0, kayla_mode=False,
+                                text_column: Optional[str] = None,
+                                prompt_column: Optional[str] = None,
+                                completion_column: Optional[str] = None,
+                                use_length_bucketing=True, bucket_size=None,
+                                device=None, prefetch_factor=None):
+    dataset = StreamingJSONLDataset(
+        path,
+        tokenizer,
+        max_length,
+        kayla_mode=kayla_mode,
+        text_column=text_column,
+        prompt_column=prompt_column,
+        completion_column=completion_column,
+        bucket_size=_streaming_bucket_size(batch_size, use_length_bucketing, bucket_size),
+        batch_size=batch_size,
+        shuffle_buckets=True,
+    )
+    collate = functools.partial(_collate_fn_dynamic_padding, pad_token_id=pad_token_id)
+    pin_memory = _pin_memory_for_device(device)
+    return _create_dataloader(
+        dataset,
+        batch_size=batch_size,
+        collate_fn=collate,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        prefetch_factor=prefetch_factor,
+    )
+
+def create_dataloader_for_hf_streaming(hf_dataset, tokenizer, max_length, batch_size, pad_token_id,
+                                       num_workers=0, kayla_mode=False,
+                                       text_column=None, prompt_column=None, completion_column=None,
+                                       use_length_bucketing=True, bucket_size=None,
+                                       shuffle=True, shuffle_buffer_size=10000,
+                                       device=None, prefetch_factor=None):
+    dataset = HuggingFaceStreamingDataset(
+        hf_dataset,
+        tokenizer,
+        max_length,
+        kayla_mode=kayla_mode,
+        text_column=text_column,
+        prompt_column=prompt_column,
+        completion_column=completion_column,
+        bucket_size=_streaming_bucket_size(batch_size, use_length_bucketing, bucket_size),
+        batch_size=batch_size,
+        shuffle=shuffle,
+        shuffle_buffer_size=shuffle_buffer_size,
+    )
+    collate = functools.partial(_collate_fn_dynamic_padding, pad_token_id=pad_token_id)
+    pin_memory = _pin_memory_for_device(device)
+    return _create_dataloader(
+        dataset,
+        batch_size=batch_size,
+        collate_fn=collate,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        prefetch_factor=prefetch_factor,
+    )
 
 def create_map_style_dataloader(dataset, batch_size, pad_token_id, num_workers=0, shuffle=True,
                                 use_length_bucketing=True, bucket_size=None,

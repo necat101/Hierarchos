@@ -5,9 +5,13 @@ from .training.trainer import train, finetune
 from .training.datasets import (
     IterableChunkedJSONLDataset, 
     PTChunkedDataset, 
+    StreamingJSONLDataset,
     OriginalJSONLDataset, 
+    HuggingFaceStreamingDataset,
     HuggingFaceMapStyleDataset,
     process_text_sample,
+    create_dataloader_for_jsonl,
+    create_dataloader_for_hf_streaming,
     create_dataloader_for_chunked,
     create_dataloader_pt_chunked,
     create_map_style_dataloader

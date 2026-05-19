@@ -24,13 +24,14 @@ class LengthGroupedBatchSampler(Sampler):
     """
     def __init__(self, lengths, batch_size: int, shuffle: bool = True,
                  drop_last: bool = False, bucket_size: Optional[int] = None,
-                 seed: Optional[int] = None):
+                 seed: Optional[int] = None, preserve_order: bool = False):
         if batch_size <= 0:
             raise ValueError("batch_size must be a positive integer")
         self.lengths = [max(1, int(length)) for length in lengths]
         self.batch_size = int(batch_size)
         self.shuffle = bool(shuffle)
         self.drop_last = bool(drop_last)
+        self.preserve_order = bool(preserve_order)
         target_bucket_size = int(bucket_size or (self.batch_size * 50))
         self.bucket_size = max(self.batch_size, target_bucket_size)
         self.bucket_size = max(
@@ -52,7 +53,7 @@ class LengthGroupedBatchSampler(Sampler):
         generator = torch.Generator()
         generator.manual_seed((self.seed + self.epoch) % (2**63 - 1))
 
-        if self.shuffle and len(self.lengths) > 1:
+        if self.shuffle and not self.preserve_order and len(self.lengths) > 1:
             indices = torch.randperm(len(self.lengths), generator=generator).tolist()
         else:
             indices = list(range(len(self.lengths)))
@@ -67,7 +68,7 @@ class LengthGroupedBatchSampler(Sampler):
                 if len(batch) == self.batch_size or not self.drop_last:
                     batches.append(batch)
 
-        if self.shuffle and len(batches) > 1:
+        if self.shuffle and not self.preserve_order and len(batches) > 1:
             order = torch.randperm(len(batches), generator=generator).tolist()
             for batch_idx in order:
                 yield batches[batch_idx]
@@ -278,8 +279,9 @@ def _streaming_bucket_size(batch_size: int, use_length_bucketing: bool, bucket_s
         return 0
     if bucket_size is not None:
         return max(batch_size, int(bucket_size))
-    # Streaming tokenizes on the critical path. Keep the default bucket window
-    # small enough that first-batch/refill latency does not starve the GPU.
+    # Keep enough lookahead for dynamic padding wins. HF single-shard datasets
+    # use the tokenized PT cache path, so this no longer forces repeated HF
+    # tokenization on every epoch.
     return max(batch_size, int(batch_size) * 8)
 
 def _resolve_jsonl_paths(path):
@@ -536,6 +538,7 @@ def create_dataloader_pt_chunked(directory_path, max_length, batch_size, num_wor
             shuffle=True,
             drop_last=drop_last,
             bucket_size=bucket_size,
+            preserve_order=True,
         )
         return _create_dataloader(
             dataset,
@@ -609,6 +612,67 @@ def process_text_sample(tokenizer, text_dict: dict, max_length: int, kayla_mode:
             "_length": len(ids),
         }
     except: return None
+
+def process_tokenized_sample(text_dict: dict, max_length: Optional[int] = None):
+    """Load a pre-tokenized JSONL row without running the tokenizer again."""
+    if not isinstance(text_dict, dict) or "input_ids" not in text_dict:
+        return None
+    try:
+        input_ids = text_dict.get("input_ids")
+        labels = text_dict.get("labels", input_ids)
+        attention_mask = text_dict.get("attention_mask")
+
+        if isinstance(input_ids, torch.Tensor):
+            input_ids = input_ids.detach().cpu().tolist()
+        if isinstance(labels, torch.Tensor):
+            labels = labels.detach().cpu().tolist()
+        if isinstance(attention_mask, torch.Tensor):
+            attention_mask = attention_mask.detach().cpu().tolist()
+
+        input_ids = [int(value) for value in input_ids]
+        labels = [int(value) for value in labels]
+        if not input_ids:
+            return None
+
+        max_len = int(max_length or 0)
+        if max_len > 0:
+            input_ids = input_ids[:max_len]
+            labels = labels[:max_len]
+            if attention_mask is not None:
+                attention_mask = attention_mask[:max_len]
+
+        if len(labels) < len(input_ids):
+            labels = labels + ([-100] * (len(input_ids) - len(labels)))
+        elif len(labels) > len(input_ids):
+            labels = labels[:len(input_ids)]
+
+        if attention_mask is None:
+            attention_mask = [1] * len(input_ids)
+        else:
+            attention_mask = [int(value) for value in attention_mask]
+            if len(attention_mask) < len(input_ids):
+                attention_mask = attention_mask + ([1] * (len(input_ids) - len(attention_mask)))
+            elif len(attention_mask) > len(input_ids):
+                attention_mask = attention_mask[:len(input_ids)]
+
+        length = text_dict.get("_length", text_dict.get("length", text_dict.get("valid_length")))
+        try:
+            length = int(length)
+        except (TypeError, ValueError):
+            length = _sample_effective_length(
+                {"input_ids": input_ids, "attention_mask": attention_mask},
+                fallback_length=len(input_ids),
+            )
+        length = max(1, min(len(input_ids), length))
+
+        return {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+            "_length": length,
+        }
+    except Exception:
+        return None
 
 class OriginalJSONLDataset(Dataset):
     def __init__(self, path, tokenizer, max_length, kayla_mode=False,
@@ -719,15 +783,17 @@ class StreamingJSONLDataset(IterableDataset):
                 obj = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            processed = process_text_sample(
-                self.tokenizer,
-                obj,
-                self.max_length,
-                self.kayla_mode,
-                text_column=self.text_column,
-                prompt_column=self.prompt_column,
-                completion_column=self.completion_column,
-            )
+            processed = process_tokenized_sample(obj, self.max_length)
+            if processed is None:
+                processed = process_text_sample(
+                    self.tokenizer,
+                    obj,
+                    self.max_length,
+                    self.kayla_mode,
+                    text_column=self.text_column,
+                    prompt_column=self.prompt_column,
+                    completion_column=self.completion_column,
+                )
             if processed is None:
                 continue
             if self.bucket_size > 0:

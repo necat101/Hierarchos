@@ -10,6 +10,7 @@ from .training.datasets import (
     HuggingFaceStreamingDataset,
     HuggingFaceMapStyleDataset,
     process_text_sample,
+    process_tokenized_sample,
     create_dataloader_for_jsonl,
     create_dataloader_for_hf_streaming,
     create_dataloader_for_chunked,

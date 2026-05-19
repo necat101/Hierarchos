@@ -788,7 +788,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     for epoch in range(start_epoch, args.epochs):
         model.train()
         set_dataloader_epoch(dataloader, epoch)
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}")
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}", total=dataloader_len)
         
         # [NEW] Restore running_states if resuming mid-epoch
         if epoch == start_epoch and checkpoint and 'running_states' in checkpoint:
@@ -1153,7 +1153,7 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
     for epoch in range(start_epoch, args.epochs):
         print(f"\n--- LoRA Finetune Epoch {epoch + 1} / {args.epochs} ---")
         set_dataloader_epoch(dataloader, epoch)
-        pbar = tqdm(dataloader, desc=f"Finetune Epoch {epoch + 1}")
+        pbar = tqdm(dataloader, desc=f"Finetune Epoch {epoch + 1}", total=dataloader_len)
         total_loss = 0.0
         total_ponder_cost = 0.0
         total_commitment_cost = 0.0

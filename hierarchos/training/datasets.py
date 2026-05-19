@@ -273,6 +273,79 @@ def _estimate_text_token_length(text_dict: dict, max_length: int, kayla_mode: bo
     approx_tokens = (text_len + 3) // 4 + 1
     return max(1, min(int(max_length), approx_tokens))
 
+def _streaming_bucket_size(batch_size: int, use_length_bucketing: bool, bucket_size=None):
+    if not use_length_bucketing or batch_size <= 1:
+        return 0
+    if bucket_size is not None:
+        return max(batch_size, int(bucket_size))
+    # Streaming tokenizes on the critical path. Keep the default bucket window
+    # small enough that first-batch/refill latency does not starve the GPU.
+    return max(batch_size, int(batch_size) * 8)
+
+def _resolve_jsonl_paths(path):
+    path = os.fspath(path)
+    if os.path.isdir(path):
+        paths = []
+        for root, _dirs, files in os.walk(path):
+            for filename in files:
+                lower = filename.lower()
+                if lower == "manifest.jsonl":
+                    continue
+                if lower.endswith((".jsonl", ".ndjson")):
+                    paths.append(os.path.join(root, filename))
+        paths.sort()
+        if not paths:
+            raise FileNotFoundError(f"No JSONL/NDJSON shard files found in directory: {path}")
+        return paths
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Dataset file not found: {path}")
+    return [path]
+
+def _iter_jsonl_lines_for_worker(path: str, worker_id: int, num_workers: int):
+    if num_workers <= 1:
+        with open(path, "r", encoding="utf-8") as f:
+            for line_num, line in enumerate(f, 1):
+                yield line_num, line
+        return
+
+    file_size = os.path.getsize(path)
+    start_byte = (file_size * worker_id) // num_workers
+    end_byte = (file_size * (worker_id + 1)) // num_workers
+    with open(path, "rb") as f:
+        f.seek(start_byte)
+        if start_byte > 0:
+            f.readline()
+        while True:
+            if worker_id != num_workers - 1 and f.tell() >= end_byte:
+                break
+            raw_line = f.readline()
+            if not raw_line:
+                break
+            try:
+                yield None, raw_line.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+
+def _iter_jsonl_shards_for_worker(paths, worker_id: int, num_workers: int):
+    paths = list(paths)
+    if not paths:
+        return
+
+    # Prefer whole-file assignment when there are enough physical shards. This
+    # avoids multiple workers seeking/reading the same file at once.
+    if num_workers <= 1 or len(paths) >= num_workers:
+        assigned_paths = paths if num_workers <= 1 else [
+            path for path_idx, path in enumerate(paths) if path_idx % num_workers == worker_id
+        ]
+        for path in assigned_paths:
+            yield from _iter_jsonl_lines_for_worker(path, 0, 1)
+        return
+
+    # If a dataset has fewer files than workers, still split by byte range so
+    # extra workers do useful work without duplicating samples.
+    for path in paths:
+        yield from _iter_jsonl_lines_for_worker(path, worker_id, num_workers)
+
 class IterableChunkedJSONLDataset(IterableDataset):
     """
     An IterableDataset for loading pre-tokenized, chunked, masked, and padded
@@ -281,9 +354,8 @@ class IterableChunkedJSONLDataset(IterableDataset):
     def __init__(self, path: str, max_length: int, bucket_size: int = 0,
                  batch_size: int = 1, shuffle_buckets: bool = True):
         super().__init__()
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Dataset file not found: {path}")
         self.path = path
+        self.paths = _resolve_jsonl_paths(path)
         self.max_length = max_length
         self.bucket_size = max(0, int(bucket_size or 0))
         self.batch_size = max(1, int(batch_size))
@@ -298,7 +370,7 @@ class IterableChunkedJSONLDataset(IterableDataset):
         worker_id = worker_info.id if worker_info is not None else 0
         num_workers = worker_info.num_workers if worker_info is not None else 1
 
-        print(f"[Worker {worker_id}/{num_workers}] Opening dataset file: {self.path}")
+        print(f"[Worker {worker_id}/{num_workers}] Opening {len(self.paths)} chunked JSONL shard(s): {self.path}")
         skipped_count = 0
         processed_count = 0
         bucket = []
@@ -306,24 +378,7 @@ class IterableChunkedJSONLDataset(IterableDataset):
         generator.manual_seed((torch.initial_seed() + self.epoch + worker_id) % (2**63 - 1))
 
         try:
-            file_size = os.path.getsize(self.path)
-            start_byte = (file_size * worker_id) // num_workers
-            end_byte = (file_size * (worker_id + 1)) // num_workers
-            with open(self.path, "rb") as f:
-                f.seek(start_byte)
-                if start_byte > 0:
-                    f.readline()
-                while True:
-                    if worker_id != num_workers - 1 and f.tell() >= end_byte:
-                        break
-                    raw_line = f.readline()
-                    if not raw_line:
-                        break
-                    try:
-                        line = raw_line.decode("utf-8")
-                    except UnicodeDecodeError:
-                        skipped_count += 1
-                        continue
+            for _line_num, line in _iter_jsonl_shards_for_worker(self.paths, worker_id, num_workers):
                     line = line.strip()
                     if not line: continue
                     try:
@@ -370,7 +425,7 @@ class IterableChunkedJSONLDataset(IterableDataset):
 def create_dataloader_for_chunked(path, max_length, batch_size, num_workers=0,
                                   use_length_bucketing=True, bucket_size=None,
                                   device=None, prefetch_factor=None):
-    streaming_bucket_size = int(bucket_size or (batch_size * 50)) if use_length_bucketing and batch_size > 1 else 0
+    streaming_bucket_size = _streaming_bucket_size(batch_size, use_length_bucketing, bucket_size)
     dataset = IterableChunkedJSONLDataset(
         path,
         max_length=max_length,
@@ -619,31 +674,6 @@ class OriginalJSONLDataset(Dataset):
     def __getitem__(self, idx): return self.samples[idx]
     def get_sample_lengths(self): return self.sample_lengths
 
-def _iter_jsonl_lines_for_worker(path: str, worker_id: int, num_workers: int):
-    if num_workers <= 1:
-        with open(path, "r", encoding="utf-8") as f:
-            for line_num, line in enumerate(f, 1):
-                yield line_num, line
-        return
-
-    file_size = os.path.getsize(path)
-    start_byte = (file_size * worker_id) // num_workers
-    end_byte = (file_size * (worker_id + 1)) // num_workers
-    with open(path, "rb") as f:
-        f.seek(start_byte)
-        if start_byte > 0:
-            f.readline()
-        while True:
-            if worker_id != num_workers - 1 and f.tell() >= end_byte:
-                break
-            raw_line = f.readline()
-            if not raw_line:
-                break
-            try:
-                yield None, raw_line.decode("utf-8")
-            except UnicodeDecodeError:
-                continue
-
 class StreamingJSONLDataset(IterableDataset):
     """
     Stream raw JSONL text samples from disk and tokenize inside DataLoader
@@ -656,9 +686,8 @@ class StreamingJSONLDataset(IterableDataset):
                  bucket_size: int = 0, batch_size: int = 1,
                  shuffle_buckets: bool = True):
         super().__init__()
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Dataset file not found: {path}")
         self.path = path
+        self.paths = _resolve_jsonl_paths(path)
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.kayla_mode = kayla_mode
@@ -682,7 +711,7 @@ class StreamingJSONLDataset(IterableDataset):
         generator = torch.Generator()
         generator.manual_seed((torch.initial_seed() + self.epoch + worker_id) % (2**63 - 1))
 
-        for _line_num, line in _iter_jsonl_lines_for_worker(self.path, worker_id, num_workers):
+        for _line_num, line in _iter_jsonl_shards_for_worker(self.paths, worker_id, num_workers):
             line = line.strip()
             if not line:
                 continue
@@ -834,19 +863,21 @@ class HuggingFaceMapStyleDataset(Dataset):
         for idx in range(len(self.hf_dataset)):
             try:
                 sample = self.hf_dataset[idx]
-                processed = process_text_sample(
-                    self.tokenizer,
-                    sample,
-                    self.max_length,
-                    self.kayla_mode,
-                    self.text_column,
-                    self.prompt_column,
-                    self.completion_column,
-                )
-                length = len(processed["input_ids"]) if processed is not None else _estimate_text_token_length(
+                length = _estimate_text_token_length(
                     sample, self.max_length, self.kayla_mode,
                     self.text_column, self.prompt_column, self.completion_column,
                 )
+                if length is None:
+                    processed = process_text_sample(
+                        self.tokenizer,
+                        sample,
+                        self.max_length,
+                        self.kayla_mode,
+                        self.text_column,
+                        self.prompt_column,
+                        self.completion_column,
+                    )
+                    length = len(processed["input_ids"]) if processed is not None else None
             except Exception:
                 return None
             if length is None:
@@ -878,9 +909,6 @@ def _collate_training_batch(batch, pad_token_id):
 
 def _collate_fn_dynamic_padding(batch, pad_token_id):
     return _collate_training_batch(batch, pad_token_id)
-
-def _streaming_bucket_size(batch_size: int, use_length_bucketing: bool, bucket_size=None):
-    return int(bucket_size or (batch_size * 50)) if use_length_bucketing and batch_size > 1 else 0
 
 def create_dataloader_for_jsonl(path, tokenizer, max_length, batch_size, pad_token_id,
                                 num_workers=0, kayla_mode=False,

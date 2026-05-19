@@ -1,5 +1,6 @@
 import json
 import os
+import types
 import tempfile
 
 import torch
@@ -10,6 +11,7 @@ from hierarchos.training.datasets import (
     StreamingJSONLDataset,
     _iter_hf_worker_samples,
     _iter_jsonl_lines_for_worker,
+    _iter_jsonl_shards_for_worker,
     create_dataloader_for_chunked,
     create_dataloader_for_hf_streaming,
     create_dataloader_for_jsonl,
@@ -123,6 +125,96 @@ def test_jsonl_byte_shards_cover_lines_once():
                 seen.append(json.loads(line)["idx"])
 
     assert sorted(seen) == list(range(len(rows)))
+
+
+def test_jsonl_file_shards_assign_whole_files_to_workers():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        paths = []
+        expected = []
+        for shard_idx in range(4):
+            path = os.path.join(tmpdir, f"shard_{shard_idx:05d}.jsonl")
+            rows = [{"text": f"row {shard_idx}-{idx}", "idx": shard_idx * 10 + idx} for idx in range(3)]
+            expected.extend(row["idx"] for row in rows)
+            _write_jsonl(path, rows)
+            paths.append(path)
+
+        seen = []
+        for worker_id in range(4):
+            for _line_num, line in _iter_jsonl_shards_for_worker(paths, worker_id, 4):
+                seen.append(json.loads(line)["idx"])
+
+    assert sorted(seen) == sorted(expected)
+
+
+def test_streaming_jsonl_directory_shards_batch_once():
+    tokenizer = TinyTokenizer()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        expected_rows = 0
+        for shard_idx in range(3):
+            rows = [{"text": f"directory shard {shard_idx} sample {idx}"} for idx in range(5)]
+            expected_rows += len(rows)
+            _write_jsonl(os.path.join(tmpdir, f"shard_{shard_idx:05d}.jsonl"), rows)
+        _write_jsonl(os.path.join(tmpdir, "manifest.jsonl"), [{"ignored": True}])
+
+        batches = list(create_dataloader_for_jsonl(
+            tmpdir,
+            tokenizer,
+            max_length=96,
+            batch_size=4,
+            pad_token_id=tokenizer.pad_token_id,
+            num_workers=0,
+            use_length_bucketing=True,
+        ))
+
+    assert sum(batch["input_ids"].shape[0] for batch in batches) == expected_rows
+
+
+def test_hf_materialization_partitions_rows_without_copying_shards():
+    import hierarchos_cli
+
+    original_loader = hierarchos_cli.load_hf_dataset
+    rows = [{"text": f"hf row {idx}", "idx": idx} for idx in range(23)]
+
+    try:
+        hierarchos_cli.load_hf_dataset = lambda *args, **kwargs: iter(rows)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = types.SimpleNamespace(
+                hf_dataset="fake/hf",
+                hf_dataset_config=None,
+                hf_dataset_split="train",
+                hf_shard_cache_dir=tmpdir,
+                refresh_hf_shards=True,
+                dataset_size=len(rows),
+            )
+            shard_dir = hierarchos_cli.materialize_hf_dataset_shards(args, 4)
+
+            seen = []
+            shard_counts = []
+            for shard_idx in range(4):
+                shard_path = os.path.join(shard_dir, f"shard_{shard_idx:05d}.jsonl")
+                with open(shard_path, "r", encoding="utf-8") as f:
+                    shard_rows = [json.loads(line) for line in f if line.strip()]
+                shard_counts.append(len(shard_rows))
+                seen.extend(row["idx"] for row in shard_rows)
+
+    finally:
+        hierarchos_cli.load_hf_dataset = original_loader
+
+    assert sorted(seen) == list(range(len(rows)))
+    assert len(seen) == len(set(seen))
+    assert max(shard_counts) - min(shard_counts) <= 1
+
+
+def test_cli_detects_jsonl_shard_directory():
+    import hierarchos_cli
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _write_jsonl(os.path.join(tmpdir, "manifest.jsonl"), [{"ignored": True}])
+        _write_jsonl(os.path.join(tmpdir, "shard_00000.jsonl"), [{"text": "visible shard"}])
+        _write_jsonl(os.path.join(tmpdir, "shard_00001.ndjson"), [{"text": "second shard"}])
+
+        assert hierarchos_cli._is_jsonl_source(tmpdir)
+        assert hierarchos_cli.count_jsonl_source_rows(tmpdir) == 2
 
 
 def test_hf_streaming_dataloader_batches():
@@ -277,6 +369,10 @@ def main():
         test_process_text_sample_autodetects_common_columns,
         test_streaming_jsonl_dataloader_batches_without_materializing,
         test_jsonl_byte_shards_cover_lines_once,
+        test_jsonl_file_shards_assign_whole_files_to_workers,
+        test_streaming_jsonl_directory_shards_batch_once,
+        test_hf_materialization_partitions_rows_without_copying_shards,
+        test_cli_detects_jsonl_shard_directory,
         test_hf_streaming_dataloader_batches,
         test_hf_worker_shards_cover_samples_once,
         test_streaming_jsonl_length_buckets_reduce_padding,

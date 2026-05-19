@@ -20,6 +20,10 @@ parser.add_argument("--output-dir", type=str, default="train_Hierarchos_chunked_
 # <<< ADDED: chunks_per_file argument >>>
 parser.add_argument("--chunks-per-file", type=int, default=1000,
                     help="Number of chunks to consolidate into a single .pt file.")
+parser.add_argument("--output-format", choices=["pt", "jsonl", "both"], default="pt",
+                    help="Output pre-tokenized chunks as consolidated .pt files, sharded JSONL files, or both.")
+parser.add_argument("--jsonl-shards", type=int, default=0,
+                    help="Number of pre-tokenized JSONL shard files to write when --output-format is jsonl/both. 0 = auto.")
 # --- Internal constants (could be args later if needed) ---
 RESERVED_CHUNK_SPACE = 2048 # Minimum size reserved for the chunkable part
 ANCHOR_SAFETY_MARGIN = 16 # Extra tokens added to the longest thought process
@@ -33,6 +37,12 @@ TOKENIZER_PATH = args.tokenizer_path
 DATASET_FILE = args.dataset
 OUTPUT_DIR = args.output_dir
 CHUNKS_PER_FILE = args.chunks_per_file # <<< Use new argument
+WRITE_PT = args.output_format in ("pt", "both")
+WRITE_JSONL = args.output_format in ("jsonl", "both")
+JSONL_SHARDS = 0
+if WRITE_JSONL:
+    auto_shards = min(16, max(1, os.cpu_count() or 1))
+    JSONL_SHARDS = max(1, int(args.jsonl_shards or auto_shards))
 
 # --- 2. Load Tokenizer ---
 print(f"Loading tokenizer '{TOKENIZER_PATH}'...")
@@ -128,6 +138,9 @@ print(f"Reserved chunk space (MIN_CHUNKABLE_TOKENS): {MIN_CHUNKABLE_TOKENS} toke
 print(f"Overlap set to: {OVERLAP_TOKENS} tokens")
 print(f"FINAL MAX_SEQ_LENGTH: {MAX_SEQ_LENGTH} tokens")
 print(f"Chunks per consolidated file: {CHUNKS_PER_FILE}")
+print(f"Output format: {args.output_format}")
+if WRITE_JSONL:
+    print(f"JSONL output shards: {JSONL_SHARDS}")
 print("---" * 10)
 
 # --- 5. Pass 2: Process and Chunk the Dataset ---
@@ -143,6 +156,7 @@ total_chunks_created = 0
 chunk_buffer = [] # Holds chunks before saving
 current_file_index = 0
 current_chunk_filename = f"consolidated_chunks_{current_file_index:07d}.pt"
+jsonl_shard_files = []
 
 # Define wrappers for easier access
 inst_start_wrapper = "### Instruction:\n"
@@ -165,6 +179,11 @@ def save_chunk_buffer(buffer, filename, output_dir):
     buffer.clear()
 
 try:
+    if WRITE_JSONL:
+        for shard_idx in range(JSONL_SHARDS):
+            shard_path = os.path.join(OUTPUT_DIR, f"chunked_shard_{shard_idx:05d}.jsonl")
+            jsonl_shard_files.append(open(shard_path, "w", encoding="utf-8"))
+
     with open(DATASET_FILE, "r", encoding="utf-8") as f_in, \
          open(manifest_path, "w", encoding="utf-8") as f_manifest:
         # Wrap the file reading with tqdm for progress bar
@@ -265,31 +284,46 @@ try:
                 valid_token_count = min(anchor_len + len(chunk_content_tokens) + 1, MAX_SEQ_LENGTH)
                 attention_mask_list = [1] * valid_token_count + [0] * (MAX_SEQ_LENGTH - valid_token_count)
 
-                # --- Create chunk dictionary (tensors created later or just before save) ---
-                chunk_data = {
-                    "input_ids": torch.tensor(input_ids_list, dtype=torch.long),
-                    "labels": torch.tensor(labels_list, dtype=torch.long),
-                    "attention_mask": torch.tensor(attention_mask_list, dtype=torch.long)
+                chunk_data_json = {
+                    "input_ids": input_ids_list,
+                    "labels": labels_list,
+                    "attention_mask": attention_mask_list,
+                    "length": valid_token_count,
+                    "valid_length": valid_token_count,
                 }
 
-                # <<< MODIFICATION: Add to buffer >>>
-                chunk_buffer.append(chunk_data)
-                index_in_current_file = len(chunk_buffer) - 1
+                if WRITE_JSONL:
+                    shard_idx = total_chunks_created % JSONL_SHARDS
+                    jsonl_shard_files[shard_idx].write(json.dumps(chunk_data_json) + "\n")
 
-                # <<< MODIFICATION: Write manifest entry >>>
-                manifest_entry = {
-                    "file_path": current_chunk_filename,
-                    "index_in_file": index_in_current_file
-                }
-                f_manifest.write(json.dumps(manifest_entry) + "\n")
-                total_chunks_created += 1
+                if WRITE_PT:
+                    # <<< MODIFICATION: Add to buffer >>>
+                    chunk_data = {
+                        "input_ids": torch.tensor(input_ids_list, dtype=torch.long),
+                        "labels": torch.tensor(labels_list, dtype=torch.long),
+                        "attention_mask": torch.tensor(attention_mask_list, dtype=torch.long),
+                        "_length": valid_token_count,
+                    }
+                    chunk_buffer.append(chunk_data)
+                    index_in_current_file = len(chunk_buffer) - 1
+
+                    # <<< MODIFICATION: Write manifest entry >>>
+                    manifest_entry = {
+                        "file_path": current_chunk_filename,
+                        "index_in_file": index_in_current_file,
+                        "length": valid_token_count,
+                        "valid_length": valid_token_count,
+                    }
+                    f_manifest.write(json.dumps(manifest_entry) + "\n")
 
                 # <<< MODIFICATION: Save buffer if full >>>
-                if len(chunk_buffer) >= CHUNKS_PER_FILE:
+                if WRITE_PT and len(chunk_buffer) >= CHUNKS_PER_FILE:
                     pbar_chunk.set_postfix_str(f"Saving {current_chunk_filename}...")
                     save_chunk_buffer(chunk_buffer, current_chunk_filename, OUTPUT_DIR)
                     current_file_index += 1
                     current_chunk_filename = f"consolidated_chunks_{current_file_index:07d}.pt"
+
+                total_chunks_created += 1
 
                 # --- Update start index for the next chunk ---
                 step_size = available_length_for_chunk - OVERLAP_TOKENS
@@ -307,9 +341,14 @@ except Exception as e:
     traceback.print_exc()
 finally:
     # <<< MODIFICATION: Save any remaining chunks in the buffer >>>
-    if chunk_buffer:
+    if WRITE_PT and chunk_buffer:
         print(f"\nSaving remaining {len(chunk_buffer)} chunks to {current_chunk_filename}...")
         save_chunk_buffer(chunk_buffer, current_chunk_filename, OUTPUT_DIR)
+    for shard_file in jsonl_shard_files:
+        try:
+            shard_file.close()
+        except Exception:
+            pass
     # Ensure files are closed if an exception occurred within the 'with' block
     try:
         if 'f_in' in locals() and not f_in.closed: f_in.close()
@@ -323,7 +362,11 @@ print("---" * 10)
 print(f"Original samples processed: {original_sample_count}")
 print(f"Samples skipped due to errors/length: {skipped_samples}")
 print(f"New tensor chunks created: {total_chunks_created}")
-print(f"Consolidated into {current_file_index + 1} '.pt' files.") # +1 because index is 0-based
+if WRITE_PT:
+    print(f"Consolidated into {current_file_index + 1} '.pt' files.") # +1 because index is 0-based
+if WRITE_JSONL:
+    print(f"Sharded into {JSONL_SHARDS} pre-tokenized JSONL files.")
 print(f"Chunked tensors saved to directory: '{OUTPUT_DIR}'")
-print(f"Manifest file created at: '{manifest_path}'")
+if WRITE_PT:
+    print(f"Manifest file created at: '{manifest_path}'")
 print("Chunking process finished.")

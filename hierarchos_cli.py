@@ -2,6 +2,8 @@ import os
 import sys
 import argparse
 import json
+import hashlib
+import shutil
 import torch
 import torch.nn as nn
 from transformers import AutoTokenizer
@@ -95,11 +97,152 @@ def _is_jsonl_path(path):
     return str(path).lower().endswith((".jsonl", ".ndjson"))
 
 
+def _jsonl_source_files(path):
+    if _is_jsonl_path(path):
+        return [path]
+    if not path or not os.path.isdir(path):
+        return []
+    paths = []
+    for _root, _dirs, files in os.walk(path):
+        for filename in files:
+            lower = filename.lower()
+            if lower != "manifest.jsonl" and lower.endswith((".jsonl", ".ndjson")):
+                paths.append(os.path.join(_root, filename))
+    paths.sort()
+    return paths
+
+
+def _is_jsonl_source(path):
+    return bool(_jsonl_source_files(path))
+
+
+def count_jsonl_source_rows(path):
+    count = 0
+    for jsonl_path in _jsonl_source_files(path):
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            count += sum(1 for line in f if line.strip())
+    return count
+
+
 def _local_text_columns(args):
     return args.text_column, args.prompt_column, args.completion_column
 
 
+def _hf_shard_cache_key(args, num_shards):
+    payload = {
+        "dataset": args.hf_dataset,
+        "config": args.hf_dataset_config,
+        "split": args.hf_dataset_split,
+        "num_shards": int(num_shards),
+    }
+    return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+
+
+def materialize_hf_dataset_shards(args, num_shards):
+    num_shards = max(1, int(num_shards or 1))
+    cache_root = getattr(args, "hf_shard_cache_dir", None) or os.path.join(os.getcwd(), ".hierarchos_hf_shards")
+    shard_key = _hf_shard_cache_key(args, num_shards)
+    shard_dir = os.path.join(cache_root, shard_key)
+    success_path = os.path.join(shard_dir, "_SUCCESS")
+
+    expected_shards = [
+        os.path.join(shard_dir, f"shard_{idx:05d}.jsonl")
+        for idx in range(num_shards)
+    ]
+    if (
+        not getattr(args, "refresh_hf_shards", False)
+        and os.path.exists(success_path)
+        and all(os.path.exists(path) for path in expected_shards)
+    ):
+        print(f"INFO: Reusing cached HF JSONL shards from {shard_dir}")
+        return shard_dir
+
+    tmp_dir = shard_dir + ".tmp"
+    if os.path.exists(tmp_dir):
+        shutil.rmtree(tmp_dir)
+    if getattr(args, "refresh_hf_shards", False) and os.path.exists(shard_dir):
+        shutil.rmtree(shard_dir)
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    print(
+        "INFO: Materializing HF dataset into "
+        f"{num_shards} local JSONL shard(s) for multi-worker streaming..."
+    )
+    hf_dataset = load_hf_dataset(
+        args.hf_dataset,
+        args.hf_dataset_config,
+        split=args.hf_dataset_split,
+        streaming=True,
+    )
+
+    shard_files = []
+    shard_counts = [0] * int(num_shards)
+    try:
+        for shard_idx in range(num_shards):
+            shard_path = os.path.join(tmp_dir, f"shard_{shard_idx:05d}.jsonl")
+            shard_files.append(open(shard_path, "w", encoding="utf-8"))
+
+        total_samples = getattr(args, "dataset_size", 0) or None
+        if total_samples is None:
+            try:
+                total_samples = estimate_hf_dataset_size(
+                    args.hf_dataset,
+                    args.hf_dataset_config,
+                    args.hf_dataset_split,
+                )
+            except Exception:
+                total_samples = None
+        for sample_idx, sample in enumerate(tqdm(
+            hf_dataset,
+            desc="Sharding HF dataset",
+            unit="sample",
+            total=total_samples,
+        )):
+            shard_idx = sample_idx % num_shards
+            shard_files[shard_idx].write(json.dumps(sample, ensure_ascii=False, default=str) + "\n")
+            shard_counts[shard_idx] += 1
+    finally:
+        for shard_file in shard_files:
+            try:
+                shard_file.close()
+            except Exception:
+                pass
+
+    with open(os.path.join(tmp_dir, "_SUCCESS"), "w", encoding="utf-8") as f:
+        json.dump({"num_shards": num_shards, "counts": shard_counts}, f, indent=2)
+
+    if os.path.exists(shard_dir):
+        shutil.rmtree(shard_dir)
+    os.replace(tmp_dir, shard_dir)
+    print(f"INFO: HF JSONL shards ready in {shard_dir} ({sum(shard_counts)} samples).")
+    return shard_dir
+
+
 def create_hf_training_dataloader(args, tokenizer, device):
+    def create_indexed_hf_dataloader(reason=None):
+        if reason:
+            print(f"INFO: {reason}")
+        hf_dataset = load_hf_dataset(args.hf_dataset, args.hf_dataset_config, split=args.hf_dataset_split)
+        dataset = HuggingFaceMapStyleDataset(
+            hf_dataset,
+            tokenizer,
+            args.max_length,
+            args.kayla,
+            args.text_column,
+            args.prompt_column,
+            args.completion_column,
+        )
+        return create_map_style_dataloader(
+            dataset,
+            args.batch_size,
+            tokenizer.pad_token_id,
+            args.num_workers,
+            use_length_bucketing=getattr(args, "length_bucketing", True),
+            bucket_size=getattr(args, "length_bucket_size", None),
+            device=device,
+            prefetch_factor=args.prefetch_factor,
+        )
+
     if getattr(args, "streaming_datasets", True):
         try:
             hf_dataset = load_hf_dataset(
@@ -108,13 +251,48 @@ def create_hf_training_dataloader(args, tokenizer, device):
                 split=args.hf_dataset_split,
                 streaming=True,
             )
+            hf_num_workers = args.num_workers
+            hf_num_shards = getattr(hf_dataset, "num_shards", None)
+            try:
+                hf_num_shards = int(hf_num_shards) if hf_num_shards is not None else None
+            except (TypeError, ValueError):
+                hf_num_shards = None
+            if hf_num_shards is not None and hf_num_shards > 0 and hf_num_workers > hf_num_shards:
+                if getattr(args, "hf_auto_shard", True) and hf_num_workers > 1:
+                    shard_dir = materialize_hf_dataset_shards(args, hf_num_workers)
+                    print(
+                        "INFO: Using local sharded JSONL streaming for HF dataset "
+                        f"({hf_num_workers} worker shard(s))."
+                    )
+                    return create_dataloader_for_jsonl(
+                        shard_dir,
+                        tokenizer,
+                        args.max_length,
+                        args.batch_size,
+                        tokenizer.pad_token_id,
+                        num_workers=hf_num_workers,
+                        kayla_mode=args.kayla,
+                        text_column=args.text_column,
+                        prompt_column=args.prompt_column,
+                        completion_column=args.completion_column,
+                        use_length_bucketing=getattr(args, "length_bucketing", True),
+                        bucket_size=getattr(args, "length_bucket_size", None),
+                        device=device,
+                        prefetch_factor=args.prefetch_factor,
+                    )
+                return create_indexed_hf_dataloader(
+                    "HF streaming exposes "
+                    f"{hf_num_shards} physical shard(s), but --num_workers={hf_num_workers}. "
+                    "Using indexed HF loading so PyTorch can use all requested workers. "
+                    "For true multi-worker iterable streaming, publish/download the dataset as multiple data files."
+                )
             dataloader = create_dataloader_for_hf_streaming(
                 hf_dataset,
                 tokenizer,
                 args.max_length,
                 args.batch_size,
                 tokenizer.pad_token_id,
-                num_workers=args.num_workers,
+                num_workers=hf_num_workers,
                 kayla_mode=args.kayla,
                 text_column=args.text_column,
                 prompt_column=args.prompt_column,
@@ -130,31 +308,12 @@ def create_hf_training_dataloader(args, tokenizer, device):
         except Exception as exc:
             print(f"WARNING: HF streaming loader failed ({exc}); falling back to map-style loading.")
 
-    hf_dataset = load_hf_dataset(args.hf_dataset, args.hf_dataset_config, split=args.hf_dataset_split)
-    dataset = HuggingFaceMapStyleDataset(
-        hf_dataset,
-        tokenizer,
-        args.max_length,
-        args.kayla,
-        args.text_column,
-        args.prompt_column,
-        args.completion_column,
-    )
-    return create_map_style_dataloader(
-        dataset,
-        args.batch_size,
-        tokenizer.pad_token_id,
-        args.num_workers,
-        use_length_bucketing=getattr(args, "length_bucketing", True),
-        bucket_size=getattr(args, "length_bucket_size", None),
-        device=device,
-        prefetch_factor=args.prefetch_factor,
-    )
+    return create_indexed_hf_dataloader()
 
 
 def create_local_training_dataloader(args, tokenizer, device):
     text_column, prompt_column, completion_column = _local_text_columns(args)
-    if getattr(args, "streaming_datasets", True) and _is_jsonl_path(args.train):
+    if getattr(args, "streaming_datasets", True) and _is_jsonl_source(args.train):
         print("INFO: Local JSONL dataset streaming enabled.")
         return create_dataloader_for_jsonl(
             args.train,
@@ -318,6 +477,9 @@ def main():
     train_group.add_argument("--length-bucket-size", "--length_bucket_size", dest="length_bucket_size", type=int, default=None, help="Samples per length bucket/window. Larger lowers padding; smaller lowers streaming latency.")
     train_group.add_argument("--no-streaming-datasets", dest="streaming_datasets", action="store_false", help="Disable streaming for raw JSONL/Hugging Face datasets and use map-style loading.")
     train_group.add_argument("--hf-streaming-shuffle-buffer", "--hf_streaming_shuffle_buffer", dest="hf_streaming_shuffle_buffer", type=int, default=10000, help="Buffered shuffle size for Hugging Face streaming datasets.")
+    train_group.add_argument("--no-hf-auto-shard", dest="hf_auto_shard", action="store_false", help="Disable automatic local JSONL shard materialization for single-shard HF streaming datasets.")
+    train_group.add_argument("--hf-shard-cache-dir", "--hf_shard_cache_dir", dest="hf_shard_cache_dir", type=str, default=None, help="Directory for cached local HF JSONL shards.")
+    train_group.add_argument("--refresh-hf-shards", "--refresh_hf_shards", dest="refresh_hf_shards", action="store_true", help="Rebuild cached local HF JSONL shards before training.")
     train_group.add_argument("--amp", action="store_true", help="Enable mixed precision (auto-enabled on CUDA).")
     train_group.add_argument("--no-amp", dest="amp", action="store_false", help="Explicitly disable mixed precision.")
     train_group.add_argument("--dataset-size", type=int, default=None, help="Force a specific dataset size (total samples) to calculate steps for the LR scheduler.")
@@ -405,21 +567,32 @@ def main():
                 processed = process_text_sample(tokenizer, sample, 9999, args.kayla, args.text_column, args.prompt_column, args.completion_column)
                 if processed: max_found = max(max_found, len(processed['input_ids']))
         elif args.train and isinstance(args.train, str):
-            print(f"Scanning local file: {args.train}...")
-            with open(args.train, 'r', encoding='utf-8') as f:
-                try: 
-                    data = json.load(f)
-                    if not isinstance(data, list): data = [data]
-                    for obj in tqdm(data, desc="Scanning JSON"):
-                        processed = process_text_sample(tokenizer, obj, 9999, args.kayla, args.text_column, args.prompt_column, args.completion_column)
-                        if processed: max_found = max(max_found, len(processed['input_ids']))
-                except:
-                    f.seek(0)
-                    for line in tqdm(f, desc="Scanning JSONL"):
-                        try:
-                            processed = process_text_sample(tokenizer, json.loads(line), 9999, args.kayla, args.text_column, args.prompt_column, args.completion_column)
+            jsonl_files = _jsonl_source_files(args.train)
+            if jsonl_files:
+                print(f"Scanning local JSONL source: {args.train}...")
+                for jsonl_path in jsonl_files:
+                    with open(jsonl_path, 'r', encoding='utf-8') as f:
+                        for line in tqdm(f, desc=f"Scanning {os.path.basename(jsonl_path)}"):
+                            try:
+                                processed = process_text_sample(tokenizer, json.loads(line), 9999, args.kayla, args.text_column, args.prompt_column, args.completion_column)
+                                if processed: max_found = max(max_found, len(processed['input_ids']))
+                            except: continue
+            else:
+                print(f"Scanning local file: {args.train}...")
+                with open(args.train, 'r', encoding='utf-8') as f:
+                    try:
+                        data = json.load(f)
+                        if not isinstance(data, list): data = [data]
+                        for obj in tqdm(data, desc="Scanning JSON"):
+                            processed = process_text_sample(tokenizer, obj, 9999, args.kayla, args.text_column, args.prompt_column, args.completion_column)
                             if processed: max_found = max(max_found, len(processed['input_ids']))
-                        except: continue
+                    except:
+                        f.seek(0)
+                        for line in tqdm(f, desc="Scanning JSONL"):
+                            try:
+                                processed = process_text_sample(tokenizer, json.loads(line), 9999, args.kayla, args.text_column, args.prompt_column, args.completion_column)
+                                if processed: max_found = max(max_found, len(processed['input_ids']))
+                            except: continue
         if max_found > 0:
             args.max_length = (max_found + 16 + 7) & -8 # Align to 8
             print(f"Auto-scan found max length {max_found}. Setting max_length={args.max_length}")
@@ -458,15 +631,14 @@ def main():
                             print(f"ERROR: Could not find split '{args.hf_dataset_split}' in HF dataset info. Please use --dataset-size."); sys.exit(1)
                     except Exception as e:
                         print(f"ERROR: Failed to query HF metadata: {e}. Please specify --dataset-size manually."); sys.exit(1)
-                elif hasattr(args, 'train') and isinstance(args.train, str) and os.path.isfile(args.train):
-                    print(f"INFO: Estimating dataset size from {args.train}...")
+                elif hasattr(args, 'train') and isinstance(args.train, str) and _is_jsonl_source(args.train):
+                    print(f"INFO: Estimating dataset size from JSONL source: {args.train}...")
                     try:
-                        with open(args.train, 'r', encoding='utf-8') as f:
-                            count = sum(1 for _ in f)
+                        count = count_jsonl_source_rows(args.train)
                         dataloader_len = _steps_from_samples(count, args.batch_size)
                         print(f"INFO: Automatic session detection found {count} samples -> {dataloader_len} steps per epoch.")
                     except Exception as e:
-                        print(f"ERROR: Could not count lines in {args.train}: {e}. Please specify --dataset-size manually."); sys.exit(1)
+                        print(f"ERROR: Could not count JSONL rows in {args.train}: {e}. Please specify --dataset-size manually."); sys.exit(1)
                 else:
                     print("ERROR: Dataset size could not be determined automatically. Please use --dataset-size to specify the number of steps per epoch."); sys.exit(1)
 
@@ -507,15 +679,14 @@ def main():
                             print(f"ERROR: Could not find split '{args.hf_dataset_split}' in HF dataset info. Please use --dataset-size."); sys.exit(1)
                     except Exception as e:
                         print(f"ERROR: Failed to query HF metadata: {e}. Please specify --dataset-size manually."); sys.exit(1)
-                elif hasattr(args, 'train') and isinstance(args.train, str) and os.path.isfile(args.train):
-                    print(f"INFO: Estimating dataset size from {args.train}...")
+                elif hasattr(args, 'train') and isinstance(args.train, str) and _is_jsonl_source(args.train):
+                    print(f"INFO: Estimating dataset size from JSONL source: {args.train}...")
                     try:
-                        with open(args.train, 'r', encoding='utf-8') as f:
-                            count = sum(1 for _ in f)
+                        count = count_jsonl_source_rows(args.train)
                         dataloader_len = _steps_from_samples(count, args.batch_size)
                         print(f"INFO: Automatic session detection found {count} samples -> {dataloader_len} steps per epoch.")
                     except Exception as e:
-                        print(f"ERROR: Could not count lines in {args.train}: {e}. Please specify --dataset-size manually."); sys.exit(1)
+                        print(f"ERROR: Could not count JSONL rows in {args.train}: {e}. Please specify --dataset-size manually."); sys.exit(1)
                 else:
                     print("ERROR: Dataset size could not be determined automatically. Please use --dataset-size to specify the number of steps per epoch."); sys.exit(1)
 

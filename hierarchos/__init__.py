@@ -5,6 +5,7 @@ from .training.trainer import train, finetune
 from .training.datasets import (
     IterableChunkedJSONLDataset, 
     PTChunkedDataset, 
+    TokenizedBinaryDataset,
     StreamingJSONLDataset,
     OriginalJSONLDataset, 
     HuggingFaceStreamingDataset,
@@ -15,6 +16,7 @@ from .training.datasets import (
     create_dataloader_for_hf_streaming,
     create_dataloader_for_chunked,
     create_dataloader_pt_chunked,
+    create_dataloader_for_tokenized_cache,
     create_map_style_dataloader
 )
 from .utils.device import (

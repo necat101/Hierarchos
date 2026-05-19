@@ -1,5 +1,6 @@
 import os
 import json
+import mmap
 import torch
 import traceback
 import functools
@@ -562,6 +563,109 @@ def create_dataloader_pt_chunked(directory_path, max_length, batch_size, num_wor
         shuffle=True,
         num_workers=num_workers,
         pin_memory=use_cuda,
+        prefetch_factor=prefetch_factor,
+    )
+
+class TokenizedBinaryDataset(Dataset):
+    """
+    Random-access token cache backed by one binary file plus a compact index.
+
+    Each record is stored as variable-length int32 input ids followed by int32
+    labels. Attention masks are generated during collation from the record
+    length, so the cache avoids padded max_length tensors.
+    """
+    def __init__(self, directory_path: str, max_length: Optional[int] = None):
+        super().__init__()
+        self.directory_path = directory_path
+        self.max_length = int(max_length or 0)
+        index_path = os.path.join(directory_path, "index.pt")
+        data_path = os.path.join(directory_path, "tokens.bin")
+        if not os.path.exists(index_path):
+            raise FileNotFoundError(f"Token cache index not found: {index_path}")
+        if not os.path.exists(data_path):
+            raise FileNotFoundError(f"Token cache data file not found: {data_path}")
+
+        index = torch.load(index_path, map_location="cpu")
+        self.offsets = index["offsets"].to(dtype=torch.long).contiguous()
+        self.lengths = index["lengths"].to(dtype=torch.long).contiguous()
+        if self.offsets.numel() != self.lengths.numel():
+            raise ValueError("Token cache index offsets/lengths size mismatch")
+        self.sample_lengths = [
+            max(1, min(int(length), self.max_length)) if self.max_length > 0 else max(1, int(length))
+            for length in self.lengths.tolist()
+        ]
+        self.data_path = data_path
+        self._file = None
+        self._mmap = None
+
+    def __len__(self):
+        return int(self.lengths.numel())
+
+    def __getstate__(self):
+        state = dict(self.__dict__)
+        state["_file"] = None
+        state["_mmap"] = None
+        return state
+
+    def _ensure_open(self):
+        if self._mmap is not None:
+            return
+        self._file = open(self.data_path, "rb")
+        self._mmap = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_COPY)
+
+    def close(self):
+        if self._mmap is not None:
+            try:
+                self._mmap.close()
+            except Exception:
+                pass
+            self._mmap = None
+        if self._file is not None:
+            try:
+                self._file.close()
+            except Exception:
+                pass
+            self._file = None
+
+    def __del__(self):
+        self.close()
+
+    def __getitem__(self, idx):
+        self._ensure_open()
+        offset = int(self.offsets[idx])
+        stored_length = int(self.lengths[idx])
+        length = stored_length
+        if self.max_length > 0:
+            length = min(length, self.max_length)
+        if length <= 0:
+            return None
+
+        label_offset = offset + (stored_length * 4)
+        input_ids = torch.frombuffer(self._mmap, dtype=torch.int32, count=length, offset=offset)
+        labels = torch.frombuffer(self._mmap, dtype=torch.int32, count=length, offset=label_offset)
+        return {
+            "input_ids": input_ids,
+            "labels": labels,
+            "_length": length,
+        }
+
+    def get_sample_lengths(self):
+        return self.sample_lengths
+
+
+def create_dataloader_for_tokenized_cache(directory_path, max_length, batch_size, pad_token_id,
+                                          num_workers=0, use_length_bucketing=True,
+                                          bucket_size=None, device=None, prefetch_factor=None):
+    dataset = TokenizedBinaryDataset(directory_path, max_length=max_length)
+    return create_map_style_dataloader(
+        dataset,
+        batch_size=batch_size,
+        pad_token_id=pad_token_id,
+        num_workers=num_workers,
+        shuffle=True,
+        use_length_bucketing=use_length_bucketing,
+        bucket_size=bucket_size,
+        device=device,
         prefetch_factor=prefetch_factor,
     )
 

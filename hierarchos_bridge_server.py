@@ -617,6 +617,7 @@ def handle_start_training(params: dict):
             from hierarchos import (
                 train as hierarchos_train,
                 OriginalJSONLDataset,
+                create_dataloader_for_jsonl,
                 create_map_style_dataloader,
                 process_text_sample,
             )
@@ -670,8 +671,6 @@ def handle_start_training(params: dict):
                         obj,
                         scan_max_length,
                         False,
-                        prompt_column="instruction",
-                        completion_column="output",
                     )
                     if processed:
                         max_found = max(max_found, len(processed["input_ids"]))
@@ -697,7 +696,7 @@ def handle_start_training(params: dict):
                                 continue
 
                 if max_found <= 0:
-                    raise ValueError("No valid instruction/output samples found while scanning.")
+                    raise ValueError("No valid text or instruction/output samples found while scanning.")
 
                 auto_len = (max_found + 16 + 7) & -8
                 capped_len = min(max(auto_len, 32), 32768)
@@ -751,7 +750,10 @@ def handle_start_training(params: dict):
                 persist_state=bool(params.get("persist_state", False)),
                 amp=bool(params.get("amp", True)),
                 save_steps=int(params.get("save_steps", 0)),
-                num_workers=0,
+                num_workers=max(0, int(params.get("num_workers", 0))),
+                prefetch_factor=params.get("prefetch_factor", None),
+                length_bucketing=bool(params.get("length_bucketing", True)),
+                length_bucket_size=params.get("length_bucket_size", None),
                 # Defaults for features not exposed in GUI
                 disable_lr_schedule=False,
                 ltm_lr=1e-3,
@@ -782,13 +784,39 @@ def handle_start_training(params: dict):
             )
 
             # Build dataloader (same pattern as hierarchos_cli.py)
-            dataset = OriginalJSONLDataset(
-                data_path, _tokenizer, train_args.max_length, False
-            )
-            dataloader = create_map_style_dataloader(
-                dataset, train_args.batch_size, _tokenizer.pad_token_id, 0
-            )
-            dataloader_len = len(dataloader)
+            if data_path.lower().endswith((".jsonl", ".ndjson")):
+                emit_status("Streaming JSONL dataset...")
+                dataloader = create_dataloader_for_jsonl(
+                    data_path,
+                    _tokenizer,
+                    train_args.max_length,
+                    train_args.batch_size,
+                    _tokenizer.pad_token_id,
+                    num_workers=train_args.num_workers,
+                    kayla_mode=False,
+                    use_length_bucketing=train_args.length_bucketing,
+                    bucket_size=train_args.length_bucket_size,
+                    device=_device,
+                    prefetch_factor=train_args.prefetch_factor,
+                )
+                with open(data_path, "r", encoding="utf-8") as f:
+                    sample_count = sum(1 for _ in f)
+                dataloader_len = max(1, (sample_count + train_args.batch_size - 1) // train_args.batch_size)
+            else:
+                dataset = OriginalJSONLDataset(
+                    data_path, _tokenizer, train_args.max_length, False
+                )
+                dataloader = create_map_style_dataloader(
+                    dataset,
+                    train_args.batch_size,
+                    _tokenizer.pad_token_id,
+                    train_args.num_workers,
+                    use_length_bucketing=train_args.length_bucketing,
+                    bucket_size=train_args.length_bucket_size,
+                    device=_device,
+                    prefetch_factor=train_args.prefetch_factor,
+                )
+                dataloader_len = len(dataloader)
 
             emit_status(f"Training started — {dataloader_len} batches/epoch × {train_args.epochs} epochs")
 

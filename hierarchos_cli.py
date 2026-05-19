@@ -19,6 +19,8 @@ from hierarchos import (
     chat,
     is_directml_device,
     setup_msvc_environment,
+    create_dataloader_for_jsonl,
+    create_dataloader_for_hf_streaming,
     create_map_style_dataloader,
     HuggingFaceMapStyleDataset,
     OriginalJSONLDataset,
@@ -28,12 +30,168 @@ from hierarchos import (
 )
 
 
-def load_hf_dataset(dataset_name, dataset_config=None, split="train"):
+def load_hf_dataset(dataset_name, dataset_config=None, split="train", streaming=False):
     try:
         from datasets import load_dataset
     except ImportError as exc:
         raise ImportError("Hugging Face dataset loading requires the 'datasets' package.") from exc
-    return load_dataset(dataset_name, dataset_config, split=split)
+    kwargs = {"split": split, "streaming": bool(streaming)}
+    if dataset_config:
+        return load_dataset(dataset_name, dataset_config, **kwargs)
+    return load_dataset(dataset_name, **kwargs)
+
+
+def _parse_hf_split_count(base_count, selector):
+    selector = selector.strip()
+    if not selector:
+        return base_count
+    if ":" not in selector:
+        return base_count
+
+    start_text, end_text = selector.split(":", 1)
+    start_text = start_text.strip()
+    end_text = end_text.strip()
+    percent_mode = start_text.endswith("%") or end_text.endswith("%")
+
+    if percent_mode:
+        start_pct = float(start_text[:-1]) if start_text.endswith("%") and start_text[:-1] else 0.0
+        end_pct = float(end_text[:-1]) if end_text.endswith("%") and end_text[:-1] else 100.0
+        start = int(base_count * (start_pct / 100.0))
+        end = int(base_count * (end_pct / 100.0))
+    else:
+        start = int(start_text) if start_text else 0
+        end = int(end_text) if end_text else base_count
+
+    start = max(0, min(base_count, start))
+    end = max(start, min(base_count, end))
+    return end - start
+
+
+def estimate_hf_dataset_size(dataset_name, dataset_config=None, split="train"):
+    from datasets import load_dataset_builder
+
+    builder = load_dataset_builder(dataset_name, dataset_config)
+    info = builder.info
+    split = split or "train"
+    if split in info.splits:
+        return info.splits[split].num_examples
+
+    if "[" in split and split.endswith("]"):
+        base_split, selector = split.split("[", 1)
+        selector = selector[:-1]
+        if base_split in info.splits:
+            return _parse_hf_split_count(info.splits[base_split].num_examples, selector)
+
+    return None
+
+
+def _steps_from_samples(sample_count, batch_size):
+    sample_count = max(0, int(sample_count or 0))
+    batch_size = max(1, int(batch_size or 1))
+    return max(1, (sample_count + batch_size - 1) // batch_size)
+
+
+def _is_jsonl_path(path):
+    return str(path).lower().endswith((".jsonl", ".ndjson"))
+
+
+def _local_text_columns(args):
+    return args.text_column, args.prompt_column, args.completion_column
+
+
+def create_hf_training_dataloader(args, tokenizer, device):
+    if getattr(args, "streaming_datasets", True):
+        try:
+            hf_dataset = load_hf_dataset(
+                args.hf_dataset,
+                args.hf_dataset_config,
+                split=args.hf_dataset_split,
+                streaming=True,
+            )
+            dataloader = create_dataloader_for_hf_streaming(
+                hf_dataset,
+                tokenizer,
+                args.max_length,
+                args.batch_size,
+                tokenizer.pad_token_id,
+                num_workers=args.num_workers,
+                kayla_mode=args.kayla,
+                text_column=args.text_column,
+                prompt_column=args.prompt_column,
+                completion_column=args.completion_column,
+                use_length_bucketing=getattr(args, "length_bucketing", True),
+                bucket_size=getattr(args, "length_bucket_size", None),
+                shuffle_buffer_size=getattr(args, "hf_streaming_shuffle_buffer", 10000),
+                device=device,
+                prefetch_factor=args.prefetch_factor,
+            )
+            print("INFO: Hugging Face dataset streaming enabled.")
+            return dataloader
+        except Exception as exc:
+            print(f"WARNING: HF streaming loader failed ({exc}); falling back to map-style loading.")
+
+    hf_dataset = load_hf_dataset(args.hf_dataset, args.hf_dataset_config, split=args.hf_dataset_split)
+    dataset = HuggingFaceMapStyleDataset(
+        hf_dataset,
+        tokenizer,
+        args.max_length,
+        args.kayla,
+        args.text_column,
+        args.prompt_column,
+        args.completion_column,
+    )
+    return create_map_style_dataloader(
+        dataset,
+        args.batch_size,
+        tokenizer.pad_token_id,
+        args.num_workers,
+        use_length_bucketing=getattr(args, "length_bucketing", True),
+        bucket_size=getattr(args, "length_bucket_size", None),
+        device=device,
+        prefetch_factor=args.prefetch_factor,
+    )
+
+
+def create_local_training_dataloader(args, tokenizer, device):
+    text_column, prompt_column, completion_column = _local_text_columns(args)
+    if getattr(args, "streaming_datasets", True) and _is_jsonl_path(args.train):
+        print("INFO: Local JSONL dataset streaming enabled.")
+        return create_dataloader_for_jsonl(
+            args.train,
+            tokenizer,
+            args.max_length,
+            args.batch_size,
+            tokenizer.pad_token_id,
+            num_workers=args.num_workers,
+            kayla_mode=args.kayla,
+            text_column=text_column,
+            prompt_column=prompt_column,
+            completion_column=completion_column,
+            use_length_bucketing=getattr(args, "length_bucketing", True),
+            bucket_size=getattr(args, "length_bucket_size", None),
+            device=device,
+            prefetch_factor=args.prefetch_factor,
+        )
+
+    dataset = OriginalJSONLDataset(
+        args.train,
+        tokenizer,
+        args.max_length,
+        args.kayla,
+        text_column=text_column,
+        prompt_column=prompt_column,
+        completion_column=completion_column,
+    )
+    return create_map_style_dataloader(
+        dataset,
+        args.batch_size,
+        tokenizer.pad_token_id,
+        args.num_workers,
+        use_length_bucketing=getattr(args, "length_bucketing", True),
+        bucket_size=getattr(args, "length_bucket_size", None),
+        device=device,
+        prefetch_factor=args.prefetch_factor,
+    )
 
 
 def configure_tokenizer_length(tokenizer, max_length):
@@ -156,6 +314,10 @@ def main():
     train_group.add_argument("--num_workers", type=int, default=-1, help="DataLoader workers (-1 = auto; CUDA uses prefetched workers, CPU/DML uses 0).")
     train_group.add_argument("--prefetch-factor", "--prefetch_factor", dest="prefetch_factor", type=int, default=None, help="Batches prefetched per DataLoader worker (auto keeps total queued batches tied to worker count).")
     train_group.add_argument("--pt-cache-size", "--pt_cache_size", dest="pt_cache_size", type=int, default=2, help="Number of .pt chunk files to keep hot per worker for --pre_pt_dataset.")
+    train_group.add_argument("--no-length-bucketing", dest="length_bucketing", action="store_false", help="Disable length-aware batching for training datasets.")
+    train_group.add_argument("--length-bucket-size", "--length_bucket_size", dest="length_bucket_size", type=int, default=None, help="Samples per length bucket/window. Larger lowers padding; smaller lowers streaming latency.")
+    train_group.add_argument("--no-streaming-datasets", dest="streaming_datasets", action="store_false", help="Disable streaming for raw JSONL/Hugging Face datasets and use map-style loading.")
+    train_group.add_argument("--hf-streaming-shuffle-buffer", "--hf_streaming_shuffle_buffer", dest="hf_streaming_shuffle_buffer", type=int, default=10000, help="Buffered shuffle size for Hugging Face streaming datasets.")
     train_group.add_argument("--amp", action="store_true", help="Enable mixed precision (auto-enabled on CUDA).")
     train_group.add_argument("--no-amp", dest="amp", action="store_false", help="Explicitly disable mixed precision.")
     train_group.add_argument("--dataset-size", type=int, default=None, help="Force a specific dataset size (total samples) to calculate steps for the LR scheduler.")
@@ -249,13 +411,13 @@ def main():
                     data = json.load(f)
                     if not isinstance(data, list): data = [data]
                     for obj in tqdm(data, desc="Scanning JSON"):
-                        processed = process_text_sample(tokenizer, obj, 9999, args.kayla, prompt_column='instruction', completion_column='output')
+                        processed = process_text_sample(tokenizer, obj, 9999, args.kayla, args.text_column, args.prompt_column, args.completion_column)
                         if processed: max_found = max(max_found, len(processed['input_ids']))
                 except:
                     f.seek(0)
                     for line in tqdm(f, desc="Scanning JSONL"):
                         try:
-                            processed = process_text_sample(tokenizer, json.loads(line), 9999, args.kayla, prompt_column='instruction', completion_column='output')
+                            processed = process_text_sample(tokenizer, json.loads(line), 9999, args.kayla, args.text_column, args.prompt_column, args.completion_column)
                             if processed: max_found = max(max_found, len(processed['input_ids']))
                         except: continue
         if max_found > 0:
@@ -266,23 +428,19 @@ def main():
     if args.mode == "train":
         dataloader = None
         if args.hf_dataset:
-            hf_dataset = temp_ds if 'temp_ds' in locals() else load_hf_dataset(args.hf_dataset, args.hf_dataset_config, split=args.hf_dataset_split)
-            dataset = HuggingFaceMapStyleDataset(hf_dataset, 
-                                                tokenizer, args.max_length, args.kayla, args.text_column, args.prompt_column, args.completion_column)
-            dataloader = create_map_style_dataloader(dataset, args.batch_size, tokenizer.pad_token_id, args.num_workers, device=pt_device, prefetch_factor=args.prefetch_factor)
+            dataloader = create_hf_training_dataloader(args, tokenizer, pt_device)
         elif args.pre_chunked_dataset:
-            dataloader = create_dataloader_for_chunked(args.train, args.max_length, args.batch_size, args.num_workers, device=pt_device, prefetch_factor=args.prefetch_factor)
+            dataloader = create_dataloader_for_chunked(args.train, args.max_length, args.batch_size, args.num_workers, use_length_bucketing=args.length_bucketing, bucket_size=args.length_bucket_size, device=pt_device, prefetch_factor=args.prefetch_factor)
         elif args.pre_pt_dataset:
-            dataloader = create_dataloader_pt_chunked(args.train, args.max_length, args.batch_size, args.num_workers, device=pt_device, prefetch_factor=args.prefetch_factor, cache_size=args.pt_cache_size)
+            dataloader = create_dataloader_pt_chunked(args.train, args.max_length, args.batch_size, args.num_workers, use_length_bucketing=args.length_bucketing, bucket_size=args.length_bucket_size, device=pt_device, prefetch_factor=args.prefetch_factor, cache_size=args.pt_cache_size)
         elif args.train and isinstance(args.train, str):
-            dataset = OriginalJSONLDataset(args.train, tokenizer, args.max_length, args.kayla)
-            dataloader = create_map_style_dataloader(dataset, args.batch_size, tokenizer.pad_token_id, args.num_workers, device=pt_device, prefetch_factor=args.prefetch_factor)
+            dataloader = create_local_training_dataloader(args, tokenizer, pt_device)
         
         if dataloader is None:
             print("ERROR: No dataset provided for training. Use --train or --hf_dataset."); sys.exit(1)
 
         if args.dataset_size:
-            dataloader_len = max(1, args.dataset_size // args.batch_size)
+            dataloader_len = _steps_from_samples(args.dataset_size, args.batch_size)
             print(f"INFO: Manual session override: {args.dataset_size} samples -> {dataloader_len} steps per epoch.")
         else:
             try: 
@@ -292,16 +450,12 @@ def main():
                 if args.hf_dataset:
                     print(f"INFO: Estimating size for HF dataset: {args.hf_dataset}...")
                     try:
-                        from datasets import load_dataset_builder
-                        builder = load_dataset_builder(args.hf_dataset, args.hf_dataset_config)
-                        info = builder.info
-                        split = args.hf_dataset_split or 'train'
-                        if split in info.splits:
-                            count = info.splits[split].num_examples
-                            dataloader_len = max(1, count // args.batch_size)
+                        count = estimate_hf_dataset_size(args.hf_dataset, args.hf_dataset_config, args.hf_dataset_split)
+                        if count is not None:
+                            dataloader_len = _steps_from_samples(count, args.batch_size)
                             print(f"INFO: Automatic HF session detection found {count} samples -> {dataloader_len} steps per epoch.")
                         else:
-                            print(f"ERROR: Could not find split '{split}' in HF dataset info. Please use --dataset-size."); sys.exit(1)
+                            print(f"ERROR: Could not find split '{args.hf_dataset_split}' in HF dataset info. Please use --dataset-size."); sys.exit(1)
                     except Exception as e:
                         print(f"ERROR: Failed to query HF metadata: {e}. Please specify --dataset-size manually."); sys.exit(1)
                 elif hasattr(args, 'train') and isinstance(args.train, str) and os.path.isfile(args.train):
@@ -309,7 +463,7 @@ def main():
                     try:
                         with open(args.train, 'r', encoding='utf-8') as f:
                             count = sum(1 for _ in f)
-                        dataloader_len = max(1, count // args.batch_size)
+                        dataloader_len = _steps_from_samples(count, args.batch_size)
                         print(f"INFO: Automatic session detection found {count} samples -> {dataloader_len} steps per epoch.")
                     except Exception as e:
                         print(f"ERROR: Could not count lines in {args.train}: {e}. Please specify --dataset-size manually."); sys.exit(1)
@@ -323,23 +477,19 @@ def main():
         # Build dataloader for finetune
         dataloader = None
         if args.hf_dataset:
-            temp_ds = load_hf_dataset(args.hf_dataset, args.hf_dataset_config, split=args.hf_dataset_split)
-            dataset = HuggingFaceMapStyleDataset(temp_ds, tokenizer, args.max_length, args.kayla, 
-                                                   args.text_column, args.prompt_column, args.completion_column)
-            dataloader = create_map_style_dataloader(dataset, args.batch_size, tokenizer.pad_token_id, args.num_workers, device=pt_device, prefetch_factor=args.prefetch_factor)
+            dataloader = create_hf_training_dataloader(args, tokenizer, pt_device)
         elif args.pre_chunked_dataset:
-            dataloader = create_dataloader_for_chunked(args.train, args.max_length, args.batch_size, args.num_workers, device=pt_device, prefetch_factor=args.prefetch_factor)
+            dataloader = create_dataloader_for_chunked(args.train, args.max_length, args.batch_size, args.num_workers, use_length_bucketing=args.length_bucketing, bucket_size=args.length_bucket_size, device=pt_device, prefetch_factor=args.prefetch_factor)
         elif args.pre_pt_dataset:
-            dataloader = create_dataloader_pt_chunked(args.train, args.max_length, args.batch_size, args.num_workers, device=pt_device, prefetch_factor=args.prefetch_factor, cache_size=args.pt_cache_size)
+            dataloader = create_dataloader_pt_chunked(args.train, args.max_length, args.batch_size, args.num_workers, use_length_bucketing=args.length_bucketing, bucket_size=args.length_bucket_size, device=pt_device, prefetch_factor=args.prefetch_factor, cache_size=args.pt_cache_size)
         elif args.train and isinstance(args.train, str):
-            dataset = OriginalJSONLDataset(args.train, tokenizer, args.max_length, args.kayla)
-            dataloader = create_map_style_dataloader(dataset, args.batch_size, tokenizer.pad_token_id, args.num_workers, device=pt_device, prefetch_factor=args.prefetch_factor)
+            dataloader = create_local_training_dataloader(args, tokenizer, pt_device)
         
         if dataloader is None:
             print("ERROR: No dataset provided for finetuning. Use --train or --hf_dataset."); sys.exit(1)
 
         if args.dataset_size:
-            dataloader_len = max(1, args.dataset_size // args.batch_size)
+            dataloader_len = _steps_from_samples(args.dataset_size, args.batch_size)
             print(f"INFO: Manual session override: {args.dataset_size} samples -> {dataloader_len} steps per epoch.")
         else:
             try: 
@@ -349,16 +499,12 @@ def main():
                 if args.hf_dataset:
                     print(f"INFO: Estimating size for HF dataset: {args.hf_dataset}...")
                     try:
-                        from datasets import load_dataset_builder
-                        builder = load_dataset_builder(args.hf_dataset, args.hf_dataset_config)
-                        info = builder.info
-                        split = args.hf_dataset_split or 'train'
-                        if split in info.splits:
-                            count = info.splits[split].num_examples
-                            dataloader_len = max(1, count // args.batch_size)
+                        count = estimate_hf_dataset_size(args.hf_dataset, args.hf_dataset_config, args.hf_dataset_split)
+                        if count is not None:
+                            dataloader_len = _steps_from_samples(count, args.batch_size)
                             print(f"INFO: Automatic HF session detection found {count} samples -> {dataloader_len} steps per epoch.")
                         else:
-                            print(f"ERROR: Could not find split '{split}' in HF dataset info. Please use --dataset-size."); sys.exit(1)
+                            print(f"ERROR: Could not find split '{args.hf_dataset_split}' in HF dataset info. Please use --dataset-size."); sys.exit(1)
                     except Exception as e:
                         print(f"ERROR: Failed to query HF metadata: {e}. Please specify --dataset-size manually."); sys.exit(1)
                 elif hasattr(args, 'train') and isinstance(args.train, str) and os.path.isfile(args.train):
@@ -366,7 +512,7 @@ def main():
                     try:
                         with open(args.train, 'r', encoding='utf-8') as f:
                             count = sum(1 for _ in f)
-                        dataloader_len = max(1, count // args.batch_size)
+                        dataloader_len = _steps_from_samples(count, args.batch_size)
                         print(f"INFO: Automatic session detection found {count} samples -> {dataloader_len} steps per epoch.")
                     except Exception as e:
                         print(f"ERROR: Could not count lines in {args.train}: {e}. Please specify --dataset-size manually."); sys.exit(1)

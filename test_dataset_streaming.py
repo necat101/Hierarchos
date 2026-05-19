@@ -186,23 +186,62 @@ def test_hf_materialization_partitions_rows_without_copying_shards():
                 refresh_hf_shards=True,
                 dataset_size=len(rows),
             )
-            shard_dir = hierarchos_cli.materialize_hf_dataset_shards(args, 4)
+            shard_dir = hierarchos_cli.materialize_hf_dataset_shards(args, TinyTokenizer(), 4)
 
             seen = []
             shard_counts = []
-            for shard_idx in range(4):
-                shard_path = os.path.join(shard_dir, f"shard_{shard_idx:05d}.jsonl")
-                with open(shard_path, "r", encoding="utf-8") as f:
-                    shard_rows = [json.loads(line) for line in f if line.strip()]
-                shard_counts.append(len(shard_rows))
-                seen.extend(row["idx"] for row in shard_rows)
+            tokenized_rows = 0
+            with open(os.path.join(shard_dir, "manifest.jsonl"), "r", encoding="utf-8") as f:
+                entries = [json.loads(line) for line in f if line.strip()]
+            by_file = {}
+            for entry in entries:
+                by_file.setdefault(entry["file_path"], []).append(entry["index_in_file"])
+
+            shard_counts_by_prefix = {idx: 0 for idx in range(4)}
+            for file_path, indices in by_file.items():
+                shard_idx = int(os.path.basename(file_path).split("_")[1])
+                shard_items = torch.load(os.path.join(shard_dir, file_path), map_location="cpu")
+                shard_counts_by_prefix[shard_idx] += len(indices)
+                for index in indices:
+                    row = shard_items[index]
+                    if "input_ids" in row and "labels" in row:
+                        tokenized_rows += 1
+                    seen.append(row["_source_idx"])
+            shard_counts = list(shard_counts_by_prefix.values())
 
     finally:
         hierarchos_cli.load_hf_dataset = original_loader
 
     assert sorted(seen) == list(range(len(rows)))
     assert len(seen) == len(set(seen))
+    assert tokenized_rows == len(rows)
     assert max(shard_counts) - min(shard_counts) <= 1
+
+
+def test_streaming_jsonl_reads_pretokenized_rows_without_tokenizer():
+    class ExplodingTokenizer(TinyTokenizer):
+        def encode(self, text, add_special_tokens=True):
+            raise AssertionError("pre-tokenized JSONL should not call tokenizer.encode")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "tokenized.jsonl")
+        _write_jsonl(path, [
+            {"input_ids": [10, 11, 12], "labels": [-100, 11, 12], "attention_mask": [1, 1, 1]},
+            {"input_ids": [20, 21], "labels": [20, 21], "length": 2},
+        ])
+
+        batches = list(create_dataloader_for_jsonl(
+            path,
+            ExplodingTokenizer(),
+            max_length=16,
+            batch_size=2,
+            pad_token_id=0,
+            num_workers=0,
+            use_length_bucketing=True,
+        ))
+
+    assert len(batches) == 1
+    assert int(batches[0]["attention_mask"].sum().item()) == 5
 
 
 def test_cli_detects_jsonl_shard_directory():
@@ -372,6 +411,7 @@ def main():
         test_jsonl_file_shards_assign_whole_files_to_workers,
         test_streaming_jsonl_directory_shards_batch_once,
         test_hf_materialization_partitions_rows_without_copying_shards,
+        test_streaming_jsonl_reads_pretokenized_rows_without_tokenizer,
         test_cli_detects_jsonl_shard_directory,
         test_hf_streaming_dataloader_batches,
         test_hf_worker_shards_cover_samples_once,

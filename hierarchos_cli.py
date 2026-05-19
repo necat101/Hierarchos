@@ -130,31 +130,67 @@ def _local_text_columns(args):
 
 def _hf_shard_cache_key(args, num_shards):
     payload = {
+        "format": "tokenized-pt-shards-v1",
         "dataset": args.hf_dataset,
         "config": args.hf_dataset_config,
         "split": args.hf_dataset_split,
         "num_shards": int(num_shards),
+        "chunks_per_file": int(getattr(args, "hf_cache_chunks_per_file", 2048) or 2048),
+        "tokenizer": (
+            getattr(args, "tokenizer_path", None)
+            or getattr(args, "model_path", None)
+            or "openai-community/gpt2"
+        ),
+        "max_length": int(getattr(args, "max_length", 0) or 0),
+        "kayla": bool(getattr(args, "kayla", False)),
+        "text_column": getattr(args, "text_column", None),
+        "prompt_column": getattr(args, "prompt_column", None),
+        "completion_column": getattr(args, "completion_column", None),
     }
     return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
 
-def materialize_hf_dataset_shards(args, num_shards):
+def _estimate_hf_total_for_progress(args):
+    total_samples = getattr(args, "dataset_size", 0) or None
+    if total_samples is not None:
+        return total_samples
+    try:
+        return estimate_hf_dataset_size(
+            args.hf_dataset,
+            args.hf_dataset_config,
+            args.hf_dataset_split,
+        )
+    except Exception:
+        return None
+
+
+def _processed_sample_to_cached_item(processed):
+    input_ids = processed["input_ids"].detach().cpu().to(dtype=torch.int32)
+    labels = processed["labels"].detach().cpu().to(dtype=torch.int32)
+    length = int(processed.get("_length", input_ids.numel()))
+    length = max(1, min(int(input_ids.numel()), length))
+    return {
+        "input_ids": input_ids,
+        "labels": labels,
+        "attention_mask": torch.ones(input_ids.numel(), dtype=torch.uint8),
+        "_length": length,
+    }
+
+
+def materialize_hf_dataset_pt_cache(args, tokenizer, num_shards):
     num_shards = max(1, int(num_shards or 1))
     cache_root = getattr(args, "hf_shard_cache_dir", None) or os.path.join(os.getcwd(), ".hierarchos_hf_shards")
     shard_key = _hf_shard_cache_key(args, num_shards)
     shard_dir = os.path.join(cache_root, shard_key)
     success_path = os.path.join(shard_dir, "_SUCCESS")
+    manifest_path = os.path.join(shard_dir, "manifest.jsonl")
 
-    expected_shards = [
-        os.path.join(shard_dir, f"shard_{idx:05d}.jsonl")
-        for idx in range(num_shards)
-    ]
     if (
         not getattr(args, "refresh_hf_shards", False)
         and os.path.exists(success_path)
-        and all(os.path.exists(path) for path in expected_shards)
+        and os.path.exists(manifest_path)
     ):
-        print(f"INFO: Reusing cached HF JSONL shards from {shard_dir}")
+        print(f"INFO: Reusing cached HF tokenized PT shards from {shard_dir}")
         return shard_dir
 
     tmp_dir = shard_dir + ".tmp"
@@ -166,7 +202,7 @@ def materialize_hf_dataset_shards(args, num_shards):
 
     print(
         "INFO: Materializing HF dataset into "
-        f"{num_shards} local JSONL shard(s) for multi-worker streaming..."
+        f"{num_shards} tokenized PT shard stream(s) for multi-worker loading..."
     )
     hf_dataset = load_hf_dataset(
         args.hf_dataset,
@@ -175,47 +211,88 @@ def materialize_hf_dataset_shards(args, num_shards):
         streaming=True,
     )
 
-    shard_files = []
+    chunks_per_file = max(1, int(getattr(args, "hf_cache_chunks_per_file", 2048) or 2048))
+    shard_buffers = [[] for _ in range(num_shards)]
     shard_counts = [0] * int(num_shards)
-    try:
-        for shard_idx in range(num_shards):
-            shard_path = os.path.join(tmp_dir, f"shard_{shard_idx:05d}.jsonl")
-            shard_files.append(open(shard_path, "w", encoding="utf-8"))
+    shard_parts = [0] * int(num_shards)
+    accepted = 0
+    skipped = 0
 
-        total_samples = getattr(args, "dataset_size", 0) or None
-        if total_samples is None:
-            try:
-                total_samples = estimate_hf_dataset_size(
-                    args.hf_dataset,
-                    args.hf_dataset_config,
-                    args.hf_dataset_split,
-                )
-            except Exception:
-                total_samples = None
+    def flush_shard(manifest_file, shard_idx):
+        buffer = shard_buffers[shard_idx]
+        if not buffer:
+            return
+        buffer.sort(key=lambda item: int(item.get("_length", item["input_ids"].numel())), reverse=True)
+        filename = f"shard_{shard_idx:05d}_part_{shard_parts[shard_idx]:05d}.pt"
+        path = os.path.join(tmp_dir, filename)
+        torch.save(buffer, path)
+        for item_idx, item in enumerate(buffer):
+            length = int(item.get("_length", item["input_ids"].numel()))
+            manifest_file.write(json.dumps({
+                "file_path": filename,
+                "index_in_file": item_idx,
+                "length": length,
+                "valid_length": length,
+            }) + "\n")
+        shard_buffers[shard_idx] = []
+        shard_parts[shard_idx] += 1
+
+    with open(os.path.join(tmp_dir, "manifest.jsonl"), "w", encoding="utf-8") as manifest_file:
+        total_samples = _estimate_hf_total_for_progress(args)
+        skipped = 0
         for sample_idx, sample in enumerate(tqdm(
             hf_dataset,
-            desc="Sharding HF dataset",
+            desc="Tokenizing/sharding HF dataset",
             unit="sample",
             total=total_samples,
         )):
-            shard_idx = sample_idx % num_shards
-            shard_files[shard_idx].write(json.dumps(sample, ensure_ascii=False, default=str) + "\n")
+            processed = process_text_sample(
+                tokenizer,
+                sample,
+                getattr(args, "max_length", 1024),
+                getattr(args, "kayla", False),
+                text_column=getattr(args, "text_column", None),
+                prompt_column=getattr(args, "prompt_column", None),
+                completion_column=getattr(args, "completion_column", None),
+            )
+            if processed is None:
+                skipped += 1
+                continue
+            item = _processed_sample_to_cached_item(processed)
+            item["_source_idx"] = sample_idx
+            shard_idx = accepted % num_shards
+            shard_buffers[shard_idx].append(item)
             shard_counts[shard_idx] += 1
-    finally:
-        for shard_file in shard_files:
-            try:
-                shard_file.close()
-            except Exception:
-                pass
+            accepted += 1
+            if len(shard_buffers[shard_idx]) >= chunks_per_file:
+                flush_shard(manifest_file, shard_idx)
+
+        for shard_idx in range(num_shards):
+            flush_shard(manifest_file, shard_idx)
 
     with open(os.path.join(tmp_dir, "_SUCCESS"), "w", encoding="utf-8") as f:
-        json.dump({"num_shards": num_shards, "counts": shard_counts}, f, indent=2)
+        json.dump({
+            "format": "tokenized-pt-shards-v1",
+            "num_shards": num_shards,
+            "counts": shard_counts,
+            "parts": shard_parts,
+            "skipped": skipped,
+            "max_length": getattr(args, "max_length", 1024),
+            "chunks_per_file": chunks_per_file,
+        }, f, indent=2)
 
     if os.path.exists(shard_dir):
         shutil.rmtree(shard_dir)
     os.replace(tmp_dir, shard_dir)
-    print(f"INFO: HF JSONL shards ready in {shard_dir} ({sum(shard_counts)} samples).")
+    print(
+        f"INFO: HF tokenized PT shards ready in {shard_dir} "
+        f"({sum(shard_counts)} samples, skipped {skipped})."
+    )
     return shard_dir
+
+
+def materialize_hf_dataset_shards(args, tokenizer, num_shards):
+    return materialize_hf_dataset_pt_cache(args, tokenizer, num_shards)
 
 
 def create_hf_training_dataloader(args, tokenizer, device):
@@ -259,26 +336,21 @@ def create_hf_training_dataloader(args, tokenizer, device):
                 hf_num_shards = None
             if hf_num_shards is not None and hf_num_shards > 0 and hf_num_workers > hf_num_shards:
                 if getattr(args, "hf_auto_shard", True) and hf_num_workers > 1:
-                    shard_dir = materialize_hf_dataset_shards(args, hf_num_workers)
+                    shard_dir = materialize_hf_dataset_shards(args, tokenizer, hf_num_workers)
                     print(
-                        "INFO: Using local sharded JSONL streaming for HF dataset "
+                        "INFO: Using local tokenized PT shard cache for HF dataset "
                         f"({hf_num_workers} worker shard(s))."
                     )
-                    return create_dataloader_for_jsonl(
+                    return create_dataloader_pt_chunked(
                         shard_dir,
-                        tokenizer,
                         args.max_length,
                         args.batch_size,
-                        tokenizer.pad_token_id,
-                        num_workers=hf_num_workers,
-                        kayla_mode=args.kayla,
-                        text_column=args.text_column,
-                        prompt_column=args.prompt_column,
-                        completion_column=args.completion_column,
+                        hf_num_workers,
                         use_length_bucketing=getattr(args, "length_bucketing", True),
                         bucket_size=getattr(args, "length_bucket_size", None),
                         device=device,
                         prefetch_factor=args.prefetch_factor,
+                        cache_size=max(getattr(args, "pt_cache_size", 2), hf_num_workers),
                     )
                 return create_indexed_hf_dataloader(
                     "HF streaming exposes "
@@ -477,9 +549,10 @@ def main():
     train_group.add_argument("--length-bucket-size", "--length_bucket_size", dest="length_bucket_size", type=int, default=None, help="Samples per length bucket/window. Larger lowers padding; smaller lowers streaming latency.")
     train_group.add_argument("--no-streaming-datasets", dest="streaming_datasets", action="store_false", help="Disable streaming for raw JSONL/Hugging Face datasets and use map-style loading.")
     train_group.add_argument("--hf-streaming-shuffle-buffer", "--hf_streaming_shuffle_buffer", dest="hf_streaming_shuffle_buffer", type=int, default=10000, help="Buffered shuffle size for Hugging Face streaming datasets.")
-    train_group.add_argument("--no-hf-auto-shard", dest="hf_auto_shard", action="store_false", help="Disable automatic local JSONL shard materialization for single-shard HF streaming datasets.")
-    train_group.add_argument("--hf-shard-cache-dir", "--hf_shard_cache_dir", dest="hf_shard_cache_dir", type=str, default=None, help="Directory for cached local HF JSONL shards.")
-    train_group.add_argument("--refresh-hf-shards", "--refresh_hf_shards", dest="refresh_hf_shards", action="store_true", help="Rebuild cached local HF JSONL shards before training.")
+    train_group.add_argument("--no-hf-auto-shard", dest="hf_auto_shard", action="store_false", help="Disable automatic local tokenized shard caching for single-shard HF streaming datasets.")
+    train_group.add_argument("--hf-shard-cache-dir", "--hf_shard_cache_dir", dest="hf_shard_cache_dir", type=str, default=None, help="Directory for cached local HF tokenized shard files.")
+    train_group.add_argument("--refresh-hf-shards", "--refresh_hf_shards", dest="refresh_hf_shards", action="store_true", help="Rebuild cached local HF tokenized shards before training.")
+    train_group.add_argument("--hf-cache-chunks-per-file", "--hf_cache_chunks_per_file", dest="hf_cache_chunks_per_file", type=int, default=2048, help="Tokenized samples per cached HF .pt shard chunk.")
     train_group.add_argument("--amp", action="store_true", help="Enable mixed precision (auto-enabled on CUDA).")
     train_group.add_argument("--no-amp", dest="amp", action="store_false", help="Explicitly disable mixed precision.")
     train_group.add_argument("--dataset-size", type=int, default=None, help="Force a specific dataset size (total samples) to calculate steps for the LR scheduler.")

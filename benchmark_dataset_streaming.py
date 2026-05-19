@@ -4,12 +4,16 @@ import os
 import tempfile
 import time
 
+import torch
+
 from hierarchos.training.datasets import (
     HuggingFaceMapStyleDataset,
     OriginalJSONLDataset,
     create_dataloader_for_hf_streaming,
     create_dataloader_for_jsonl,
+    create_dataloader_pt_chunked,
     create_map_style_dataloader,
+    process_text_sample,
 )
 
 
@@ -68,6 +72,53 @@ def write_benchmark_jsonl(path, samples):
     with open(path, "w", encoding="utf-8") as f:
         for row in make_rows(samples):
             f.write(json.dumps(row) + "\n")
+
+
+def write_pt_cache(directory, rows, tokenizer, max_length, num_shards=4, chunks_per_file=256):
+    os.makedirs(directory, exist_ok=True)
+    buffers = [[] for _ in range(num_shards)]
+    parts = [0 for _ in range(num_shards)]
+
+    def flush(manifest, shard_idx):
+        buffer = buffers[shard_idx]
+        if not buffer:
+            return
+        buffer.sort(key=lambda item: int(item["_length"]), reverse=True)
+        filename = f"shard_{shard_idx:05d}_part_{parts[shard_idx]:05d}.pt"
+        import torch
+        torch.save(buffer, os.path.join(directory, filename))
+        for item_idx, item in enumerate(buffer):
+            length = int(item["_length"])
+            manifest.write(json.dumps({
+                "file_path": filename,
+                "index_in_file": item_idx,
+                "length": length,
+                "valid_length": length,
+            }) + "\n")
+        buffers[shard_idx] = []
+        parts[shard_idx] += 1
+
+    accepted = 0
+    with open(os.path.join(directory, "manifest.jsonl"), "w", encoding="utf-8") as manifest:
+        for row in rows:
+            processed = process_text_sample(tokenizer, row, max_length)
+            if processed is None:
+                continue
+            input_ids = processed["input_ids"].detach().cpu()
+            labels = processed["labels"].detach().cpu()
+            item = {
+                "input_ids": input_ids.to(dtype=torch.int32),
+                "labels": labels.to(dtype=torch.int32),
+                "attention_mask": torch.ones(input_ids.numel(), dtype=torch.uint8),
+                "_length": int(processed["_length"]),
+            }
+            shard_idx = accepted % num_shards
+            buffers[shard_idx].append(item)
+            accepted += 1
+            if len(buffers[shard_idx]) >= chunks_per_file:
+                flush(manifest, shard_idx)
+        for shard_idx in range(num_shards):
+            flush(manifest, shard_idx)
 
 
 def consume_batches(dataloader, batches):
@@ -208,6 +259,44 @@ def main():
                     tokenizer.pad_token_id,
                     num_workers=args.stream_workers_extra,
                     use_length_bucketing=True,
+                ),
+            )
+
+        pt_cache_dir = os.path.join(tmpdir, "pt_cache")
+        write_pt_cache(
+            pt_cache_dir,
+            make_rows(args.samples),
+            tokenizer,
+            args.max_length,
+            num_shards=max(1, args.stream_workers_extra),
+        )
+        run_case(
+            path,
+            tokenizer,
+            args,
+            "hf_auto_pt_cache_bucketed_workers_0",
+            lambda: create_dataloader_pt_chunked(
+                pt_cache_dir,
+                args.max_length,
+                args.batch_size,
+                num_workers=0,
+                use_length_bucketing=True,
+                cache_size=max(2, args.stream_workers_extra),
+            ),
+        )
+        if args.stream_workers_extra > 0:
+            run_case(
+                path,
+                tokenizer,
+                args,
+                f"hf_auto_pt_cache_bucketed_workers_{args.stream_workers_extra}",
+                lambda: create_dataloader_pt_chunked(
+                    pt_cache_dir,
+                    args.max_length,
+                    args.batch_size,
+                    num_workers=args.stream_workers_extra,
+                    use_length_bucketing=True,
+                    cache_size=max(2, args.stream_workers_extra),
                 ),
             )
 

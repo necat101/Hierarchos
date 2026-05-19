@@ -11,6 +11,7 @@ from hierarchos.training.datasets import (
     OriginalJSONLDataset,
     create_dataloader_for_hf_streaming,
     create_dataloader_for_jsonl,
+    create_dataloader_for_tokenized_cache,
     create_dataloader_pt_chunked,
     create_map_style_dataloader,
     process_text_sample,
@@ -120,6 +121,37 @@ def write_pt_cache(directory, rows, tokenizer, max_length, num_shards=4, chunks_
             flush(manifest, shard_idx)
 
 
+def write_binary_token_cache(directory, rows, tokenizer, max_length):
+    os.makedirs(directory, exist_ok=True)
+    offsets = []
+    lengths = []
+    total_bytes = 0
+    with open(os.path.join(directory, "tokens.bin"), "wb") as f:
+        for row in rows:
+            processed = process_text_sample(tokenizer, row, max_length)
+            if processed is None:
+                continue
+            input_ids = processed["input_ids"].detach().cpu().to(dtype=torch.int32).contiguous()
+            labels = processed["labels"].detach().cpu().to(dtype=torch.int32).contiguous()
+            length = min(int(input_ids.numel()), int(labels.numel()))
+            if length <= 0:
+                continue
+            offsets.append(total_bytes)
+            lengths.append(length)
+            input_bytes = input_ids[:length].numpy().tobytes()
+            label_bytes = labels[:length].numpy().tobytes()
+            f.write(input_bytes)
+            f.write(label_bytes)
+            total_bytes += len(input_bytes) + len(label_bytes)
+    torch.save({
+        "format": "map-token-bin-v1",
+        "offsets": torch.tensor(offsets, dtype=torch.long),
+        "lengths": torch.tensor(lengths, dtype=torch.int32),
+    }, os.path.join(directory, "index.pt"))
+    with open(os.path.join(directory, "_SUCCESS"), "w", encoding="utf-8") as f:
+        json.dump({"samples": len(lengths), "bytes": total_bytes}, f)
+
+
 def consume_batches(dataloader, batches):
     total_samples = 0
     total_tokens = 0
@@ -176,6 +208,9 @@ def run_case(path, tokenizer, args, name, factory):
     dataloader = factory()
     create_seconds = time.perf_counter() - create_start
     result = consume_batches(dataloader, args.batches)
+    close_fn = getattr(getattr(dataloader, "dataset", None), "close", None)
+    if callable(close_fn):
+        close_fn()
     print_result(name, create_seconds, result)
 
 
@@ -296,6 +331,43 @@ def main():
                     num_workers=args.stream_workers_extra,
                     use_length_bucketing=True,
                     cache_size=max(2, args.stream_workers_extra),
+                ),
+            )
+
+        token_cache_dir = os.path.join(tmpdir, "token_cache")
+        write_binary_token_cache(
+            token_cache_dir,
+            make_rows(args.samples),
+            tokenizer,
+            args.max_length,
+        )
+        run_case(
+            path,
+            tokenizer,
+            args,
+            "hf_binary_token_cache_bucketed_workers_0",
+            lambda: create_dataloader_for_tokenized_cache(
+                token_cache_dir,
+                args.max_length,
+                args.batch_size,
+                tokenizer.pad_token_id,
+                num_workers=0,
+                use_length_bucketing=True,
+            ),
+        )
+        if args.stream_workers_extra > 0:
+            run_case(
+                path,
+                tokenizer,
+                args,
+                f"hf_binary_token_cache_bucketed_workers_{args.stream_workers_extra}",
+                lambda: create_dataloader_for_tokenized_cache(
+                    token_cache_dir,
+                    args.max_length,
+                    args.batch_size,
+                    tokenizer.pad_token_id,
+                    num_workers=args.stream_workers_extra,
+                    use_length_bucketing=True,
                 ),
             )
 

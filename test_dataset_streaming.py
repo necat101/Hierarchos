@@ -9,12 +9,14 @@ from hierarchos.training.datasets import (
     HuggingFaceStreamingDataset,
     OriginalJSONLDataset,
     StreamingJSONLDataset,
+    TokenizedBinaryDataset,
     _iter_hf_worker_samples,
     _iter_jsonl_lines_for_worker,
     _iter_jsonl_shards_for_worker,
     create_dataloader_for_chunked,
     create_dataloader_for_hf_streaming,
     create_dataloader_for_jsonl,
+    create_dataloader_for_tokenized_cache,
     process_text_sample,
 )
 
@@ -67,6 +69,34 @@ def _padding_waste(batches):
 def _alternating_length_rows():
     lengths = [8, 180, 12, 170, 16, 160, 20, 150, 24, 140, 28, 130, 32, 120, 36, 110]
     return [{"text": "x" * length} for length in lengths]
+
+
+def _write_binary_token_cache(directory, rows, tokenizer, max_length=256):
+    os.makedirs(directory, exist_ok=True)
+    offsets = []
+    lengths = []
+    total_bytes = 0
+    with open(os.path.join(directory, "tokens.bin"), "wb") as f:
+        for row in rows:
+            processed = process_text_sample(tokenizer, row, max_length)
+            assert processed is not None
+            input_ids = processed["input_ids"].to(dtype=torch.int32).contiguous()
+            labels = processed["labels"].to(dtype=torch.int32).contiguous()
+            length = min(int(input_ids.numel()), int(labels.numel()))
+            offsets.append(total_bytes)
+            lengths.append(length)
+            input_bytes = input_ids[:length].numpy().tobytes()
+            label_bytes = labels[:length].numpy().tobytes()
+            f.write(input_bytes)
+            f.write(label_bytes)
+            total_bytes += len(input_bytes) + len(label_bytes)
+    torch.save({
+        "format": "map-token-bin-v1",
+        "offsets": torch.tensor(offsets, dtype=torch.long),
+        "lengths": torch.tensor(lengths, dtype=torch.int32),
+    }, os.path.join(directory, "index.pt"))
+    with open(os.path.join(directory, "_SUCCESS"), "w", encoding="utf-8") as f:
+        json.dump({"samples": len(lengths)}, f)
 
 
 def test_process_text_sample_autodetects_common_columns():
@@ -298,6 +328,92 @@ def test_cli_prefers_indexed_hf_for_single_streaming_shard_by_default():
     assert isinstance(dataloader.dataset, HuggingFaceMapStyleDataset)
 
 
+def test_tokenized_binary_cache_is_map_style_and_bucketed():
+    tokenizer = TinyTokenizer()
+    rows = _alternating_length_rows()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _write_binary_token_cache(tmpdir, rows, tokenizer, max_length=256)
+        dataset = TokenizedBinaryDataset(tmpdir, max_length=256)
+        assert len(dataset) == len(rows)
+        assert dataset.get_sample_lengths()
+        first = dataset[0]
+        assert first["input_ids"].dtype == torch.int32
+        assert first["labels"].dtype == torch.int32
+        dataset.close()
+
+        unbucketed_loader = create_dataloader_for_tokenized_cache(
+            tmpdir,
+            max_length=256,
+            batch_size=4,
+            pad_token_id=tokenizer.pad_token_id,
+            num_workers=0,
+            use_length_bucketing=False,
+        )
+        unbucketed = list(unbucketed_loader)
+        unbucketed_loader.dataset.close()
+        bucketed_loader = create_dataloader_for_tokenized_cache(
+            tmpdir,
+            max_length=256,
+            batch_size=4,
+            pad_token_id=tokenizer.pad_token_id,
+            num_workers=0,
+            use_length_bucketing=True,
+            bucket_size=len(rows),
+        )
+        bucketed = list(bucketed_loader)
+        bucketed_loader.dataset.close()
+
+    assert sum(batch["input_ids"].shape[0] for batch in bucketed) == len(rows)
+    assert _padding_waste(bucketed) < _padding_waste(unbucketed)
+
+
+def test_cli_builds_and_uses_hf_token_cache():
+    import hierarchos_cli
+    from hierarchos.training.datasets import TokenizedBinaryDataset
+
+    original_loader = hierarchos_cli.load_hf_dataset
+    rows = [{"text": f"token cache row {idx}"} for idx in range(9)]
+
+    try:
+        hierarchos_cli.load_hf_dataset = lambda *args, **kwargs: list(rows)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = types.SimpleNamespace(
+                hf_dataset="fake/hf",
+                hf_dataset_config=None,
+                hf_dataset_split="train",
+                hf_token_cache_dir=tmpdir,
+                hf_shard_cache_dir=None,
+                refresh_hf_token_cache=True,
+                tokenizer_path=None,
+                model_path=None,
+                max_length=96,
+                kayla=False,
+                text_column=None,
+                prompt_column=None,
+                completion_column=None,
+                batch_size=3,
+                num_workers=0,
+                length_bucketing=True,
+                length_bucket_size=None,
+                hf_token_cache=True,
+                streaming_datasets=True,
+                prefetch_factor=None,
+            )
+            dataloader = hierarchos_cli.create_hf_training_dataloader(
+                args,
+                TinyTokenizer(),
+                torch.device("cpu"),
+            )
+            batches = list(dataloader)
+            dataloader.dataset.close()
+    finally:
+        hierarchos_cli.load_hf_dataset = original_loader
+
+    assert isinstance(dataloader.dataset, TokenizedBinaryDataset)
+    assert sum(batch["input_ids"].shape[0] for batch in batches) == len(rows)
+
+
 def test_hf_streaming_dataloader_batches():
     tokenizer = TinyTokenizer()
     hf_rows = FakeHFStream({"text": f"streamed sample {idx}"} for idx in range(10))
@@ -456,6 +572,8 @@ def main():
         test_streaming_jsonl_reads_pretokenized_rows_without_tokenizer,
         test_cli_detects_jsonl_shard_directory,
         test_cli_prefers_indexed_hf_for_single_streaming_shard_by_default,
+        test_tokenized_binary_cache_is_map_style_and_bucketed,
+        test_cli_builds_and_uses_hf_token_cache,
         test_hf_streaming_dataloader_batches,
         test_hf_worker_shards_cover_samples_once,
         test_streaming_jsonl_length_buckets_reduce_padding,

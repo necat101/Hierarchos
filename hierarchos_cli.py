@@ -28,7 +28,8 @@ from hierarchos import (
     OriginalJSONLDataset,
     process_text_sample,
     create_dataloader_for_chunked,
-    create_dataloader_pt_chunked
+    create_dataloader_pt_chunked,
+    create_dataloader_for_tokenized_cache
 )
 
 
@@ -294,6 +295,153 @@ def materialize_hf_dataset_shards(args, tokenizer, num_shards):
     return materialize_hf_dataset_pt_cache(args, tokenizer, num_shards)
 
 
+def _hf_token_cache_key(args):
+    payload = {
+        "format": "map-token-bin-v1",
+        "dataset": args.hf_dataset,
+        "config": args.hf_dataset_config,
+        "split": args.hf_dataset_split,
+        "tokenizer": (
+            getattr(args, "tokenizer_path", None)
+            or getattr(args, "model_path", None)
+            or "openai-community/gpt2"
+        ),
+        "max_length": int(getattr(args, "max_length", 0) or 0),
+        "kayla": bool(getattr(args, "kayla", False)),
+        "text_column": getattr(args, "text_column", None),
+        "prompt_column": getattr(args, "prompt_column", None),
+        "completion_column": getattr(args, "completion_column", None),
+    }
+    return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+
+
+def materialize_hf_token_cache(args, tokenizer):
+    cache_root = (
+        getattr(args, "hf_token_cache_dir", None)
+        or getattr(args, "hf_shard_cache_dir", None)
+        or os.path.join(os.getcwd(), ".hierarchos_token_cache")
+    )
+    cache_key = _hf_token_cache_key(args)
+    cache_dir = os.path.join(cache_root, cache_key)
+    success_path = os.path.join(cache_dir, "_SUCCESS")
+    index_path = os.path.join(cache_dir, "index.pt")
+    data_path = os.path.join(cache_dir, "tokens.bin")
+
+    if (
+        not getattr(args, "refresh_hf_token_cache", False)
+        and os.path.exists(success_path)
+        and os.path.exists(index_path)
+        and os.path.exists(data_path)
+    ):
+        print(f"INFO: Reusing HF random-access token cache from {cache_dir}")
+        return cache_dir
+
+    tmp_dir = cache_dir + ".tmp"
+    if os.path.exists(tmp_dir):
+        shutil.rmtree(tmp_dir)
+    if getattr(args, "refresh_hf_token_cache", False) and os.path.exists(cache_dir):
+        shutil.rmtree(cache_dir)
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    print("INFO: Building HF random-access token cache...")
+    hf_dataset = load_hf_dataset(
+        args.hf_dataset,
+        args.hf_dataset_config,
+        split=args.hf_dataset_split,
+        streaming=False,
+    )
+    try:
+        total_samples = len(hf_dataset)
+    except Exception:
+        total_samples = _estimate_hf_total_for_progress(args)
+
+    offsets = []
+    lengths = []
+    skipped = 0
+    total_bytes = 0
+    tmp_data_path = os.path.join(tmp_dir, "tokens.bin")
+
+    def iter_hf_samples():
+        nonlocal skipped
+        if total_samples is None:
+            yield from enumerate(hf_dataset)
+            return
+        for sample_idx in range(total_samples):
+            try:
+                yield sample_idx, hf_dataset[sample_idx]
+            except Exception:
+                skipped += 1
+
+    with open(tmp_data_path, "wb") as data_file:
+        for sample_idx, sample in tqdm(
+            iter_hf_samples(),
+            desc="Tokenizing HF cache",
+            unit="sample",
+            total=total_samples,
+        ):
+            try:
+                processed = process_text_sample(
+                    tokenizer,
+                    sample,
+                    getattr(args, "max_length", 1024),
+                    getattr(args, "kayla", False),
+                    text_column=getattr(args, "text_column", None),
+                    prompt_column=getattr(args, "prompt_column", None),
+                    completion_column=getattr(args, "completion_column", None),
+                )
+            except Exception:
+                processed = None
+            if processed is None:
+                skipped += 1
+                continue
+
+            input_ids = processed["input_ids"].detach().cpu().to(dtype=torch.int32).contiguous()
+            labels = processed["labels"].detach().cpu().to(dtype=torch.int32).contiguous()
+            length = min(int(input_ids.numel()), int(labels.numel()))
+            if length <= 0:
+                skipped += 1
+                continue
+            if input_ids.numel() != length:
+                input_ids = input_ids[:length].contiguous()
+            if labels.numel() != length:
+                labels = labels[:length].contiguous()
+
+            offsets.append(total_bytes)
+            lengths.append(length)
+            input_bytes = input_ids.numpy().tobytes()
+            label_bytes = labels.numpy().tobytes()
+            data_file.write(input_bytes)
+            data_file.write(label_bytes)
+            total_bytes += len(input_bytes) + len(label_bytes)
+
+    if not lengths:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise RuntimeError("HF token cache build produced no usable samples.")
+
+    torch.save({
+        "format": "map-token-bin-v1",
+        "offsets": torch.tensor(offsets, dtype=torch.long),
+        "lengths": torch.tensor(lengths, dtype=torch.int32),
+    }, os.path.join(tmp_dir, "index.pt"))
+    with open(os.path.join(tmp_dir, "_SUCCESS"), "w", encoding="utf-8") as f:
+        json.dump({
+            "format": "map-token-bin-v1",
+            "samples": len(lengths),
+            "skipped": skipped,
+            "bytes": total_bytes,
+            "max_length": getattr(args, "max_length", 1024),
+        }, f, indent=2)
+
+    if os.path.exists(cache_dir):
+        shutil.rmtree(cache_dir)
+    os.replace(tmp_dir, cache_dir)
+    print(
+        f"INFO: HF random-access token cache ready in {cache_dir} "
+        f"({len(lengths)} samples, skipped {skipped}, {total_bytes / (1024 ** 3):.2f} GiB)."
+    )
+    return cache_dir
+
+
 def create_hf_training_dataloader(args, tokenizer, device):
     def create_indexed_hf_dataloader(reason=None):
         if reason:
@@ -313,6 +461,21 @@ def create_hf_training_dataloader(args, tokenizer, device):
             args.batch_size,
             tokenizer.pad_token_id,
             args.num_workers,
+            use_length_bucketing=getattr(args, "length_bucketing", True),
+            bucket_size=getattr(args, "length_bucket_size", None),
+            device=device,
+            prefetch_factor=args.prefetch_factor,
+        )
+
+    if getattr(args, "hf_token_cache", False):
+        cache_dir = materialize_hf_token_cache(args, tokenizer)
+        print("INFO: Using HF random-access token cache with length bucketing.")
+        return create_dataloader_for_tokenized_cache(
+            cache_dir,
+            args.max_length,
+            args.batch_size,
+            tokenizer.pad_token_id,
+            num_workers=args.num_workers,
             use_length_bucketing=getattr(args, "length_bucketing", True),
             bucket_size=getattr(args, "length_bucket_size", None),
             device=device,
@@ -553,6 +716,9 @@ def main():
     train_group.add_argument("--hf-shard-cache-dir", "--hf_shard_cache_dir", dest="hf_shard_cache_dir", type=str, default=None, help="Directory for cached local HF tokenized shard files.")
     train_group.add_argument("--refresh-hf-shards", "--refresh_hf_shards", dest="refresh_hf_shards", action="store_true", help="Rebuild cached local HF tokenized shards before training.")
     train_group.add_argument("--hf-cache-chunks-per-file", "--hf_cache_chunks_per_file", dest="hf_cache_chunks_per_file", type=int, default=2048, help="Tokenized samples per cached HF .pt shard chunk.")
+    train_group.add_argument("--hf-token-cache", "--hf_token_cache", dest="hf_token_cache", action="store_true", help="Build/reuse a random-access binary token cache for HF datasets before training.")
+    train_group.add_argument("--hf-token-cache-dir", "--hf_token_cache_dir", dest="hf_token_cache_dir", type=str, default=None, help="Directory for random-access HF token caches.")
+    train_group.add_argument("--refresh-hf-token-cache", "--refresh_hf_token_cache", dest="refresh_hf_token_cache", action="store_true", help="Rebuild the random-access HF token cache before training.")
     train_group.add_argument("--amp", action="store_true", help="Enable mixed precision (auto-enabled on CUDA).")
     train_group.add_argument("--no-amp", dest="amp", action="store_false", help="Explicitly disable mixed precision.")
     train_group.add_argument("--dataset-size", type=int, default=None, help="Force a specific dataset size (total samples) to calculate steps for the LR scheduler.")

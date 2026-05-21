@@ -7,6 +7,7 @@ import torch
 
 from hierarchos.training.datasets import (
     HuggingFaceStreamingDataset,
+    LengthGroupedBatchSampler,
     OriginalJSONLDataset,
     StreamingJSONLDataset,
     TokenizedBinaryDataset,
@@ -73,6 +74,14 @@ def _padding_waste(batches):
     padded_tokens = sum(int(batch["input_ids"].numel()) for batch in batches)
     real_tokens = sum(int(batch["attention_mask"].sum().item()) for batch in batches)
     return padded_tokens - real_tokens
+
+
+def _batch_length_spreads(batches):
+    spreads = []
+    for batch in batches:
+        lengths = batch["attention_mask"].sum(dim=1)
+        spreads.append(int(lengths.max().item() - lengths.min().item()))
+    return spreads
 
 
 def _alternating_length_rows():
@@ -430,7 +439,7 @@ def test_cli_builds_and_uses_hf_token_cache():
     from hierarchos.training.datasets import TokenizedBinaryDataset
 
     original_loader = hierarchos_cli.load_hf_dataset
-    rows = [{"text": f"token cache row {idx}"} for idx in range(9)]
+    rows = _alternating_length_rows()
 
     try:
         hierarchos_cli.load_hf_dataset = lambda *args, **kwargs: list(rows)
@@ -449,10 +458,9 @@ def test_cli_builds_and_uses_hf_token_cache():
                 text_column=None,
                 prompt_column=None,
                 completion_column=None,
-                batch_size=3,
+                batch_size=4,
                 num_workers=0,
-                length_bucketing=True,
-                length_bucket_size=None,
+                length_bucket_size=len(rows),
                 hf_token_cache=True,
                 streaming_datasets=True,
                 prefetch_factor=None,
@@ -468,7 +476,53 @@ def test_cli_builds_and_uses_hf_token_cache():
         hierarchos_cli.load_hf_dataset = original_loader
 
     assert isinstance(dataloader.dataset, TokenizedBinaryDataset)
+    assert isinstance(dataloader.batch_sampler, LengthGroupedBatchSampler)
     assert sum(batch["input_ids"].shape[0] for batch in batches) == len(rows)
+    assert max(_batch_length_spreads(batches)) <= 32
+
+
+def test_cli_hf_token_cache_respects_disabled_length_bucketing():
+    import hierarchos_cli
+
+    original_loader = hierarchos_cli.load_hf_dataset
+    rows = _alternating_length_rows()
+
+    try:
+        hierarchos_cli.load_hf_dataset = lambda *args, **kwargs: list(rows)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = types.SimpleNamespace(
+                hf_dataset="fake/hf",
+                hf_dataset_config=None,
+                hf_dataset_split="train",
+                hf_token_cache_dir=tmpdir,
+                hf_shard_cache_dir=None,
+                refresh_hf_token_cache=True,
+                tokenizer_path=None,
+                model_path=None,
+                max_length=256,
+                kayla=False,
+                text_column=None,
+                prompt_column=None,
+                completion_column=None,
+                batch_size=4,
+                num_workers=0,
+                length_bucketing=False,
+                length_bucket_size=len(rows),
+                hf_token_cache=True,
+                streaming_datasets=True,
+                prefetch_factor=None,
+            )
+            dataloader = hierarchos_cli.create_hf_training_dataloader(
+                args,
+                TinyTokenizer(),
+                torch.device("cpu"),
+            )
+            try:
+                assert not isinstance(dataloader.batch_sampler, LengthGroupedBatchSampler)
+            finally:
+                dataloader.dataset.close()
+    finally:
+        hierarchos_cli.load_hf_dataset = original_loader
 
 
 def test_hf_streaming_dataloader_batches():
@@ -631,6 +685,7 @@ def main():
         test_cli_prefers_indexed_hf_for_single_streaming_shard_by_default,
         test_tokenized_binary_cache_is_map_style_and_bucketed,
         test_cli_builds_and_uses_hf_token_cache,
+        test_cli_hf_token_cache_respects_disabled_length_bucketing,
         test_hf_streaming_dataloader_batches,
         test_hf_worker_shards_cover_samples_once,
         test_streaming_jsonl_length_buckets_reduce_padding,

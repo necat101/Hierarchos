@@ -129,6 +129,13 @@ def _local_text_columns(args):
     return args.text_column, args.prompt_column, args.completion_column
 
 
+def _length_bucketing_enabled(args, default=True):
+    value = getattr(args, "length_bucketing", default)
+    if value is None:
+        return bool(default)
+    return bool(value)
+
+
 def _hf_shard_cache_key(args, num_shards):
     payload = {
         "format": "tokenized-pt-shards-v2",
@@ -471,7 +478,7 @@ def create_hf_training_dataloader(args, tokenizer, device):
             args.batch_size,
             tokenizer.pad_token_id,
             args.num_workers,
-            use_length_bucketing=getattr(args, "length_bucketing", True),
+            use_length_bucketing=_length_bucketing_enabled(args),
             bucket_size=getattr(args, "length_bucket_size", None),
             device=device,
             prefetch_factor=args.prefetch_factor,
@@ -479,14 +486,18 @@ def create_hf_training_dataloader(args, tokenizer, device):
 
     if getattr(args, "hf_token_cache", False):
         cache_dir = materialize_hf_token_cache(args, tokenizer)
-        print("INFO: Using HF random-access token cache with length bucketing.")
+        cache_length_bucketing = _length_bucketing_enabled(args, default=True)
+        if cache_length_bucketing:
+            print("INFO: Using HF random-access token cache with automatic per-step length bucketing.")
+        else:
+            print("INFO: Using HF random-access token cache without length bucketing.")
         return create_dataloader_for_tokenized_cache(
             cache_dir,
             args.max_length,
             args.batch_size,
             tokenizer.pad_token_id,
             num_workers=args.num_workers,
-            use_length_bucketing=getattr(args, "length_bucketing", True),
+            use_length_bucketing=cache_length_bucketing,
             bucket_size=getattr(args, "length_bucket_size", None),
             device=device,
             prefetch_factor=args.prefetch_factor,
@@ -518,7 +529,7 @@ def create_hf_training_dataloader(args, tokenizer, device):
                         args.max_length,
                         args.batch_size,
                         hf_num_workers,
-                        use_length_bucketing=getattr(args, "length_bucketing", True),
+                        use_length_bucketing=_length_bucketing_enabled(args),
                         bucket_size=getattr(args, "length_bucket_size", None),
                         device=device,
                         prefetch_factor=args.prefetch_factor,
@@ -541,7 +552,7 @@ def create_hf_training_dataloader(args, tokenizer, device):
                 prompt_column=args.prompt_column,
                 completion_column=args.completion_column,
                 alpaca_mode=getattr(args, "alpaca", False),
-                use_length_bucketing=getattr(args, "length_bucketing", True),
+                use_length_bucketing=_length_bucketing_enabled(args),
                 bucket_size=getattr(args, "length_bucket_size", None),
                 shuffle_buffer_size=getattr(args, "hf_streaming_shuffle_buffer", 10000),
                 device=device,
@@ -571,7 +582,7 @@ def create_local_training_dataloader(args, tokenizer, device):
             prompt_column=prompt_column,
             completion_column=completion_column,
             alpaca_mode=getattr(args, "alpaca", False),
-            use_length_bucketing=getattr(args, "length_bucketing", True),
+            use_length_bucketing=_length_bucketing_enabled(args),
             bucket_size=getattr(args, "length_bucket_size", None),
             device=device,
             prefetch_factor=args.prefetch_factor,
@@ -592,7 +603,7 @@ def create_local_training_dataloader(args, tokenizer, device):
         args.batch_size,
         tokenizer.pad_token_id,
         args.num_workers,
-        use_length_bucketing=getattr(args, "length_bucketing", True),
+        use_length_bucketing=_length_bucketing_enabled(args),
         bucket_size=getattr(args, "length_bucket_size", None),
         device=device,
         prefetch_factor=args.prefetch_factor,
@@ -732,6 +743,7 @@ def main():
     train_group.add_argument("--hf-auto-shard", dest="hf_auto_shard", action="store_true", help="Opt into local tokenized shard caching for single-shard HF streaming datasets.")
     train_group.add_argument("--no-hf-auto-shard", dest="hf_auto_shard", action="store_false", help="Use indexed HF loading instead of local tokenized shard caching for single-shard HF datasets.")
     train_group.set_defaults(hf_auto_shard=False)
+    train_group.set_defaults(length_bucketing=True)
     train_group.add_argument("--hf-shard-cache-dir", "--hf_shard_cache_dir", dest="hf_shard_cache_dir", type=str, default=None, help="Directory for cached local HF tokenized shard files.")
     train_group.add_argument("--refresh-hf-shards", "--refresh_hf_shards", dest="refresh_hf_shards", action="store_true", help="Rebuild cached local HF tokenized shards before training.")
     train_group.add_argument("--hf-cache-chunks-per-file", "--hf_cache_chunks_per_file", dest="hf_cache_chunks_per_file", type=int, default=2048, help="Tokenized samples per cached HF .pt shard chunk.")

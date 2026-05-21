@@ -283,7 +283,7 @@ def _layer_note(name: str) -> str:
     return "new/current layer"
 
 
-def scan_dataset_for_max_length(dataset_path: str, tokenizer, kayla_mode: bool) -> int:
+def scan_dataset_for_max_length(dataset_path: str, tokenizer, kayla_mode: bool, alpaca_mode: bool = False) -> int:
     """Scan a JSON or JSONL dataset and return the max token length rounded to 8."""
     max_found_length = 0
     print(f"Scanning dataset '{dataset_path}' to determine max length...")
@@ -291,7 +291,7 @@ def scan_dataset_for_max_length(dataset_path: str, tokenizer, kayla_mode: bool) 
     if not os.path.exists(dataset_path):
         raise FileNotFoundError(f"Dataset file not found: {dataset_path}")
 
-    def get_text_from_obj(obj: Dict[str, Any], kayla: bool) -> str:
+    def get_text_from_obj(obj: Dict[str, Any], kayla: bool, alpaca: bool) -> str:
         try:
             if kayla:
                 feelings_part = f"### Feelings:\n{obj.get('feelings')}\n\n" if obj.get("feelings") else ""
@@ -300,6 +300,13 @@ def scan_dataset_for_max_length(dataset_path: str, tokenizer, kayla_mode: bool) 
                     f"{feelings_part}"
                     f"### Thought Process:\n{obj.get('thought-process', '')}\n\n"
                     f"### Response:\n{obj.get('output', '')}"
+                )
+            if alpaca:
+                input_part = f"### Input:\n{obj.get('input', '')}\n\n" if obj.get("input") else ""
+                return (
+                    f"### Instruction:\n{obj.get('instruction', '')}\n\n"
+                    f"{input_part}"
+                    f"### Response:\n{obj.get('output', '') or obj.get('response', '')}"
                 )
             return (
                 f"### Instruction:\n{obj.get('instruction', '')}\n\n"
@@ -317,7 +324,7 @@ def scan_dataset_for_max_length(dataset_path: str, tokenizer, kayla_mode: bool) 
                 for obj in tqdm(data, desc="Scanning JSON"):
                     if not isinstance(obj, dict):
                         continue
-                    length = len(tokenizer.encode(get_text_from_obj(obj, kayla_mode))) + 1
+                    length = len(tokenizer.encode(get_text_from_obj(obj, kayla_mode, alpaca_mode))) + 1
                     max_found_length = max(max_found_length, length)
         except json.JSONDecodeError:
             f.seek(0)
@@ -326,7 +333,7 @@ def scan_dataset_for_max_length(dataset_path: str, tokenizer, kayla_mode: bool) 
                     obj = json.loads(line)
                     if not isinstance(obj, dict):
                         continue
-                    length = len(tokenizer.encode(get_text_from_obj(obj, kayla_mode))) + 1
+                    length = len(tokenizer.encode(get_text_from_obj(obj, kayla_mode, alpaca_mode))) + 1
                     max_found_length = max(max_found_length, length)
                 except (json.JSONDecodeError, AttributeError, TypeError):
                     continue
@@ -483,7 +490,7 @@ def build_expanded_config(args: argparse.Namespace, device: str) -> Dict[str, An
             if tokenizer.pad_token is None:
                 tokenizer.pad_token = tokenizer.eos_token
 
-            determined_len = scan_dataset_for_max_length(args.dataset_for_length, tokenizer, args.kayla)
+            determined_len = scan_dataset_for_max_length(args.dataset_for_length, tokenizer, args.kayla, args.alpaca)
             if determined_len > 0:
                 new_max_len = determined_len
         except Exception as exc:
@@ -558,7 +565,9 @@ def main() -> None:
         help="Scan a dataset to determine max_length. Requires --dataset-for-length.",
     )
     length_group.add_argument("--dataset-for-length", type=str, help="Dataset (.jsonl or .json) for --auto-max-length.")
-    length_group.add_argument("--kayla", action="store_true", help="Use Kayla formatting for auto length scanning.")
+    scan_format_group = length_group.add_mutually_exclusive_group()
+    scan_format_group.add_argument("--kayla", action="store_true", help="Use Kayla formatting for auto length scanning.")
+    scan_format_group.add_argument("--alpaca", action="store_true", help="Use Alpaca instruction/input/output formatting for auto length scanning.")
 
     args = parser.parse_args()
     device = "cpu"

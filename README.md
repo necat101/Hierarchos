@@ -212,8 +212,7 @@ This guide covers common scenarios from data preparation to inference.
 ```bash
 python hierarchos_cli.py train \
     --hf_dataset "tatsu-lab/alpaca" \
-    --prompt_column "instruction" \
-    --completion_column "output" \
+    --alpaca \
     --out-dir "./my_model" \
     --epochs 3 \
     --force-compile
@@ -262,13 +261,14 @@ python hierarchos_cli.py train \
     --gradient-checkpointing # Add this if VRAM is limited
 ```
 
-**(C) Hugging Face Dataset (Instruction/Kayla Format):**
+**(C) Hugging Face Dataset (Instruction/Alpaca/Kayla Format):**
 
 ```bash
 python hierarchos_cli.py train \
     --hf_dataset "databricks/databricks-dolly-15k" \
     --prompt_column "Instruction" \
     --completion_column "output" \
+    # --alpaca # Add for instruction/input/output datasets; defaults columns to instruction/output \
     # --kayla # Add if your HF data structure matches Kayla format (instruction, output, thought-process, feelings) \
     # --text_column "context" # Example: Map 'context' field if needed for your format \
     --tokenizer-path "openai-community/gpt2" \
@@ -496,6 +496,7 @@ Run standardized LLM benchmarks on your model. Requires `pip install lm-eval` (a
 ```bash
 python hierarchos_cli.py train \
     --hf_dataset "tatsu-lab/alpaca" \
+    --alpaca \
     --eval-tasks hellaswag arc_easy \
     --eval-every-epoch 1 \
     --eval-limit 100 # Optional: test on only 100 samples for speed
@@ -505,6 +506,7 @@ python hierarchos_cli.py train \
 ```bash
 python hierarchos_cli.py train \
     --hf_dataset "tatsu-lab/alpaca" \
+    --alpaca \
     --eval-tasks arc_easy \
     --eval-steps 500 # Runs every 500 steps
     --eval-limit 10
@@ -605,6 +607,7 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.5 --top-
 | `--lora_r`                     | `finetune`                          | LoRA rank 'r'.                                                                                                                           | `8`                     |
 | `--lora_alpha`                 | `finetune`                          | LoRA alpha scaling factor.                                                                                                               | `16`                    |\n| `--finetune-unlock-percent`    | `finetune`                          | Target % of params to train (approx.). Overrides `--lora_r` if set.                                                                     | `None`                  |
 | `--kayla`                      | `train`, `finetune`                 | Enable Kayla-style instruction tuning format (with thought-process). **Ignored if using pre-chunked formats or --text\_column.** | `False`                 |
+| `--alpaca`                     | `train`, `finetune`                 | Enable Alpaca `instruction`/`input`/`output` formatting. Defaults prompt/completion columns to `instruction`/`output` and includes `input` as a `### Input:` context block. | `False`                 |
 | **Quantization/Inference** |                                     |                                                                                                                                          |                         |
 | `--qtype`                      | `quantize`, `train`                 | Quantization format (`INT4`, `Q4_0`, `Q8_0`, `Q2_K`). Used by `quantize` or `--quantize-on-complete`. **Requires compiled kernel.** | `INT4`                  |
 | `--quantize-on-complete`       | `train`                             | Automatically run quantization after training finishes. **Requires compiled kernel.** | `False`                 |

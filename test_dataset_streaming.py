@@ -33,6 +33,15 @@ class TinyTokenizer:
         return [3 + (ord(ch) % 97) for ch in text]
 
 
+class RecordingTokenizer(TinyTokenizer):
+    def __init__(self):
+        self.calls = []
+
+    def encode(self, text, add_special_tokens=True):
+        self.calls.append((str(text), add_special_tokens))
+        return super().encode(text, add_special_tokens=add_special_tokens)
+
+
 class FakeHFStream:
     def __init__(self, rows):
         self.rows = list(rows)
@@ -113,6 +122,54 @@ def test_process_text_sample_autodetects_common_columns():
     assert text_sample["input_ids"].dtype == torch.long
     assert instruct_sample["labels"].shape == instruct_sample["input_ids"].shape
     assert (instruct_sample["labels"] == -100).any()
+
+
+def test_alpaca_instruction_input_output_uses_input_section():
+    tokenizer = RecordingTokenizer()
+    processed = process_text_sample(
+        tokenizer,
+        {
+            "instruction": "Summarize the passage.",
+            "input": "The passage to summarize.",
+            "output": "A short summary.",
+        },
+        max_length=256,
+        prompt_column="instruction",
+        completion_column="output",
+    )
+
+    assert processed is not None
+    assert tokenizer.calls[0] == (
+        "### Instruction:\nSummarize the passage.\n\n"
+        "### Input:\nThe passage to summarize.\n\n"
+        "### Response:\n",
+        True,
+    )
+    assert tokenizer.calls[1] == ("A short summary.", False)
+    assert "User:" not in tokenizer.calls[0][0]
+    prompt_len = len(TinyTokenizer().encode(tokenizer.calls[0][0]))
+    assert torch.equal(
+        processed["labels"][:prompt_len],
+        torch.full((prompt_len,), -100, dtype=torch.long),
+    )
+
+
+def test_alpaca_flag_defaults_instruction_output_columns():
+    tokenizer = RecordingTokenizer()
+    processed = process_text_sample(
+        tokenizer,
+        {
+            "instruction": "Classify sentiment.",
+            "input": "I love this.",
+            "output": "positive",
+        },
+        max_length=256,
+        alpaca_mode=True,
+    )
+
+    assert processed is not None
+    assert "### Input:\nI love this.\n\n" in tokenizer.calls[0][0]
+    assert tokenizer.calls[1] == ("positive", False)
 
 
 def test_streaming_jsonl_dataloader_batches_without_materializing():

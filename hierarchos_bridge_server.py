@@ -758,6 +758,7 @@ def handle_start_training(params: dict):
                 disable_lr_schedule=False,
                 ltm_lr=1e-3,
                 kayla=False,
+                alpaca=bool(params.get("alpaca", False)),
                 lora_r=8, lora_alpha=16,
                 ponder_loss_weight=0.01,
                 commitment_loss_weight=0.5,
@@ -794,6 +795,7 @@ def handle_start_training(params: dict):
                     _tokenizer.pad_token_id,
                     num_workers=train_args.num_workers,
                     kayla_mode=False,
+                    alpaca_mode=train_args.alpaca,
                     use_length_bucketing=train_args.length_bucketing,
                     bucket_size=train_args.length_bucket_size,
                     device=_device,
@@ -804,7 +806,8 @@ def handle_start_training(params: dict):
                 dataloader_len = max(1, (sample_count + train_args.batch_size - 1) // train_args.batch_size)
             else:
                 dataset = OriginalJSONLDataset(
-                    data_path, _tokenizer, train_args.max_length, False
+                    data_path, _tokenizer, train_args.max_length, False,
+                    alpaca_mode=train_args.alpaca,
                 )
                 dataloader = create_map_style_dataloader(
                     dataset,

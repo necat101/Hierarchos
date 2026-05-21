@@ -131,7 +131,8 @@ def _local_text_columns(args):
 
 def _hf_shard_cache_key(args, num_shards):
     payload = {
-        "format": "tokenized-pt-shards-v1",
+        "format": "tokenized-pt-shards-v2",
+        "formatter": "alpaca-input-section-v1",
         "dataset": args.hf_dataset,
         "config": args.hf_dataset_config,
         "split": args.hf_dataset_split,
@@ -144,6 +145,7 @@ def _hf_shard_cache_key(args, num_shards):
         ),
         "max_length": int(getattr(args, "max_length", 0) or 0),
         "kayla": bool(getattr(args, "kayla", False)),
+        "alpaca": bool(getattr(args, "alpaca", False)),
         "text_column": getattr(args, "text_column", None),
         "prompt_column": getattr(args, "prompt_column", None),
         "completion_column": getattr(args, "completion_column", None),
@@ -254,6 +256,7 @@ def materialize_hf_dataset_pt_cache(args, tokenizer, num_shards):
                 text_column=getattr(args, "text_column", None),
                 prompt_column=getattr(args, "prompt_column", None),
                 completion_column=getattr(args, "completion_column", None),
+                alpaca_mode=getattr(args, "alpaca", False),
             )
             if processed is None:
                 skipped += 1
@@ -272,7 +275,8 @@ def materialize_hf_dataset_pt_cache(args, tokenizer, num_shards):
 
     with open(os.path.join(tmp_dir, "_SUCCESS"), "w", encoding="utf-8") as f:
         json.dump({
-            "format": "tokenized-pt-shards-v1",
+            "format": "tokenized-pt-shards-v2",
+            "formatter": "alpaca-input-section-v1",
             "num_shards": num_shards,
             "counts": shard_counts,
             "parts": shard_parts,
@@ -297,7 +301,8 @@ def materialize_hf_dataset_shards(args, tokenizer, num_shards):
 
 def _hf_token_cache_key(args):
     payload = {
-        "format": "map-token-bin-v1",
+        "format": "map-token-bin-v2",
+        "formatter": "alpaca-input-section-v1",
         "dataset": args.hf_dataset,
         "config": args.hf_dataset_config,
         "split": args.hf_dataset_split,
@@ -308,6 +313,7 @@ def _hf_token_cache_key(args):
         ),
         "max_length": int(getattr(args, "max_length", 0) or 0),
         "kayla": bool(getattr(args, "kayla", False)),
+        "alpaca": bool(getattr(args, "alpaca", False)),
         "text_column": getattr(args, "text_column", None),
         "prompt_column": getattr(args, "prompt_column", None),
         "completion_column": getattr(args, "completion_column", None),
@@ -388,6 +394,7 @@ def materialize_hf_token_cache(args, tokenizer):
                     text_column=getattr(args, "text_column", None),
                     prompt_column=getattr(args, "prompt_column", None),
                     completion_column=getattr(args, "completion_column", None),
+                    alpaca_mode=getattr(args, "alpaca", False),
                 )
             except Exception:
                 processed = None
@@ -419,13 +426,15 @@ def materialize_hf_token_cache(args, tokenizer):
         raise RuntimeError("HF token cache build produced no usable samples.")
 
     torch.save({
-        "format": "map-token-bin-v1",
+        "format": "map-token-bin-v2",
+        "formatter": "alpaca-input-section-v1",
         "offsets": torch.tensor(offsets, dtype=torch.long),
         "lengths": torch.tensor(lengths, dtype=torch.int32),
     }, os.path.join(tmp_dir, "index.pt"))
     with open(os.path.join(tmp_dir, "_SUCCESS"), "w", encoding="utf-8") as f:
         json.dump({
-            "format": "map-token-bin-v1",
+            "format": "map-token-bin-v2",
+            "formatter": "alpaca-input-section-v1",
             "samples": len(lengths),
             "skipped": skipped,
             "bytes": total_bytes,
@@ -455,6 +464,7 @@ def create_hf_training_dataloader(args, tokenizer, device):
             args.text_column,
             args.prompt_column,
             args.completion_column,
+            getattr(args, "alpaca", False),
         )
         return create_map_style_dataloader(
             dataset,
@@ -530,6 +540,7 @@ def create_hf_training_dataloader(args, tokenizer, device):
                 text_column=args.text_column,
                 prompt_column=args.prompt_column,
                 completion_column=args.completion_column,
+                alpaca_mode=getattr(args, "alpaca", False),
                 use_length_bucketing=getattr(args, "length_bucketing", True),
                 bucket_size=getattr(args, "length_bucket_size", None),
                 shuffle_buffer_size=getattr(args, "hf_streaming_shuffle_buffer", 10000),
@@ -559,6 +570,7 @@ def create_local_training_dataloader(args, tokenizer, device):
             text_column=text_column,
             prompt_column=prompt_column,
             completion_column=completion_column,
+            alpaca_mode=getattr(args, "alpaca", False),
             use_length_bucketing=getattr(args, "length_bucketing", True),
             bucket_size=getattr(args, "length_bucket_size", None),
             device=device,
@@ -573,6 +585,7 @@ def create_local_training_dataloader(args, tokenizer, device):
         text_column=text_column,
         prompt_column=prompt_column,
         completion_column=completion_column,
+        alpaca_mode=getattr(args, "alpaca", False),
     )
     return create_map_style_dataloader(
         dataset,
@@ -671,7 +684,13 @@ def main():
     train_group.add_argument("--disable-lr-schedule", action="store_true")
     train_group.add_argument("--ltm_lr", type=float, default=1e-3)
     train_group.add_argument("--ltm-score-grad-scale", "--ltm_score_grad_scale", type=float, default=1.0, help="Straight-through gradient scale for LTM query/key addressing. Set 0 to keep retrieval addressing frozen.")
-    train_group.add_argument("--kayla", action="store_true")
+    format_group = train_group.add_mutually_exclusive_group()
+    format_group.add_argument("--kayla", action="store_true")
+    format_group.add_argument(
+        "--alpaca",
+        action="store_true",
+        help="Use Alpaca instruction/input/output formatting and default columns instruction/output.",
+    )
     train_group.add_argument("--lora_r", type=int, default=8)
     train_group.add_argument("--lora_alpha", type=int, default=16)
     train_group.add_argument("--grad-clip", type=float, default=1.0)
@@ -803,7 +822,7 @@ def main():
             print(f"Scanning HF dataset: {args.hf_dataset}...")
             temp_ds = load_hf_dataset(args.hf_dataset, args.hf_dataset_config, split=args.hf_dataset_split)
             for sample in tqdm(temp_ds, desc="Scanning HF"):
-                processed = process_text_sample(tokenizer, sample, 9999, args.kayla, args.text_column, args.prompt_column, args.completion_column)
+                processed = process_text_sample(tokenizer, sample, 9999, args.kayla, args.text_column, args.prompt_column, args.completion_column, args.alpaca)
                 if processed: max_found = max(max_found, len(processed['input_ids']))
         elif args.train and isinstance(args.train, str):
             jsonl_files = _jsonl_source_files(args.train)
@@ -813,7 +832,7 @@ def main():
                     with open(jsonl_path, 'r', encoding='utf-8') as f:
                         for line in tqdm(f, desc=f"Scanning {os.path.basename(jsonl_path)}"):
                             try:
-                                processed = process_text_sample(tokenizer, json.loads(line), 9999, args.kayla, args.text_column, args.prompt_column, args.completion_column)
+                                processed = process_text_sample(tokenizer, json.loads(line), 9999, args.kayla, args.text_column, args.prompt_column, args.completion_column, args.alpaca)
                                 if processed: max_found = max(max_found, len(processed['input_ids']))
                             except: continue
             else:
@@ -823,13 +842,13 @@ def main():
                         data = json.load(f)
                         if not isinstance(data, list): data = [data]
                         for obj in tqdm(data, desc="Scanning JSON"):
-                            processed = process_text_sample(tokenizer, obj, 9999, args.kayla, args.text_column, args.prompt_column, args.completion_column)
+                            processed = process_text_sample(tokenizer, obj, 9999, args.kayla, args.text_column, args.prompt_column, args.completion_column, args.alpaca)
                             if processed: max_found = max(max_found, len(processed['input_ids']))
                     except:
                         f.seek(0)
                         for line in tqdm(f, desc="Scanning JSONL"):
                             try:
-                                processed = process_text_sample(tokenizer, json.loads(line), 9999, args.kayla, args.text_column, args.prompt_column, args.completion_column)
+                                processed = process_text_sample(tokenizer, json.loads(line), 9999, args.kayla, args.text_column, args.prompt_column, args.completion_column, args.alpaca)
                                 if processed: max_found = max(max_found, len(processed['input_ids']))
                             except: continue
         if max_found > 0:

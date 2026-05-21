@@ -237,9 +237,12 @@ def _column_has_value(sample: dict, column: Optional[str]) -> bool:
 
 def _resolve_text_sample_columns(text_dict: dict, text_column: Optional[str] = None,
                                  prompt_column: Optional[str] = None,
-                                 completion_column: Optional[str] = None):
+                                 completion_column: Optional[str] = None,
+                                 alpaca_mode: bool = False):
     if text_column:
         return text_column, None, None
+    if alpaca_mode and not (prompt_column or completion_column):
+        return None, "instruction", "output"
     if prompt_column or completion_column:
         return None, prompt_column, completion_column
 
@@ -256,15 +259,29 @@ def _resolve_text_sample_columns(text_dict: dict, text_column: Optional[str] = N
 
     return None, None, None
 
+def _is_alpaca_prompt_pair(prompt_column: Optional[str], completion_column: Optional[str]) -> bool:
+    return (
+        str(prompt_column or "").lower() == "instruction"
+        and str(completion_column or "").lower() == "output"
+    )
+
+def _format_alpaca_prompt(instruction: str, inp: str) -> str:
+    prompt = f"### Instruction:\n{instruction}\n\n"
+    if inp:
+        prompt += f"### Input:\n{inp}\n\n"
+    return prompt + "### Response:\n"
+
 def _estimate_text_token_length(text_dict: dict, max_length: int, kayla_mode: bool,
                                 text_column: Optional[str] = None,
                                 prompt_column: Optional[str] = None,
-                                completion_column: Optional[str] = None):
+                                completion_column: Optional[str] = None,
+                                alpaca_mode: bool = False):
     text_column, prompt_column, completion_column = _resolve_text_sample_columns(
         text_dict,
         text_column=text_column,
         prompt_column=prompt_column,
         completion_column=completion_column,
+        alpaca_mode=alpaca_mode,
     )
     if text_column:
         text_len = len(str(text_dict.get(text_column, "")))
@@ -671,7 +688,8 @@ def create_dataloader_for_tokenized_cache(directory_path, max_length, batch_size
 
 def process_text_sample(tokenizer, text_dict: dict, max_length: int, kayla_mode: bool = False,
                          text_column: Optional[str] = None,
-                         prompt_column: Optional[str] = None, completion_column: Optional[str] = None):
+                         prompt_column: Optional[str] = None, completion_column: Optional[str] = None,
+                         alpaca_mode: bool = False):
     try:
         if not isinstance(text_dict, dict):
             return None
@@ -681,6 +699,7 @@ def process_text_sample(tokenizer, text_dict: dict, max_length: int, kayla_mode:
             text_column=text_column,
             prompt_column=prompt_column,
             completion_column=completion_column,
+            alpaca_mode=alpaca_mode,
         )
 
         if text_column:
@@ -705,6 +724,12 @@ def process_text_sample(tokenizer, text_dict: dict, max_length: int, kayla_mode:
                 r_ids = tokenizer.encode(response_text, add_special_tokens=False)
                 ids = p_ids + t_ids + r_ids + [tokenizer.eos_token_id]
                 labels = ([-100] * len(p_ids)) + t_ids + r_ids + [tokenizer.eos_token_id]
+            elif alpaca_mode or _is_alpaca_prompt_pair(prompt_column, completion_column):
+                prompt = _format_alpaca_prompt(instruction, inp)
+                p_ids = tokenizer.encode(prompt)
+                c_ids = tokenizer.encode(output, add_special_tokens=False)
+                ids = p_ids + c_ids + [tokenizer.eos_token_id]
+                labels = ([-100] * len(p_ids)) + c_ids + [tokenizer.eos_token_id]
             else:
                 if inp:
                     prompt = f"User: {inp}\n\nUser: {instruction}\n\nAssistant: "
@@ -788,7 +813,8 @@ class OriginalJSONLDataset(Dataset):
     def __init__(self, path, tokenizer, max_length, kayla_mode=False,
                  text_column: Optional[str] = None,
                  prompt_column: Optional[str] = None,
-                 completion_column: Optional[str] = None):
+                 completion_column: Optional[str] = None,
+                 alpaca_mode: bool = False):
         super().__init__()
         self.tokenizer, self.max_length, self.kayla_mode, self.samples = tokenizer, max_length, kayla_mode, []
         self.sample_lengths = []
@@ -804,6 +830,7 @@ class OriginalJSONLDataset(Dataset):
                 text_column=text_column,
                 prompt_column=prompt_column,
                 completion_column=completion_column,
+                alpaca_mode=alpaca_mode,
             )
             if processed:
                 self.samples.append(processed)
@@ -858,7 +885,8 @@ class StreamingJSONLDataset(IterableDataset):
                  prompt_column: Optional[str] = None,
                  completion_column: Optional[str] = None,
                  bucket_size: int = 0, batch_size: int = 1,
-                 shuffle_buckets: bool = True):
+                 shuffle_buckets: bool = True,
+                 alpaca_mode: bool = False):
         super().__init__()
         self.path = path
         self.paths = _resolve_jsonl_paths(path)
@@ -868,6 +896,7 @@ class StreamingJSONLDataset(IterableDataset):
         self.text_column = text_column
         self.prompt_column = prompt_column
         self.completion_column = completion_column
+        self.alpaca_mode = alpaca_mode
         self.bucket_size = max(0, int(bucket_size or 0))
         self.batch_size = max(1, int(batch_size))
         self.shuffle_buckets = bool(shuffle_buckets)
@@ -903,6 +932,7 @@ class StreamingJSONLDataset(IterableDataset):
                     text_column=self.text_column,
                     prompt_column=self.prompt_column,
                     completion_column=self.completion_column,
+                    alpaca_mode=self.alpaca_mode,
                 )
             if processed is None:
                 continue
@@ -965,7 +995,8 @@ class HuggingFaceStreamingDataset(IterableDataset):
     def __init__(self, hf_dataset, tokenizer, max_length, kayla_mode=False,
                  text_column=None, prompt_column=None, completion_column=None,
                  bucket_size: int = 0, batch_size: int = 1,
-                 shuffle: bool = True, shuffle_buffer_size: int = 10000):
+                 shuffle: bool = True, shuffle_buffer_size: int = 10000,
+                 alpaca_mode: bool = False):
         super().__init__()
         self.hf_dataset = hf_dataset
         self.tokenizer = tokenizer
@@ -974,6 +1005,7 @@ class HuggingFaceStreamingDataset(IterableDataset):
         self.text_column = text_column
         self.prompt_column = prompt_column
         self.completion_column = completion_column
+        self.alpaca_mode = alpaca_mode
         self.bucket_size = max(0, int(bucket_size or 0))
         self.batch_size = max(1, int(batch_size))
         self.shuffle = bool(shuffle)
@@ -1009,6 +1041,7 @@ class HuggingFaceStreamingDataset(IterableDataset):
                 self.text_column,
                 self.prompt_column,
                 self.completion_column,
+                self.alpaca_mode,
             )
             if processed is None:
                 continue
@@ -1024,14 +1057,15 @@ class HuggingFaceStreamingDataset(IterableDataset):
             yield from _yield_length_bucket(bucket, self.batch_size, self.shuffle, generator)
 
 class HuggingFaceMapStyleDataset(Dataset):
-    def __init__(self, hf_dataset, tokenizer, max_length, kayla_mode=False, text_column=None, prompt_column=None, completion_column=None):
+    def __init__(self, hf_dataset, tokenizer, max_length, kayla_mode=False, text_column=None, prompt_column=None, completion_column=None, alpaca_mode: bool = False):
         super().__init__()
         self.hf_dataset, self.tokenizer, self.max_length, self.kayla_mode = hf_dataset, tokenizer, max_length, kayla_mode
         self.text_column, self.prompt_column, self.completion_column = text_column, prompt_column, completion_column
+        self.alpaca_mode = alpaca_mode
         self.sample_lengths = None
     def __len__(self): return len(self.hf_dataset)
     def __getitem__(self, idx):
-        return process_text_sample(self.tokenizer, self.hf_dataset[idx], self.max_length, self.kayla_mode, self.text_column, self.prompt_column, self.completion_column)
+        return process_text_sample(self.tokenizer, self.hf_dataset[idx], self.max_length, self.kayla_mode, self.text_column, self.prompt_column, self.completion_column, self.alpaca_mode)
     def get_sample_lengths(self):
         if self.sample_lengths is not None:
             return self.sample_lengths
@@ -1042,6 +1076,7 @@ class HuggingFaceMapStyleDataset(Dataset):
                 length = _estimate_text_token_length(
                     sample, self.max_length, self.kayla_mode,
                     self.text_column, self.prompt_column, self.completion_column,
+                    self.alpaca_mode,
                 )
                 if length is None:
                     processed = process_text_sample(
@@ -1052,6 +1087,7 @@ class HuggingFaceMapStyleDataset(Dataset):
                         self.text_column,
                         self.prompt_column,
                         self.completion_column,
+                        self.alpaca_mode,
                     )
                     length = len(processed["input_ids"]) if processed is not None else None
             except Exception:
@@ -1092,7 +1128,8 @@ def create_dataloader_for_jsonl(path, tokenizer, max_length, batch_size, pad_tok
                                 prompt_column: Optional[str] = None,
                                 completion_column: Optional[str] = None,
                                 use_length_bucketing=True, bucket_size=None,
-                                device=None, prefetch_factor=None):
+                                device=None, prefetch_factor=None,
+                                alpaca_mode: bool = False):
     dataset = StreamingJSONLDataset(
         path,
         tokenizer,
@@ -1101,6 +1138,7 @@ def create_dataloader_for_jsonl(path, tokenizer, max_length, batch_size, pad_tok
         text_column=text_column,
         prompt_column=prompt_column,
         completion_column=completion_column,
+        alpaca_mode=alpaca_mode,
         bucket_size=_streaming_bucket_size(batch_size, use_length_bucketing, bucket_size),
         batch_size=batch_size,
         shuffle_buckets=True,
@@ -1121,7 +1159,8 @@ def create_dataloader_for_hf_streaming(hf_dataset, tokenizer, max_length, batch_
                                        text_column=None, prompt_column=None, completion_column=None,
                                        use_length_bucketing=True, bucket_size=None,
                                        shuffle=True, shuffle_buffer_size=10000,
-                                       device=None, prefetch_factor=None):
+                                       device=None, prefetch_factor=None,
+                                       alpaca_mode: bool = False):
     dataset = HuggingFaceStreamingDataset(
         hf_dataset,
         tokenizer,
@@ -1130,6 +1169,7 @@ def create_dataloader_for_hf_streaming(hf_dataset, tokenizer, max_length, batch_
         text_column=text_column,
         prompt_column=prompt_column,
         completion_column=completion_column,
+        alpaca_mode=alpaca_mode,
         bucket_size=_streaming_bucket_size(batch_size, use_length_bucketing, bucket_size),
         batch_size=batch_size,
         shuffle=shuffle,

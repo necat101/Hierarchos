@@ -1,10 +1,16 @@
 -----
 
-# Hierarchos v0.19.2 (alpha): DataLoader Throughput Tuning
+# Hierarchos v0.19.3 (alpha): Progress Sync Throttling
 
 **hierarchos/models/ltm.py** (line 122): CUDA LTM updates now aggregate only touched slots with torch.unique plus indexed writes, avoiding full dense [slots, val_dim] and [batch, slots, val_dim] scatter buffers.
 
 **hierarchos/models/core.py** (line 628): added _compute_cuda_chunked_lm_loss, matching dense CE plus z-loss behavior while chunking lm_head rows for large-vocab CUDA memory pressure.
+
+**hierarchos/training/trainer.py**: progress-bar scalar logging is now throttled with `--progress-log-steps`, avoiding a CUDA sync from `.item()` every single batch on fast GPUs.
+
+**hierarchos/training/datasets.py**: Alpaca formatting is standardized around the explicit `### Instruction:`, optional `### Input:`, and `### Response:` prompt string while preserving the same supervised completion labels.
+
+**The "Progress Sync Throttling" update** — Hierarchos now avoids unnecessary CUDA-to-CPU metric syncs during training progress display. The training objective, batch data, labels, and model architecture are unchanged.
 
 **The "DataLoader Throughput Tuning" update** — Hierarchos now keeps CUDA input queues bounded by tying auto prefetch to worker count, uses conservative CUDA worker defaults for pre-tokenized datasets, and keeps pinned memory specific to CUDA training.
 
@@ -13,6 +19,14 @@
 A novel AI architecture that synergistically integrates Google's Titans memory system with a Hierarchical Reasoning Model (HRM) and RWKV linear attention to move beyond the limitations of scale and take a decisive step on the path to AGI.
 
 -----
+
+### 🚀 **New in v0.19.3: Progress Sync Throttling**
+
+#### CUDA Training Loop
+- **Throttled Progress Metrics**: `train_step` only returns display metrics on scheduled progress updates, so CUDA scalar `.item()` calls no longer synchronize every batch by default.
+- **Configurable Logging Interval**: Use `--progress-log-steps N` to update tqdm scalar metrics every N steps. Default is `10`; use `1` for the old every-step behavior.
+- **Non-Destructive Runtime Patch**: This changes only metric reporting cadence. Model architecture, dataset formatting, labels, losses, optimizer steps, and scheduler behavior are unchanged.
+- **Alpaca Prompt String Documented**: `--alpaca` uses `### Instruction:`, optional `### Input:`, and `### Response:` formatting before the supervised output text.
 
 ### 🚀 **New in v0.19.2: DataLoader Throughput Tuning**
 
@@ -533,6 +547,17 @@ hierarchos: Machine learning is a type of artificial intelligence that uses
 algorithms to learn from data and improve performance...
 ```
 
+For models trained with `--alpaca`, the training formatter uses this prompt string before the supervised output:
+```text
+### Instruction:
+<instruction>
+
+### Input:
+<optional input>
+
+### Response:
+```
+
 **Good prompt examples:**
 ```
 >>> Write a short poem about learning.
@@ -603,6 +628,7 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.5 --top-
 | `--no-amp`                     | `train`, `finetune`                 | **Explicitly disable AMP** (overrides auto-detection on CUDA).                                                                                   | N/A                     |
 | `--num_workers`                | `train`, `finetune`                 | Number of CPU workers for data loading (`-1` = auto; CUDA defaults conservatively, CPU/DML use 0).                                      | `-1`                    |
 | `--prefetch-factor`            | `train`, `finetune`                 | Batches prefetched per DataLoader worker. Omit it to keep total queued batches tied to worker count.                                    | `None`                  |
+| `--progress-log-steps`         | `train`                             | Update tqdm scalar metrics every N steps to reduce CUDA sync overhead from progress logging (`1` = every step).                         | `10`                    |
 | `--pt-cache-size`              | `train`, `finetune`                 | Number of `.pt` chunk files to keep hot per worker when using `--pre_pt_dataset`.                                                       | `2`                     |
 | `--lora_r`                     | `finetune`                          | LoRA rank 'r'.                                                                                                                           | `8`                     |
 | `--lora_alpha`                 | `finetune`                          | LoRA alpha scaling factor.                                                                                                               | `16`                    |\n| `--finetune-unlock-percent`    | `finetune`                          | Target % of params to train (approx.). Overrides `--lora_r` if set.                                                                     | `None`                  |
@@ -691,6 +717,12 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
   * **DirectML/ZLUDA communities** for enabling AMD GPU acceleration on Windows.
 
 ## Changelog
+
+### v0.19.3 (alpha)
+
+  * **Progress Sync Throttling**: Training progress metrics are now collected only on scheduled tqdm updates, reducing CUDA synchronization from per-step `.item()` logging.
+  * **`--progress-log-steps`**: New train flag controls metric update cadence; default `10`, with `1` restoring every-step logging.
+  * **Alpaca Prompt String**: The `--alpaca` formatter is documented as `### Instruction:`, optional `### Input:`, and `### Response:` before the supervised output string.
 
 ### v0.19.2 (alpha)
 

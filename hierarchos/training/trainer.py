@@ -196,7 +196,16 @@ def set_dataloader_epoch(dataloader, epoch: int):
         if callable(set_epoch):
             set_epoch(epoch)
 
-def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, running_states):
+def should_update_progress(step: int, args, total_steps: int = None, first_step: int = 0) -> bool:
+    """Throttle CUDA-to-CPU metric syncs caused by progress-bar scalar logging."""
+    interval = max(1, int(getattr(args, 'progress_log_steps', 10) or 1))
+    return (
+        step == first_step
+        or (step + 1) % interval == 0
+        or (total_steps is not None and (step + 1) >= int(total_steps))
+    )
+
+def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, running_states, collect_metrics=True):
     """Training step with temporal chunking to match original hierarchos.py."""
     device = next(model.parameters()).device
     _nb = (device.type == 'cuda')  # non_blocking for async CUDA transfer
@@ -473,13 +482,15 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
         if chunks_processed == 0:
             return None, running_states
             
-        # Return averaged metrics for display
-        # Since we already weighted by chunk_ratio, these are correct averages
-        avg_outputs = {
-            'loss': total_loss.detach().cpu(),
-            'ponder_cost': total_ponder.detach().cpu() if has_ponder else None,
-            'commitment_cost': total_commit.detach().cpu() if has_commitment else None,
-        }
+        avg_outputs = None
+        if collect_metrics:
+            # Keep scalars on-device until the throttled progress update calls
+            # .item(); doing this every batch forces a CUDA sync on fast GPUs.
+            avg_outputs = {
+                'loss': total_loss.detach(),
+                'ponder_cost': total_ponder.detach() if has_ponder else None,
+                'commitment_cost': total_commit.detach() if has_commitment else None,
+            }
         
         next_states = (h_state, l_state, prev_ctx, target_ctx, drift_state, ltm_state)
         return avg_outputs, next_states
@@ -823,7 +834,19 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
             if not getattr(args, 'persist_state', False):
                 running_states = (None, None, None, None, None, None)
 
-            outputs, running_states = train_step(model, batch, optimizer, scaler, args.accumulation_steps, step, args, running_states)
+            first_logged_step = start_step if epoch == start_epoch else 0
+            collect_metrics = should_update_progress(step, args, dataloader_len, first_logged_step)
+            outputs, running_states = train_step(
+                model,
+                batch,
+                optimizer,
+                scaler,
+                args.accumulation_steps,
+                step,
+                args,
+                running_states,
+                collect_metrics=collect_metrics,
+            )
             if outputs:
                 postfix = {"loss": f"{outputs['loss'].item():.4f}"}
                 if outputs.get('ponder_cost') is not None:

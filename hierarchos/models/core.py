@@ -372,8 +372,6 @@ class HierarchosCore(nn.Module):
         if allow_hebbian_update:
             suppress_hebbian = False
 
-        x = self.tok_emb(input_ids)
-
         # Unpack LTM Memory State early so we can use past_tokens + ROSA states
         rosa_states = None
         memory_timestamps = None
@@ -410,8 +408,10 @@ class HierarchosCore(nn.Module):
                     memory_timestamps = self.ltm.timestamps
                     memory_sources = self.ltm.sources
 
-        # V8 ROSA Precomputation (only when enabled)
+        # V8 ROSA Precomputation (only when enabled). Launch this before the
+        # embedding lookup so CPU suffix-automaton work can overlap CUDA kernels.
         new_rosa_states = None
+        rosa_finalize = None
         if self.use_rosa:
             rosa_max_ctx = getattr(self.config, 'rosa_max_context', 512)
 
@@ -428,6 +428,9 @@ class HierarchosCore(nn.Module):
                 rosa_max_ctx=rosa_max_ctx,
             )
 
+        x = self.tok_emb(input_ids)
+
+        if self.use_rosa:
             # Finalize: wait for CPU work, async H2D transfer
             rosa_batch_tensor, rosa_input, new_rosa_states = rosa_finalize()
 

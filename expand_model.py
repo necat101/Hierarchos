@@ -28,8 +28,18 @@ LATEST_CONFIG_DEFAULTS = {
     "h_halt_thresh": 0.9,
     "gradient_checkpointing": False,
     "compile": False,
+    "compile_mode": "max-autotune",
+    "compile_backend": None,
+    "compile_dynamic": False,
+    "compile_fullgraph_worker": False,
+    "compile_cudagraphs": True,
+    "compile_pad_to_chunk_size": True,
+    "compile_static_worker_loop": None,
+    "compile_h_rnn": True,
     "use_deepembed": True,
     "use_rosa": True,
+    "rosa_max_context": 512,
+    "rwkv_head_size": None,
 }
 
 ARCH_UPDATE_KEYS = [
@@ -53,6 +63,8 @@ ARCH_UPDATE_KEYS = [
     "ltm_forget_rate",
     "use_deepembed",
     "use_rosa",
+    "rosa_max_context",
+    "rwkv_head_size",
 ]
 
 DERIVED_OR_RUNTIME_KEYS = {
@@ -206,6 +218,9 @@ def _infer_missing_config(config: Dict[str, Any], state_dict: Dict[str, torch.Te
 
     if "h_rnn.key.weight" in state_dict and state_dict["h_rnn.key.weight"].ndim == 2:
         inferred.setdefault("h_hidden", int(state_dict["h_rnn.key.weight"].shape[0]))
+
+    if "h_rnn.r_k" in state_dict and state_dict["h_rnn.r_k"].ndim == 2:
+        inferred.setdefault("rwkv_head_size", int(state_dict["h_rnn.r_k"].shape[1]))
 
     if "l_rnn.key.weight" in state_dict and state_dict["l_rnn.key.weight"].ndim == 2:
         inferred.setdefault("l_hidden", int(state_dict["l_rnn.key.weight"].shape[0]))
@@ -550,6 +565,8 @@ def main() -> None:
     dim_group.add_argument("--detach_every_n_steps", "--detach-every-n-steps", dest="detach_every_n_steps", type=int)
     dim_group.add_argument("--h_halt_thresh", "--h-halt-thresh", dest="h_halt_thresh", type=float)
     dim_group.add_argument("--ltm_forget_rate", "--ltm-forget-rate", dest="ltm_forget_rate", type=float)
+    dim_group.add_argument("--rosa_max_context", "--rosa-max-context", dest="rosa_max_context", type=int)
+    dim_group.add_argument("--rwkv_head_size", "--rwkv-head-size", dest="rwkv_head_size", type=int)
     deepembed_group = dim_group.add_mutually_exclusive_group()
     deepembed_group.add_argument("--use-deepembed", dest="use_deepembed", action="store_true", default=None)
     deepembed_group.add_argument("--no-deepembed", dest="use_deepembed", action="store_false")

@@ -295,6 +295,147 @@ def _reset_runtime_state():
     _total_tokens_generated = 0
 
 
+def _chat_state_config_signature():
+    """Small architecture fingerprint for model-neutral chat state files."""
+    if not _config:
+        return {}
+    keys = (
+        "context_dim",
+        "h_hidden",
+        "l_hidden",
+        "h_stride",
+        "max_h_steps",
+        "max_l_steps",
+        "vocab_size",
+    )
+    signature = {}
+    for key in keys:
+        if key in _config:
+            try:
+                signature[key] = int(_config[key])
+            except Exception:
+                signature[key] = _config[key]
+    return signature
+
+
+def _tensor_to_cpu(value):
+    try:
+        import torch
+
+        if torch.is_tensor(value):
+            return value.detach().cpu().clone()
+    except Exception:
+        pass
+    return None
+
+
+def _rosa_past_tokens_from_ltm_state(ltm_state):
+    if ltm_state is None or not isinstance(ltm_state, (tuple, list)) or len(ltm_state) < 3:
+        return None
+    return _tensor_to_cpu(ltm_state[2])
+
+
+def _ltm_state_from_rosa_past(rosa_past_tokens):
+    """Resume ROSA context without putting per-chat LTM values in state files."""
+    if _model is None or not hasattr(_model, "ltm"):
+        return None
+    try:
+        import torch
+
+        if not torch.is_tensor(rosa_past_tokens):
+            return None
+        ltm = _model.ltm
+        fast_vals = getattr(ltm, "fast_vals", None)
+        mom_vals = getattr(ltm, "_mom_vals", None)
+        if not torch.is_tensor(fast_vals) or not torch.is_tensor(mom_vals):
+            return None
+        return (
+            fast_vals,
+            torch.zeros_like(mom_vals),
+            rosa_past_tokens.detach().cpu().clone(),
+            None,
+            getattr(ltm, "timestamps", None),
+            getattr(ltm, "sources", None),
+        )
+    except Exception:
+        return None
+
+
+def _normalize_chat_state_path(path: str) -> str:
+    path = os.path.abspath(os.path.expanduser((path or "").strip().strip('"')))
+    if not path:
+        raise ValueError("No chat runtime state path provided.")
+    return path
+
+
+def _write_chat_runtime_state(path: str):
+    """Persist only tiny hierarchical continuation state, never LTM/model weights."""
+    path = _normalize_chat_state_path(path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    import torch
+
+    payload = {
+        "version": 1,
+        "kind": "hierarchos_chat_runtime_state",
+        "saved_at": time.time(),
+        "model_dir": _model_dir,
+        "config_signature": _chat_state_config_signature(),
+        "total_tokens_generated": int(_total_tokens_generated),
+        "h_state": _tensor_to_cpu(_h_state),
+        "l_state": _tensor_to_cpu(_l_state),
+        "prev_context": _tensor_to_cpu(_prev_context),
+        "target_context": _tensor_to_cpu(_target_context),
+        "drift_state": _tensor_to_cpu(_drift_state),
+        "rosa_past_tokens": _rosa_past_tokens_from_ltm_state(_ltm_state),
+    }
+
+    temp_path = path + ".tmp"
+    torch.save(payload, temp_path)
+    os.replace(temp_path, path)
+    return path
+
+
+def _validate_chat_state_signature(payload: dict):
+    saved = payload.get("config_signature") or {}
+    current = _chat_state_config_signature()
+    for key in ("context_dim", "h_hidden", "l_hidden", "vocab_size"):
+        if key in saved and key in current and saved[key] != current[key]:
+            raise RuntimeError(
+                f"Chat state was saved for {key}={saved[key]}, "
+                f"but the loaded model has {key}={current[key]}."
+            )
+
+
+def _load_chat_runtime_state(path: str):
+    """Restore hierarchical continuation state without restoring LTM working memory."""
+    global _h_state, _l_state, _prev_context, _target_context
+    global _drift_state, _ltm_state, _total_tokens_generated
+
+    path = _normalize_chat_state_path(path)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Chat runtime state file not found: {path}")
+
+    import torch
+
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict) or payload.get("kind") != "hierarchos_chat_runtime_state":
+        raise RuntimeError(f"Not a Hierarchos chat runtime state file: {path}")
+
+    _validate_chat_state_signature(payload)
+    _h_state = payload.get("h_state")
+    _l_state = payload.get("l_state")
+    _prev_context = payload.get("prev_context")
+    _target_context = payload.get("target_context")
+    _drift_state = payload.get("drift_state")
+    _total_tokens_generated = int(payload.get("total_tokens_generated") or 0)
+
+    # LTM fast/momentum state is deliberately not per-chat. The model/LTM sidecar
+    # owns persistent memory; chat files only keep capped ROSA token context.
+    _ltm_state = _ltm_state_from_rosa_past(payload.get("rosa_past_tokens"))
+    return path
+
+
 def _apply_thread_count(value=None) -> int:
     """Clamp and apply the PyTorch CPU thread count used by chat/inference."""
     global _cpu_threads
@@ -317,9 +458,13 @@ def _apply_thread_count(value=None) -> int:
     return threads
 
 
-def _sample_next_token(logits, generated_ids, sampling):
+def _sample_next_token(logits, generated_ids, sampling, tokenizer=None):
     import torch
     import torch.nn.functional as F
+    from hierarchos.inference.chat import should_stop_generation_from_uncertainty
+
+    if should_stop_generation_from_uncertainty(logits, generated_ids, tokenizer, sampling):
+        return None
 
     temperature = float(sampling.get("temperature", 0.7))
     top_k = int(sampling.get("top_k", 40))
@@ -455,9 +600,9 @@ def handle_load_model(params: dict):
         total_params = sum(p.numel() for p in _model.parameters())
 
         model_config = {
-            "context_dim": int(_config.get("context_dim", 768)),
-            "h_hidden": int(_config.get("h_hidden", _config.get("context_dim", 768))),
-            "l_hidden": int(_config.get("l_hidden", _config.get("context_dim", 768))),
+            "context_dim": int(_config.get("context_dim", 448)),
+            "h_hidden": int(_config.get("h_hidden", _config.get("context_dim", 448))),
+            "l_hidden": int(_config.get("l_hidden", _config.get("context_dim", 448))),
             "ltm_slots": int(_config.get("ltm_slots", 1024)),
             "ltm_key_dim": int(_config.get("ltm_key_dim", 128)),
             "ltm_val_dim": int(_config.get("ltm_val_dim", 128)),
@@ -548,10 +693,10 @@ def handle_generate(params: dict):
                 _ltm_state = outputs.get("ltm_memory_state", _ltm_state)
                 _total_tokens_generated += prompt_ids.shape[1]
 
-                current_ids = _sample_next_token(logits, response_ids, sampling)
+                current_ids = _sample_next_token(logits, response_ids, sampling, _tokenizer)
 
                 for _ in range(max_new):
-                    if _stop_generation.is_set():
+                    if _stop_generation.is_set() or current_ids is None:
                         break
 
                     next_token = int(current_ids.item())
@@ -584,7 +729,7 @@ def handle_generate(params: dict):
                     _ltm_state = outputs.get("ltm_memory_state", _ltm_state)
                     _total_tokens_generated += 1
 
-                    current_ids = _sample_next_token(logits, response_ids, sampling)
+                    current_ids = _sample_next_token(logits, response_ids, sampling, _tokenizer)
 
             if _ltm_state is not None and len(_ltm_state) >= 2:
                 _ltm_state = (_ltm_state[0], torch.zeros_like(_ltm_state[1]), *_ltm_state[2:])
@@ -640,7 +785,7 @@ def handle_start_training(params: dict):
                     value = int(default)
                 return max(minimum, value)
 
-            context_dim = _int_param("context_dim", _config.get("context_dim", 768), 32)
+            context_dim = _int_param("context_dim", _config.get("context_dim", 448), 32)
             train_arch = {
                 "context_dim": context_dim,
                 "persistent_dim": _int_param("persistent_dim", _config.get("persistent_dim", 128), 1),
@@ -656,6 +801,14 @@ def handle_start_training(params: dict):
                 "max_length": _int_param("max_length", _config.get("max_length", 1024), 32),
             }
             train_arch["ltm_topk"] = min(train_arch["ltm_topk"], train_arch["ltm_slots"])
+            rwkv_head_size = params.get("rwkv_head_size", _config.get("rwkv_head_size", None))
+            try:
+                rwkv_head_size = int(rwkv_head_size) if rwkv_head_size is not None else None
+            except Exception:
+                rwkv_head_size = None
+            if rwkv_head_size is not None and rwkv_head_size <= 0:
+                rwkv_head_size = None
+            train_arch["rwkv_head_size"] = rwkv_head_size
 
             def _scan_auto_max_length(path: str) -> int:
                 max_found = 0
@@ -739,6 +892,10 @@ def handle_start_training(params: dict):
                 max_length=train_arch["max_length"],
                 auto_max_length=bool(params.get("auto_max_length", False)),
                 vocab_size=_config.get("vocab_size", len(_tokenizer)),
+                use_deepembed=bool(_config.get("use_deepembed", True)),
+                use_rosa=bool(_config.get("use_rosa", True)),
+                rosa_max_context=int(_config.get("rosa_max_context", 512)),
+                rwkv_head_size=train_arch["rwkv_head_size"],
                 # Training hyperparams from GUI
                 epochs=int(params.get("epochs", 3)),
                 batch_size=int(params.get("batch_size", 4)),
@@ -757,6 +914,10 @@ def handle_start_training(params: dict):
                 # Defaults for features not exposed in GUI
                 disable_lr_schedule=False,
                 ltm_lr=1e-3,
+                rwkv_weight_decay=0.1,
+                ltm_score_grad_scale=1.0,
+                ltm_cpu_gather_retrieval=True,
+                ltm_cpu_sparse_update=True,
                 kayla=False,
                 alpaca=bool(params.get("alpaca", False)),
                 lora_r=8, lora_alpha=16,
@@ -772,6 +933,14 @@ def handle_start_training(params: dict):
                 reset_halt_bias=None,
                 override_scheduling=False,
                 compile=False, force_compile=False,
+                compile_mode="max-autotune",
+                compile_backend=None,
+                compile_dynamic=False,
+                compile_fullgraph_worker=False,
+                compile_cudagraphs=True,
+                compile_pad_to_chunk_size=True,
+                compile_static_worker_loop=None,
+                compile_h_rnn=True,
                 eval_tasks=None, eval_every_epoch=1, eval_batch_size=1,
                 eval_limit=None, eval_steps=None,
             )
@@ -1075,6 +1244,41 @@ def handle_save_ltm_updates(_params):
         emit_error(f"Failed to save LTM updates: {e}\n{traceback.format_exc()}")
 
 
+def handle_save_chat_runtime_state(params: dict):
+    if _model is None:
+        emit_error("No model loaded.")
+        return
+    try:
+        path = _write_chat_runtime_state(params.get("path", ""))
+        emit("chat_state_saved", {"path": path})
+    except Exception as e:
+        emit_error(f"Failed to save chat runtime state: {e}\n{traceback.format_exc()}")
+
+
+def handle_load_chat_runtime_state(params: dict):
+    if _model is None:
+        emit_error("No model loaded.")
+        return
+    try:
+        path = _load_chat_runtime_state(params.get("path", ""))
+        emit("chat_state_loaded", {"path": path})
+        emit_status(f"Restored chat runtime state from {path}.")
+    except Exception as e:
+        emit_error(f"Failed to load chat runtime state: {e}\n{traceback.format_exc()}")
+
+
+def handle_reset_chat_runtime_state(params: dict):
+    if _model is None:
+        emit_error("No model loaded.")
+        return
+    try:
+        _reset_runtime_state()
+        path = _write_chat_runtime_state(params.get("path", ""))
+        emit("chat_state_saved", {"path": path})
+    except Exception as e:
+        emit_error(f"Failed to reset chat runtime state: {e}\n{traceback.format_exc()}")
+
+
 def handle_send_feedback(params: dict):
     positive = params.get("positive", True)
     msg = ("Positive feedback received — reinforcing LTM memory."
@@ -1088,10 +1292,8 @@ def handle_execute_command(params: dict):
     command = params.get("command", "").strip()
 
     if command == "/reset":
-        if _model is not None and hasattr(_model, 'reset_memory'):
-            _model.reset_memory()
         _reset_runtime_state()
-        emit_status("All RNN and hierarchical states reset.")
+        emit_status("RNN and hierarchical states reset. LTM memory was left unchanged.")
     elif command == "/reset_ltm":
         if _model is not None and hasattr(_model, 'ltm'):
             if hasattr(_model.ltm, 'reset_working_memory'):
@@ -1131,6 +1333,9 @@ HANDLERS = {
     "get_model_info": handle_get_model_info,
     "get_ltm_snapshot": handle_get_ltm_snapshot,
     "save_ltm_updates": handle_save_ltm_updates,
+    "save_chat_runtime_state": handle_save_chat_runtime_state,
+    "load_chat_runtime_state": handle_load_chat_runtime_state,
+    "reset_chat_runtime_state": handle_reset_chat_runtime_state,
     "send_feedback": handle_send_feedback,
     "execute_command": handle_execute_command,
     "set_threads": handle_set_threads,

@@ -20,6 +20,7 @@ from hierarchos.training.datasets import (
     create_dataloader_for_tokenized_cache,
     process_text_sample,
 )
+from hierarchos.training.trainer import pad_training_batch_to_multiple
 
 
 class TinyTokenizer:
@@ -82,6 +83,21 @@ def _batch_length_spreads(batches):
         lengths = batch["attention_mask"].sum(dim=1)
         spreads.append(int(lengths.max().item() - lengths.min().item()))
     return spreads
+
+
+def _compile_padded_batches(batches, multiple):
+    padded = []
+    for batch in batches:
+        ids, labels, mask = pad_training_batch_to_multiple(
+            batch["input_ids"],
+            batch["labels"],
+            batch.get("attention_mask"),
+            multiple=multiple,
+            pad_token_id=0,
+        )
+        assert ids.shape[1] % multiple == 0
+        padded.append({"input_ids": ids, "labels": labels, "attention_mask": mask})
+    return padded
 
 
 def _alternating_length_rows():
@@ -658,6 +674,42 @@ def test_prechunked_jsonl_streaming_length_buckets_reduce_padding():
     assert _padding_waste(bucketed) < _padding_waste(unbucketed)
 
 
+def test_length_bucketing_still_reduces_padding_with_static_compile_chunks():
+    tokenizer = TinyTokenizer()
+    rows = _alternating_length_rows()
+    multiple = 32
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "train.jsonl")
+        _write_jsonl(path, rows)
+
+        unbucketed = list(create_dataloader_for_jsonl(
+            path,
+            tokenizer,
+            max_length=256,
+            batch_size=4,
+            pad_token_id=tokenizer.pad_token_id,
+            num_workers=0,
+            use_length_bucketing=False,
+        ))
+        bucketed = list(create_dataloader_for_jsonl(
+            path,
+            tokenizer,
+            max_length=256,
+            batch_size=4,
+            pad_token_id=tokenizer.pad_token_id,
+            num_workers=0,
+            use_length_bucketing=True,
+            bucket_size=len(rows),
+        ))
+
+    unbucketed_static = _compile_padded_batches(unbucketed, multiple)
+    bucketed_static = _compile_padded_batches(bucketed, multiple)
+
+    assert sum(batch["input_ids"].shape[0] for batch in bucketed_static) == len(rows)
+    assert _padding_waste(bucketed_static) < _padding_waste(unbucketed_static)
+
+
 def test_map_style_jsonl_fallback_still_loads_text_samples():
     tokenizer = TinyTokenizer()
     rows = [{"text": f"fallback {idx}"} for idx in range(5)]
@@ -691,6 +743,7 @@ def main():
         test_streaming_jsonl_length_buckets_reduce_padding,
         test_hf_streaming_length_buckets_reduce_padding,
         test_prechunked_jsonl_streaming_length_buckets_reduce_padding,
+        test_length_bucketing_still_reduces_padding_with_static_compile_chunks,
         test_map_style_jsonl_fallback_still_loads_text_samples,
     ]
     for test in tests:

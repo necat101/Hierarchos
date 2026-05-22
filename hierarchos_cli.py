@@ -671,19 +671,25 @@ def main():
 
     # --- Architecture Arguments ---
     arch_group = parser.add_argument_group('Architecture')
-    arch_group.add_argument("--context_dim", type=int, default=768) 
+    arch_group.add_argument("--context_dim", type=int, default=448)
     arch_group.add_argument("--persistent_dim", type=int, default=128)
     arch_group.add_argument("--ltm_slots", type=int, default=1024)
     arch_group.add_argument("--ltm_key_dim", type=int, default=128)
     arch_group.add_argument("--ltm_val_dim", type=int, default=128)
-    arch_group.add_argument("--h_hidden", type=int, default=None)
-    arch_group.add_argument("--l_hidden", type=int, default=None)
+    arch_group.add_argument("--h_hidden", type=int, default=None, help="H-module hidden size. Defaults to context_dim; 448 gives a 64-wide RWKV head and ~233M params with GPT-2 vocab.")
+    arch_group.add_argument("--l_hidden", type=int, default=None, help="L-module hidden size. Defaults to context_dim; 448 gives a 64-wide RWKV head and ~233M params with GPT-2 vocab.")
     arch_group.add_argument("--h_stride", type=int, default=4)
     arch_group.add_argument("--max_h_steps", type=int, default=5)
     arch_group.add_argument("--max_l_steps", type=int, default=5)
     arch_group.add_argument("--ltm_topk", type=int, default=4)
     arch_group.add_argument("--max_length", type=int, default=1024)
     arch_group.add_argument("--auto-max-length", action="store_true")
+    arch_group.add_argument("--use-deepembed", dest="use_deepembed", action="store_true", default=True, help="Enable V8 DeepEmbed channel-mix modulation (default).")
+    arch_group.add_argument("--no-deepembed", dest="use_deepembed", action="store_false", help="Disable V8 DeepEmbed for ablations or legacy checkpoints.")
+    arch_group.add_argument("--use-rosa", dest="use_rosa", action="store_true", default=True, help="Enable V8 ROSA embedding path (default).")
+    arch_group.add_argument("--no-rosa", dest="use_rosa", action="store_false", help="Disable V8 ROSA for ablations or legacy checkpoints.")
+    arch_group.add_argument("--rosa-max-context", dest="rosa_max_context", type=int, default=512, help="Capped token window used by ROSA.")
+    arch_group.add_argument("--rwkv-head-size", "--rwkv_head_size", dest="rwkv_head_size", type=int, default=None, help="RWKV matrix-state head size. Default auto-selects 64 when divisible, else a smaller divisor.")
 
     # --- Training Arguments ---
     train_group = parser.add_argument_group('Training')
@@ -694,6 +700,7 @@ def main():
     train_group.add_argument("--min-lr", type=float, default=1e-6)
     train_group.add_argument("--disable-lr-schedule", action="store_true")
     train_group.add_argument("--ltm_lr", type=float, default=1e-3)
+    train_group.add_argument("--rwkv-weight-decay", "--rwkv_weight_decay", dest="rwkv_weight_decay", type=float, default=0.1, help="AdamW decay for RWKV matrices/embeddings; norms/scalars use 0 decay.")
     train_group.add_argument("--ltm-score-grad-scale", "--ltm_score_grad_scale", type=float, default=1.0, help="Straight-through gradient scale for LTM query/key addressing. Set 0 to keep retrieval addressing frozen.")
     format_group = train_group.add_mutually_exclusive_group()
     format_group.add_argument("--kayla", action="store_true")
@@ -756,6 +763,25 @@ def main():
     train_group.add_argument("--dataset-size", type=int, default=None, help="Force a specific dataset size (total samples) to calculate steps for the LR scheduler.")
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile (auto-enabled on CUDA).")
     parser.add_argument("--force-compile", action="store_true")
+    parser.add_argument(
+        "--compile-mode",
+        choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"],
+        default="max-autotune",
+        help="torch.compile mode for the RWKV hot path. max-autotune has longer startup but best amortized CUDA throughput for long runs.",
+    )
+    parser.add_argument("--compile-dynamic", action="store_true", help="Compile with dynamic shapes. Slower, but useful if batch/sequence geometry changes often.")
+    parser.add_argument("--compile-backend", default=None, help="Optional torch.compile backend override, e.g. eager for diagnostics or inductor for production.")
+    parser.add_argument("--compile-fullgraph-worker", action="store_true", help="Require the worker loop to compile as one full graph. Useful for diagnostics; falls back on failure.")
+    parser.add_argument("--no-compile-cudagraphs", dest="compile_cudagraphs", action="store_false", help="Disable CUDA graph capture inside torch.compile.")
+    parser.add_argument("--no-compile-pad-to-chunk-size", dest="compile_pad_to_chunk_size", action="store_false", help="Disable CUDA compile padding to training_chunk_size multiples.")
+    parser.add_argument("--compile-static-worker-loop", dest="compile_static_worker_loop", action="store_true", default=None, help="Force the compile-friendly fixed WorkerLoop even outside CUDA auto-compile.")
+    parser.add_argument("--no-compile-static-worker-loop", dest="compile_static_worker_loop", action="store_false", help="Keep the old data-dependent WorkerLoop early break under torch.compile.")
+    parser.add_argument("--no-compile-h-rnn", dest="compile_h_rnn", action="store_false", help="Compile only the L/worker hot loop, leaving the H RWKV cell eager.")
+    parser.set_defaults(
+        compile_cudagraphs=True,
+        compile_pad_to_chunk_size=True,
+        compile_h_rnn=True,
+    )
 
     # --- Evaluation Arguments (lm-evaluation-harness) ---
     eval_group = parser.add_argument_group('Evaluation')
@@ -777,6 +803,10 @@ def main():
     infer_group.add_argument("--top-p", type=float, default=0.9)
     infer_group.add_argument("--repetition-penalty", type=float, default=1.2, help="Penalty for repeating tokens (1.0=none, >1.0=discourage). Default: 1.2.")
     infer_group.add_argument("--max-new-tokens", type=int, default=512)
+    infer_group.add_argument("--entropy-stop-threshold", type=float, default=0.0, help="Stop chat generation when raw logit entropy is this high and the top token is low-confidence. Default 0 disables this guard.")
+    infer_group.add_argument("--entropy-stop-min-tokens", type=int, default=3, help="Minimum generated tokens before entropy stop can trigger.")
+    infer_group.add_argument("--entropy-stop-top-prob", type=float, default=0.05, help="Entropy stop only triggers when the top raw token probability is at or below this value.")
+    infer_group.add_argument("--eos-stop-prob", type=float, default=0.0, help="Stop once EOS has at least this raw probability after generation has started. Default 0 disables this guard.")
     infer_group.add_argument("--device", type=str, default=None, choices=["cuda", "cpu", "dml"])
     infer_group.add_argument("--threads", type=int, default=max(1, os.cpu_count() // 2))
     
@@ -795,6 +825,8 @@ def main():
     chat_group.add_argument("--passive-response-learning", action="store_true", default=False, help="Also allow passive learning from self-generated responses after confidence/quality gates. Default: OFF.")
     chat_group.add_argument("--passive-lr", type=float, default=5e-6, help="Learning rate for passive LTM updates (default: 5e-6, very conservative).")
     chat_group.add_argument("--surprise-threshold", type=float, default=1.0, help="Passive learning only writes when loss <= this threshold (default: 1.0; lower is stricter).")
+    chat_group.add_argument("--chat-state-file", type=str, nargs="?", const="auto", default=None, help="Autosave a new tiny model-neutral hierarchical chat state .pt file. Pass no value for an auto path.")
+    chat_group.add_argument("--resume-chat-from-state-file", type=str, default=None, help="Resume and autosave a tiny model-neutral hierarchical chat state .pt file.")
     
     # --- Utility Arguments ---
     util_group = parser.add_argument_group('Utilities')

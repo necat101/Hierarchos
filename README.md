@@ -248,9 +248,10 @@ python hierarchos_cli.py train \
     --batch_size 4 \
     --accumulation-steps 2 `# Effective batch size = 8` \
     --auto-max-length `# Automatically determines max sequence length` \
-    --context_dim 768 `# Example architecture` \
-    --h_hidden 768 \
-    --l_hidden 768 \
+    --context_dim 448 `# ~233M params with GPT-2 vocab, DeepEmbed, ROSA` \
+    --h_hidden 448 \
+    --l_hidden 448 \
+    --rwkv-head-size 64 \
     --max_h_steps 5 \
     --max_l_steps 5 \
     --amp `# Enable Mixed Precision for speed (NVIDIA GPUs only)` \
@@ -339,7 +340,7 @@ python hierarchos_cli.py train \
 
 -----
 
-💡 **CUDA Auto-Optimization:** On NVIDIA GPUs, AMP, TF32, cuDNN benchmark, and torch.compile are **auto-enabled** — no flags needed. Use `--no-amp` to disable.
+💡 **CUDA Auto-Optimization:** On NVIDIA GPUs, AMP, TF32, cuDNN benchmark, and torch.compile are **auto-enabled**. Long CUDA runs default to `--compile-mode max-autotune`, static RWKV worker-loop capture, H-RNN cell compilation, and CUDA graphs. Use `--no-amp` to disable AMP.
 💾 **Training on Low Memory:** Use `--gradient-checkpointing` to significantly reduce VRAM usage at the cost of some extra computation.
 🎮 **AMD GPU Training:** Use `--device dml` to train on AMD Radeon GPUs via DirectML. AMP is automatically disabled for stability.
 🚀 **Datacenter Training:** start with auto workers or `--num_workers 4 --batch_size 32 --training-chunk-size 512 --persist-state`, then benchmark higher worker counts only if the input pipeline is still the bottleneck.
@@ -624,6 +625,10 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.5 --top-
 | `--ltm_lr`                     | `train`, `finetune`, `chat`         | Learning Rate for LTM "surprise" updates (or max LR for LTM schedule in chat).                                                         | `0.01`                  |
 | `--compile`                    | `train`, `finetune`                 | **Enable torch.compile (auto-enabled on CUDA).**                                                                              | `False`                 |
 | `--force-compile`              | `train`, `finetune`                 | Force torch.compile even on Windows CPU (overrides safety check).                                                                         | `False`                 |
+| `--compile-mode`               | `train`, `finetune`                 | torch.compile mode for the RWKV hot path. `max-autotune` has longer startup but best amortized CUDA throughput for long runs. | `max-autotune`          |
+| `--no-compile-cudagraphs`      | `train`, `finetune`                 | Disable CUDA graph capture inside torch.compile.                                                                                         | `False`                 |
+| `--no-compile-pad-to-chunk-size` | `train`, `finetune`               | Disable CUDA compile padding to `training_chunk_size` multiples; leaving it enabled reduces shape recompiles.                            | `False`                 |
+| `--no-compile-static-worker-loop` | `train`, `finetune`              | Disable the compile-friendly fixed WorkerLoop used by CUDA compile.                                                                       | `False`                 |
 | `--amp`                        | `train`, `finetune`, `chat`         | **Enable Automatic Mixed Precision (auto-enabled on CUDA).**                                                                                     | `False`                 |
 | `--no-amp`                     | `train`, `finetune`                 | **Explicitly disable AMP** (overrides auto-detection on CUDA).                                                                                   | N/A                     |
 | `--num_workers`                | `train`, `finetune`                 | Number of CPU workers for data loading (`-1` = auto; CUDA defaults conservatively, CPU/DML use 0).                                      | `-1`                    |
@@ -646,13 +651,13 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.5 --top-
 | `--ltm-schedule-steps`         | `chat`                              | Number of chat updates per LTM LR cosine cycle.                                                                                          | `100`                   |
 | `--ltm-schedule-min-lr`        | `chat`                              | Minimum LR for chat LTM cosine schedule.                                                                                                 | `1e-5`                  |
 | **Architecture (Train)** |                                     | *(Used only if starting train from scratch)* |                         |
-| `--context_dim`                | `train`                             | Core embedding dimension.                                                                                                                | `768`                   |
+| `--context_dim`                | `train`                             | Core embedding dimension. The default 448 keeps full RWKV matrix-state heads at 64-wide geometry and lands near 233M params with GPT-2 vocab + DeepEmbed/ROSA. | `448`                   |
 | `--persistent_dim`             | `train`                             | Dimension of the fixed Persistent Memory.                                                                                                | `128`                   |
 | `--ltm_slots`                  | `train`                             | Number of slots in the Long-Term Memory.                                                                                                 | `1024`                  |
 | `--ltm_key_dim`                | `train`                             | Dimension of LTM keys.                                                                                                                   | `128`                   |
 | `--ltm_val_dim`                | `train`                             | Dimension of LTM values.                                                                                                                 | `128`                   |
-| `--h_hidden`                   | `train`                             | Hidden size of the High-Level (CEO) RNN.                                                                                                 | `768`                   |
-| `--l_hidden`                   | `train`                             | Hidden size of the Low-Level (Worker) RNN.                                                                                               | `768`                   |
+| `--h_hidden`                   | `train`                             | Hidden size of the High-Level (CEO) RNN. Defaults to `context_dim`.                                                                       | `448`                   |
+| `--l_hidden`                   | `train`                             | Hidden size of the Low-Level (Worker) RNN. Defaults to `context_dim`.                                                                     | `448`                   |
 | `--max_h_steps`                | `train`                             | **Maximum** number of reasoning steps H-module can take. **Impacts training speed.** | `5`                     |
 | `--max_l_steps`                | `train`                             | **Maximum** number of iterations for L-module convergence per H-step. **Impacts training speed.** | `5`                     |
 | `--l_conv_atol`                | `train`                             | Absolute tolerance for checking L-module state convergence.                                                                              | `1e-4`                  |

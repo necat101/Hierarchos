@@ -31,6 +31,8 @@ class WorkerLoop:
         self.max_l_steps = config.max_l_steps
         self.l_conv_atol = getattr(config, 'l_conv_atol', 0.01)
         self.commitment_threshold = getattr(config, 'commitment_threshold', 0.1)
+        static_loop = getattr(config, 'compile_static_worker_loop', False)
+        self.compile_static_worker_loop = bool(static_loop) if static_loop is not None else False
 
     def __call__(self, enc: torch.Tensor, static_context: torch.Tensor, l_state: torch.Tensor, 
                 initial_drift: torch.Tensor, timestep: Optional[int] = None, l_deepemb_vec: Optional[torch.Tensor] = None):
@@ -54,7 +56,7 @@ class WorkerLoop:
         l_input = self.l_input_proj(l_input_vec)
         l_input = torch.clamp(l_input, min=-50.0, max=50.0)
         
-        check_idx = [0, 1, 2, 4]
+        check_idx = [0, 1, 2]
 
         if not self.l_rnn.training:
             prev_shadow = shadow_l_state.clone()
@@ -73,8 +75,49 @@ class WorkerLoop:
                 if drift_converged or state_converged: break
                 prev_shadow = shadow_l_state.clone()
         else:
+            commitment_cost_static = None
+            if self.compile_static_worker_loop:
+                active = torch.ones((), device=enc.device, dtype=enc.dtype)
+                drift_cost_sum = torch.zeros(enc.shape[0], device=enc.device, dtype=enc.dtype)
+                drift_cost_count = torch.zeros((), device=enc.device, dtype=enc.dtype)
+
+                for step_idx in range(self.max_l_steps):
+                    prev_shadow = shadow_l_state
+                    prev_drift = current_drift
+                    prev_l_input = l_input
+
+                    l_out, candidate_shadow = self.l_rnn(l_input, shadow_l_state, timestep=None, deepemb_vec=l_deepemb_vec)
+                    candidate_shadow = torch.clamp(candidate_shadow, min=-50.0, max=50.0)
+
+                    drift_delta = torch.tanh(self.context_drift_proj(l_out))
+                    candidate_drift = torch.clamp(current_drift + drift_delta, min=-5.0, max=5.0)
+                    drift_sq = torch.sum(candidate_drift ** 2, dim=-1)
+                    hinge_cost = torch.relu(drift_sq - self.commitment_threshold)
+                    hinge_cost = torch.clamp(hinge_cost, max=100.0)
+
+                    drift_cost_sum = drift_cost_sum + hinge_cost * active
+                    drift_cost_count = drift_cost_count + active
+
+                    candidate_dynamic = static_context + candidate_drift
+                    candidate_input_vec = torch.cat([current_enc, candidate_dynamic], dim=-1)
+                    candidate_l_input = self.l_input_proj(candidate_input_vec)
+
+                    keep2 = active.view(1, 1)
+                    keep3 = active.view(1, 1, 1)
+                    shadow_l_state = candidate_shadow * keep3 + prev_shadow * (1.0 - keep3)
+                    current_drift = candidate_drift * keep2 + prev_drift * (1.0 - keep2)
+                    l_input = candidate_l_input * keep2 + prev_l_input * (1.0 - keep2)
+
+                    still_active = (torch.mean(torch.abs(drift_delta)) >= self.l_conv_atol).to(dtype=enc.dtype)
+                    active = active * still_active
+
+                commitment_cost_static = drift_cost_sum / torch.clamp(drift_cost_count, min=1.0)
+            else:
+                commitment_cost_static = None
+
+        if self.l_rnn.training and not self.compile_static_worker_loop:
             for step_idx in range(self.max_l_steps):
-                l_out, shadow_l_state = self.l_rnn(l_input, shadow_l_state, timestep=-(step_idx+1), deepemb_vec=l_deepemb_vec)
+                l_out, shadow_l_state = self.l_rnn(l_input, shadow_l_state, timestep=None, deepemb_vec=l_deepemb_vec)
                 shadow_l_state = torch.clamp(shadow_l_state, min=-50.0, max=50.0)
                 
                 drift_delta = torch.tanh(self.context_drift_proj(l_out))
@@ -100,12 +143,14 @@ class WorkerLoop:
         l_input_vec = torch.cat([current_enc, dynamic_context], dim=-1)
         l_input = self.l_input_proj(l_input_vec)
         
-        final_l_out, next_l_state = self.l_rnn(l_input, l_state, timestep=ts, deepemb_vec=l_deepemb_vec)
+        final_l_out, next_l_state = self.l_rnn(l_input, l_state, timestep=None, deepemb_vec=l_deepemb_vec)
         next_l_state = torch.clamp(next_l_state, min=-50.0, max=50.0)
         
         final_enc = current_enc + self.l_to_out(final_l_out)
         commitment_cost = torch.zeros(enc.shape[0], device=enc.device, dtype=enc.dtype)
-        if len(drift_costs) > 0:
+        if self.l_rnn.training and self.compile_static_worker_loop and commitment_cost_static is not None:
+            commitment_cost = commitment_cost_static
+        elif len(drift_costs) > 0:
             commitment_cost = torch.stack(drift_costs, dim=0).mean(dim=0)
 
         return final_enc, next_l_state, commitment_cost, current_drift
@@ -179,7 +224,13 @@ class HierarchosCore(nn.Module):
         # Initialize with small weights to introduce feedback gradually
         nn.init.normal_(self.l_feedback_proj.weight, mean=0.0, std=0.01)
 
-        self.h_rnn = RWKVCell(config.h_hidden)
+        rwkv_head_size = getattr(config, 'rwkv_head_size', None)
+        self.h_rnn = RWKVCell(
+            config.h_hidden,
+            head_size=rwkv_head_size,
+            layer_id=0,
+            n_layer=getattr(config, 'rwkv_n_layer_hint', 2),
+        )
         self.h_to_context = nn.Linear(config.h_hidden, config.context_dim)
         self.h_halt_proj = nn.Linear(config.h_hidden, 1)
         # Initialize bias to encourage max_h_steps pondering steps initially
@@ -191,7 +242,12 @@ class HierarchosCore(nn.Module):
         
         # Worker Components
         self.l_input_proj = nn.Linear(config.context_dim * 2, config.l_hidden)
-        self.l_rnn = RWKVCell(config.l_hidden)
+        self.l_rnn = RWKVCell(
+            config.l_hidden,
+            head_size=rwkv_head_size,
+            layer_id=0,
+            n_layer=getattr(config, 'rwkv_n_layer_hint', 2),
+        )
         
         # Configure truncated BPTT for RWKV cells
         detach_freq = getattr(config, 'detach_every_n_steps', 32)
@@ -243,22 +299,58 @@ class HierarchosCore(nn.Module):
 
         try:
             if hasattr(torch, "compile"):
-                print("INFO: Compiling WorkerLoop...")
+                compile_mode = getattr(self.config, 'compile_mode', 'reduce-overhead')
+                if compile_mode in (None, '', 'default'):
+                    compile_mode = None
+                compile_backend = getattr(self.config, 'compile_backend', None)
+                if compile_backend in (None, '', 'default'):
+                    compile_backend = None
+                compile_dynamic = bool(getattr(self.config, 'compile_dynamic', False))
+                compile_fullgraph_worker = bool(getattr(self.config, 'compile_fullgraph_worker', False))
+                compile_cudagraphs = bool(getattr(self.config, 'compile_cudagraphs', device_type == 'cuda'))
+
+                print(
+                    "INFO: Compiling RWKV hot path "
+                    f"(mode={compile_mode or 'default'}, dynamic={compile_dynamic}, "
+                    f"cudagraphs={compile_cudagraphs})."
+                )
                 if os.name == 'nt' and device_type != 'dml':
                     setup_msvc_environment()
 
                 import torch._dynamo as dynamo
                 dynamo.config.suppress_errors = True
+                dynamo.config.cache_size_limit = max(getattr(dynamo.config, 'cache_size_limit', 8), 64)
+
+                self.h_rnn.allow_legacy_state_migration = False
+                self.l_rnn.allow_legacy_state_migration = False
+                static_loop = getattr(self.config, 'compile_static_worker_loop', None)
+                self.worker_loop_module.compile_static_worker_loop = True if static_loop is None else bool(static_loop)
                 
-                compile_options = {"triton.cudagraphs": False} if device_type == 'cuda' else {}
-                
+                compile_options = {}
+                if device_type == 'cuda':
+                    compile_options["triton.cudagraphs"] = compile_cudagraphs
+
+                compile_kwargs = {
+                    "dynamic": compile_dynamic,
+                    "fullgraph": False,
+                }
+                if compile_backend is not None:
+                    compile_kwargs["backend"] = compile_backend
+                if compile_mode is not None:
+                    compile_kwargs["mode"] = compile_mode
+                if compile_options:
+                    compile_kwargs["options"] = compile_options
+
+                if bool(getattr(self.config, 'compile_h_rnn', True)):
+                    self.h_rnn.compile_forward(**compile_kwargs)
+
+                worker_compile_kwargs = dict(compile_kwargs)
+                worker_compile_kwargs["fullgraph"] = compile_fullgraph_worker
                 self.worker_loop_module = torch.compile(
-                    self.worker_loop_module, 
-                    dynamic=True,
-                    fullgraph=False,
-                    options=compile_options
+                    self.worker_loop_module,
+                    **worker_compile_kwargs,
                 )
-                print("INFO: WorkerLoop compiled successfully.")
+                print("INFO: RWKV hot path compiled successfully.")
         except Exception as e:
             print(f"Warning: Compilation failed! Falling back to eager mode. {e}")
             self.config.compile = False
@@ -355,24 +447,22 @@ class HierarchosCore(nn.Module):
         # 1. STATE INITIALIZATION (With Context Recovery)
         # ==================================================================
         if h_state is None:
-            h_state = torch.zeros(B, self.config.h_hidden, 5, device=device)
-            h_state[:, :, 3] = -1e30   
+            h_state = self.h_rnn.initial_state(B, device=device)
             prev_context = torch.zeros(B, self.config.context_dim, device=device)
             target_context = torch.zeros(B, self.config.context_dim, device=device)
         else:
             h_state = h_state.to(device)
             if prev_context is None:
-                prev_context = self.h_to_context(h_state[:, :, 0])
+                prev_context = self.h_to_context(self.h_rnn.state_hidden(h_state))
             else:
                 prev_context = prev_context.to(device)
             if target_context is None:
-                target_context = self.h_to_context(h_state[:, :, 0])
+                target_context = self.h_to_context(self.h_rnn.state_hidden(h_state))
             else:
                 target_context = target_context.to(device)
 
         if l_state is None:
-            l_state = torch.zeros(B, self.config.l_hidden, 5, device=device)
-            l_state[:, :, 3] = -1e30
+            l_state = self.l_rnn.initial_state(B, device=device)
         else:
             l_state = l_state.to(device)
 
@@ -448,10 +538,14 @@ class HierarchosCore(nn.Module):
             # ==================================================================
             # 3. HIERARCHICAL MANAGER (Continuous Watch, Strided Plan)
             # ==================================================================
-            l_feedback = self.l_feedback_proj(l_state[:, :, 0].to(device))
+            l_feedback = self.l_feedback_proj(self.l_rnn.state_hidden(l_state).to(device))
             enc_with_feedback = enc + l_feedback
+
+            detach_freq = getattr(self.config, 'detach_every_n_steps', 32)
+            if self.training and detach_freq is not None and t > 0 and t % detach_freq == 0:
+                h_state = h_state.detach()
             
-            h_out_real, h_state = self.h_rnn(enc_with_feedback, h_state, timestep=t, deepemb_vec=h_deepemb_vec)
+            h_out_real, h_state = self.h_rnn(enc_with_feedback, h_state, timestep=None, deepemb_vec=h_deepemb_vec)
             h_out_real = torch.clamp(h_out_real, min=-100.0, max=100.0)
             
             if getattr(self.config, 'debug_numerics', False) and (torch.isnan(h_out_real).any() or torch.isinf(h_out_real).any()):
@@ -474,7 +568,7 @@ class HierarchosCore(nn.Module):
                 for step_idx in range(self.config.max_h_steps - 1):
                     if not self.training and h_halt_probs[-1].mean() > getattr(self.config, 'h_halt_thresh', 0.9): 
                         break
-                    h_out_ponder, shadow_h_state = self.h_rnn(current_enc_h, shadow_h_state, timestep=-(step_idx+1), deepemb_vec=h_deepemb_vec)
+                    h_out_ponder, shadow_h_state = self.h_rnn(current_enc_h, shadow_h_state, timestep=None, deepemb_vec=h_deepemb_vec)
                     halt_logit = self.h_halt_proj(h_out_ponder).squeeze(-1)
                     h_step_outputs.append(h_out_ponder)
                     h_halt_probs.append(torch.sigmoid(halt_logit))
@@ -517,13 +611,12 @@ class HierarchosCore(nn.Module):
             if t == 0 and drift_seed is not None:
                 initial_drift = torch.clamp(drift_seed, min=-5.0, max=5.0)
             elif self.context_drift_proj is not None:
-                prev_worker_h = l_state[:, :, 0].to(device)
+                prev_worker_h = self.l_rnn.state_hidden(l_state).to(device)
                 initial_drift = torch.tanh(self.context_drift_proj(prev_worker_h))
                 initial_drift = torch.clamp(initial_drift, min=-5.0, max=5.0)
             else:
                 initial_drift = torch.zeros(B, self.config.context_dim, device=device)
 
-            detach_freq = getattr(self.config, 'detach_every_n_steps', 32)
             if self.training and detach_freq is not None and t > 0 and t % detach_freq == 0:
                 l_state = l_state.detach()
 

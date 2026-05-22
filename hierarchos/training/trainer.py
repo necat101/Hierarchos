@@ -88,6 +88,30 @@ def compute_remaining_update_steps(dataloader_len: int, accumulation_steps: int,
     remaining_batches += remaining_epochs_after_current * int(dataloader_len)
     return max(1, remaining_batches // accumulation_steps)
 
+def build_hierarchos_optimizer(model, args, device):
+    """RWKV-style AdamW grouping: decay matrices/embeddings, never norms or scalars."""
+    lr = args.starting_lr
+    weight_decay = float(getattr(args, "rwkv_weight_decay", 0.1))
+    decay = []
+    no_decay = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if (".weight" in name or "emb" in name) and ("ln" not in name and "norm" not in name):
+            decay.append(param)
+        else:
+            no_decay.append(param)
+
+    param_groups = [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+    if is_directml_device(device):
+        return DirectMLAdamW(param_groups, lr=lr)
+    if device.type == 'cuda':
+        return torch.optim.AdamW(param_groups, lr=lr, fused=True)
+    return torch.optim.AdamW(param_groups, lr=lr)
+
 def estimate_cuda_loss_chunk_rows(free_bytes: int, batch_size: int, chunk_size: int,
                                   vocab_size: int, requested_rows: int = 0) -> int:
     """
@@ -185,6 +209,32 @@ def trim_trailing_padding(input_ids: torch.Tensor, labels: torch.Tensor, attenti
         attention_mask[:, :trim_to].contiguous(),
     )
 
+def pad_training_batch_to_multiple(
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    attention_mask: torch.Tensor = None,
+    multiple: int = 128,
+    pad_token_id: int = 0,
+):
+    """Pad sequence length to a chunk multiple so torch.compile sees stable shapes."""
+    multiple = int(multiple or 0)
+    if multiple <= 1 or input_ids.ndim != 2 or labels.ndim != 2:
+        return input_ids, labels, attention_mask
+    T = input_ids.shape[1]
+    target_T = int(math.ceil(T / multiple) * multiple)
+    pad_cols = target_T - T
+    if pad_cols <= 0:
+        return input_ids, labels, attention_mask
+
+    ids_pad = input_ids.new_full((input_ids.shape[0], pad_cols), int(pad_token_id))
+    label_pad = labels.new_full((labels.shape[0], pad_cols), -100)
+    input_ids = torch.cat([input_ids, ids_pad], dim=1).contiguous()
+    labels = torch.cat([labels, label_pad], dim=1).contiguous()
+    if attention_mask is not None:
+        mask_pad = attention_mask.new_zeros((attention_mask.shape[0], pad_cols))
+        attention_mask = torch.cat([attention_mask, mask_pad], dim=1).contiguous()
+    return input_ids, labels, attention_mask
+
 def set_dataloader_epoch(dataloader, epoch: int):
     """Let length-grouped or distributed samplers reshuffle per epoch."""
     for sampler in (
@@ -215,6 +265,19 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
     full_input_ids, full_labels, full_attention_mask = trim_trailing_padding(
         full_input_ids, full_labels, full_attention_mask
     )
+    chunk_size = getattr(args, 'training_chunk_size', 128)
+    if (
+        device.type == 'cuda'
+        and getattr(args, 'compile', False)
+        and getattr(args, 'compile_pad_to_chunk_size', True)
+    ):
+        full_input_ids, full_labels, full_attention_mask = pad_training_batch_to_multiple(
+            full_input_ids,
+            full_labels,
+            full_attention_mask,
+            multiple=chunk_size,
+            pad_token_id=getattr(args, 'pad_token_id', 0),
+        )
     
     # --- [NEW] Track Sequence Poisoning (Parity Fix) ---
     if full_labels.is_floating_point() and torch.isnan(full_labels).any():
@@ -263,7 +326,6 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
     
     # Temporal chunking (critical for RWKV-based models). Build this on CPU before
     # moving labels/masks to CUDA so per-chunk .item() accounting does not sync GPU.
-    chunk_size = getattr(args, 'training_chunk_size', 128)
     if chunk_size <= 0 or chunk_size > T: chunk_size = T
     chunk_plan = compute_chunk_training_weights(full_labels, full_attention_mask, chunk_size)
     num_chunks = len(chunk_plan)
@@ -637,20 +699,25 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
             key = 'qproj.weight' if 'qproj.weight' in state_dict else '_orig_mod.qproj.weight'
             model_config.ltm_key_dim = state_dict[key].shape[0]
 
-        # 4. Detect RNN hidden sizes (RWKV-style states)
-        if 'h_rnn.time_decay' in state_dict_keys:
-            key = 'h_rnn.time_decay' if 'h_rnn.time_decay' in state_dict else '_orig_mod.h_rnn.time_decay'
-            model_config.h_hidden = state_dict[key].shape[-1]
-        if 'l_rnn.time_decay' in state_dict_keys:
-            key = 'l_rnn.time_decay' if 'l_rnn.time_decay' in state_dict else '_orig_mod.l_rnn.time_decay'
-            model_config.l_hidden = state_dict[key].shape[-1]
+        # 4. Detect RNN hidden sizes and RWKV matrix-state head geometry.
+        if 'h_rnn.key.weight' in state_dict_keys:
+            model_config.h_hidden = state_dict['h_rnn.key.weight'].shape[0]
+        elif 'h_rnn.time_decay' in state_dict_keys:
+            model_config.h_hidden = state_dict['h_rnn.time_decay'].shape[-1]
+        if 'l_rnn.key.weight' in state_dict_keys:
+            model_config.l_hidden = state_dict['l_rnn.key.weight'].shape[0]
+        elif 'l_rnn.time_decay' in state_dict_keys:
+            model_config.l_hidden = state_dict['l_rnn.time_decay'].shape[-1]
+        if 'h_rnn.r_k' in state_dict_keys:
+            model_config.rwkv_head_size = state_dict['h_rnn.r_k'].shape[1]
 
         # ARCH defaults / Fallbacks
         arch_defaults = {
             'ltm_slots': 1024, 'ltm_key_dim': 128, 'ltm_val_dim': 128, 'ltm_topk': 4,
             'h_stride': 4, 'max_h_steps': 5, 'max_l_steps': 5,
-            'h_hidden': model_config.get('context_dim', 768),
-            'l_hidden': model_config.get('context_dim', 768)
+            'h_hidden': model_config.get('context_dim', 448),
+            'l_hidden': model_config.get('context_dim', 448),
+            'rwkv_head_size': getattr(args, 'rwkv_head_size', None),
         }
         for k, v in arch_defaults.items():
             if k not in model_config:
@@ -689,9 +756,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                 else:
                     print("WARNING: h_halt_proj.bias not found, surgical fix skipped.")
         
-        if is_directml_device(device): optimizer = DirectMLAdamW(model.parameters(), lr=args.starting_lr)
-        elif device.type == 'cuda': optimizer = torch.optim.AdamW(model.parameters(), lr=args.starting_lr, fused=True)
-        else: optimizer = torch.optim.AdamW(model.parameters(), lr=args.starting_lr)
+        optimizer = build_hierarchos_optimizer(model, args, device)
         
         if not getattr(args, 'override_scheduling', False) and 'optimizer_state_dict' in checkpoint:
             try: optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -714,9 +779,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         model_config.compile = args.compile
         model.config = model_config
         
-        if is_directml_device(device): optimizer = DirectMLAdamW(model.parameters(), lr=args.starting_lr)
-        elif device.type == 'cuda': optimizer = torch.optim.AdamW(model.parameters(), lr=args.starting_lr, fused=True)
-        else: optimizer = torch.optim.AdamW(model.parameters(), lr=args.starting_lr)
+        optimizer = build_hierarchos_optimizer(model, args, device)
         
         if use_amp and getattr(config, 'amp_dtype', 'float16') == 'float16': scaler = GradScaler()
     
@@ -724,9 +787,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         print("Starting training from scratch.")
         if 'vocab_size' not in config: config.vocab_size = len(tokenizer)
         model = HierarchosCore(config).to(device)
-        if is_directml_device(device): optimizer = DirectMLAdamW(model.parameters(), lr=args.starting_lr)
-        elif device.type == 'cuda': optimizer = torch.optim.AdamW(model.parameters(), lr=args.starting_lr, fused=True)
-        else: optimizer = torch.optim.AdamW(model.parameters(), lr=args.starting_lr)
+        optimizer = build_hierarchos_optimizer(model, args, device)
         if use_amp and getattr(config, 'amp_dtype', 'float16') == 'float16': scaler = GradScaler()
 
     # --- [NEW] Sync LTM reference chunk size (Parity Fix) ---
@@ -1125,9 +1186,9 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
     # Optimizer selection
     if is_directml_device(device):
         print("INFO: DirectML detected. Using optimized DirectMLAdamW optimizer.")
-        optimizer = DirectMLAdamW(model.parameters(), lr=args.starting_lr)
+        optimizer = build_hierarchos_optimizer(model, args, device)
     else:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.starting_lr)
+        optimizer = build_hierarchos_optimizer(model, args, device)
     
     if checkpoint and 'optimizer_state_dict' in checkpoint:
         try:

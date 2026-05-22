@@ -180,7 +180,7 @@ class QuantizedRWKVCell:
         
         r = torch.sigmoid(self.receptance_cm(xr, device))
         key_out = self.key_cm(xk, device)
-        k = F.silu(key_out) * torch.relu(key_out)
+        k = torch.square(torch.relu(key_out))
         x = x + r * self.value_cm(k, device)
 
         # Update state: [x_in(=x_norm), aa, bb, pp, x_norm2] — aligned with full model

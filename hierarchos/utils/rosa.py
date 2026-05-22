@@ -498,6 +498,7 @@ def rosa_async_pipeline(
     """
     B, T = input_ids.shape
     is_cuda = (device.type == 'cuda')
+    no_prediction = vocab_size
 
     # Build full context
     if past_tokens is not None:
@@ -514,6 +515,14 @@ def rosa_async_pipeline(
         rosa_input = full_input_ids[:, -rosa_max_ctx:]
     else:
         rosa_input = full_input_ids
+
+    total_len = full_input_ids.shape[1]
+    window_start = total_len - rosa_input.shape[1]
+    current_start = total_len - T
+    overlap_start = max(window_start, current_start)
+    overlap_len = max(0, total_len - overlap_start)
+    current_pad_len = max(0, T - overlap_len)
+    start_in_window = max(0, overlap_start - window_start)
 
     # Transfer to CPU (async if CUDA)
     if is_cuda:
@@ -544,17 +553,52 @@ def rosa_async_pipeline(
         if ev_copy is not None:
             ev_copy.synchronize()
 
-        input_lists = host_buf.tolist()
+        full_input_lists = host_buf.tolist()
+        state_inputs = []
+        state_seeds = []
+        rebuild_flags = []
+
+        for row, state in zip(full_input_lists, rosa_states):
+            current_overlap = row[start_in_window:] if overlap_len > 0 else []
+            expected_prefix = row[:start_in_window]
+            state_tokens = getattr(state, "tokens", None) if state is not None else None
+            if state is not None and state_tokens == expected_prefix:
+                # Incremental ROSA state already represents the cached prefix;
+                # extend it with only the new chunk. Feeding the full window here
+                # duplicates history and corrupts future ROSA predictions.
+                state_inputs.append(current_overlap)
+                state_seeds.append(state)
+                rebuild_flags.append(False)
+            else:
+                # Rebuild from the capped canonical window when state is missing,
+                # stale, resumed only from tokens, or the max context has slid.
+                state_inputs.append(row)
+                state_seeds.append(None)
+                rebuild_flags.append(True)
 
         # Parallel ROSA batch computation
-        rosa_preds, new_states = rosa_batch_parallel(input_lists, rosa_states)
+        rosa_preds, new_states = rosa_batch_parallel(state_inputs, state_seeds)
 
-        # Slice to only the last T predictions (current chunk)
-        rosa_raw = [preds[-T:] for preds in rosa_preds]
+        # Return exactly one ROSA token per model token. If a forward chunk is
+        # longer than rosa_max_ctx, only the current tokens inside the capped
+        # window have valid ROSA predictions; earlier current tokens get the
+        # no-prediction sentinel.
+        rosa_raw = []
+        for preds, rebuilt in zip(rosa_preds, rebuild_flags):
+            if overlap_len <= 0:
+                overlap_preds = []
+            elif rebuilt:
+                overlap_preds = preds[-overlap_len:]
+            else:
+                overlap_preds = preds
+            if len(overlap_preds) != overlap_len:
+                overlap_preds = overlap_preds[-overlap_len:] if overlap_len > 0 else []
+                overlap_preds = [-1] * (overlap_len - len(overlap_preds)) + overlap_preds
+            rosa_raw.append(([-1] * current_pad_len) + overlap_preds)
 
         # Vectorized post-processing via numpy
         rosa_np = np.array(rosa_raw, dtype=np.int64)
-        rosa_np[rosa_np == -1] = vocab_size  # sentinel for "no prediction"
+        rosa_np[rosa_np == -1] = no_prediction  # sentinel for "no prediction"
 
         # Use pinned buffer for H2D transfer
         result_buf = _PINNED.get("rosa_result", (B, T), dtype=torch.int64)

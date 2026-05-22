@@ -72,6 +72,29 @@ def _load_json_config(model_dir: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _infer_arch_flags_from_state_dict(config_dict: Dict[str, Any], state_dict: Dict[str, torch.Tensor]) -> None:
+    """Backfill architecture toggles for checkpoints saved before these flags existed."""
+    if "use_deepembed" not in config_dict:
+        config_dict["use_deepembed"] = any(
+            key.startswith("h_deepemb.") or key.startswith("l_deepemb.")
+            for key in state_dict
+        )
+
+    if "use_rosa" not in config_dict:
+        config_dict["use_rosa"] = any(
+            key.startswith("rosa_emb.") or key == "rosa_gate_logit"
+            for key in state_dict
+        )
+
+    if config_dict.get("use_rosa", True) and "rosa_max_context" not in config_dict:
+        config_dict["rosa_max_context"] = 512
+
+    if "rwkv_head_size" not in config_dict:
+        head_shape = state_dict.get("h_rnn.r_k")
+        if torch.is_tensor(head_shape) and head_shape.ndim == 2:
+            config_dict["rwkv_head_size"] = int(head_shape.shape[1])
+
+
 def load_full_model_with_config(model_path: str, device):
     """Loads a full-precision model from a directory or direct .pt file."""
     weights_path, model_dir = _resolve_weights_path(model_path)
@@ -104,10 +127,6 @@ def load_full_model_with_config(model_path: str, device):
 
     config_dict = dict(config_dict)
     if 'model_type' not in config_dict: config_dict['model_type'] = 'hierarchos'
-    config = AttrDict(config_dict)
-
-    from ..models.core import HierarchosCore
-    model = HierarchosCore(config)
     
     # Strip _orig_mod. prefix from compiled model checkpoints (torch.compile adds this)
     # Without this, strict=False silently drops ALL weights from compiled checkpoints
@@ -118,6 +137,12 @@ def load_full_model_with_config(model_path: str, device):
         if not state_source:
             raise ValueError("Model state_dict not found in checkpoint.")
     state_dict = sanitize_model_state_dict(state_source, reset_transient_ltm=False)
+    _infer_arch_flags_from_state_dict(config_dict, state_dict)
+
+    config = AttrDict(config_dict)
+
+    from ..models.core import HierarchosCore
+    model = HierarchosCore(config)
     
     # Handle qproj shape mismatch (Old -> New Architecture)
     if 'qproj.weight' in state_dict:

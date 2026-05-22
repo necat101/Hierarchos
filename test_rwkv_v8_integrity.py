@@ -1,7 +1,9 @@
 import unittest
+import os
 
 import torch
 
+import hierarchos
 from hierarchos import AttrDict, HierarchosCore
 from hierarchos.models.rwkv_cell import RWKVCell
 
@@ -32,6 +34,10 @@ def _tiny_config():
 
 
 class RWKVV8IntegrityTests(unittest.TestCase):
+    def test_import_uses_modular_package_not_legacy_monolith(self):
+        loaded = os.path.normcase(os.path.abspath(hierarchos.__file__))
+        self.assertTrue(loaded.endswith(os.path.normcase(os.path.join("hierarchos", "__init__.py"))), loaded)
+
     def test_conservative_448_default_stays_near_233m_with_real_rwkv_heads(self):
         cfg = AttrDict(
             vocab_size=50257,
@@ -153,6 +159,57 @@ class RWKVV8IntegrityTests(unittest.TestCase):
             k = k * (1 + (a - 1) * cell.k_a)
             expected = (
                 v.float().view(2, cell.n_head, cell.head_size).unsqueeze(-1)
+                * k.float().view(2, cell.n_head, cell.head_size).unsqueeze(-2)
+            )
+
+        actual = new_state[:, :, 3:].view(2, cell.n_head, cell.head_size, cell.head_size)
+        self.assertTrue(torch.allclose(actual, expected, atol=1e-5), (actual, expected))
+
+    def test_matrix_state_recurrence_matches_v7_reference_with_existing_state(self):
+        torch.manual_seed(19)
+        cell = RWKVCell(4, head_size=2)
+        cell.eval()
+
+        x = torch.randn(2, 4)
+        state = cell.initial_state(batch_size=2, device=x.device)
+        state[:, :, 0] = torch.randn(2, 4) * 0.2
+        state[:, :, 1] = torch.randn(2, 4) * 0.2
+        matrix_state = torch.randn(2, cell.n_head, cell.head_size, cell.head_size) * 0.05
+        state[:, :, 3:] = matrix_state.reshape(2, 4, cell.head_size)
+
+        _, new_state = cell(x, state)
+
+        with torch.no_grad():
+            prev_tm = state[:, :, 0]
+            x_norm = cell.ln1(x)
+            xw = cell._mix(x_norm, prev_tm, cell.x_w)
+            xk = cell._mix(x_norm, prev_tm, cell.x_k)
+            xv = cell._mix(x_norm, prev_tm, cell.x_v)
+            xa = cell._mix(x_norm, prev_tm, cell.x_a)
+
+            k = cell.key(xk)
+            v = cell.value(xv)
+            a = torch.sigmoid(cell.a0 + (xa @ cell.a1) @ cell.a2)
+            w = -torch.nn.functional.softplus(
+                -(cell.w0 + torch.tanh(xw @ cell.w1) @ cell.w2)
+            ) - 0.5
+            kk = k * cell.k_k
+            kk = torch.nn.functional.normalize(
+                kk.view(2, cell.n_head, cell.head_size), dim=-1, p=2.0
+            ).view(2, 4)
+            k = k * (1 + (a - 1) * cell.k_a)
+            state_a = -kk.view(2, cell.n_head, cell.head_size)
+            state_b = (kk * a).view(2, cell.n_head, cell.head_size)
+            w_decay = torch.exp(-torch.exp(torch.clamp(w.float(), min=-60.0, max=30.0))).view(
+                2, cell.n_head, cell.head_size
+            )
+
+            expected = matrix_state.float()
+            sa = torch.matmul(expected, state_a.float().unsqueeze(-1)).squeeze(-1)
+            expected = (
+                expected * w_decay.unsqueeze(-2)
+                + sa.unsqueeze(-1) * state_b.float().unsqueeze(-2)
+                + v.float().view(2, cell.n_head, cell.head_size).unsqueeze(-1)
                 * k.float().view(2, cell.n_head, cell.head_size).unsqueeze(-2)
             )
 

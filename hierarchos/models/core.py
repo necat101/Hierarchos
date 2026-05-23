@@ -216,6 +216,24 @@ class HierarchosCore(nn.Module):
     def reset_memory(self):
         """Resets the short-term 'fast' associative memory."""
         self.ltm.reset_working_memory()
+
+    def set_training_step(self, step: int):
+        if hasattr(self, "memory_gate_warmup_step"):
+            with torch.no_grad():
+                self.memory_gate_warmup_step.fill_(float(max(0, int(step or 0))))
+
+    def _apply_memory_gate_warmup(self, gate: torch.Tensor) -> torch.Tensor:
+        if not self.training:
+            return gate
+        warmup_steps = float(getattr(self.config, 'memory_gate_warmup_steps', 0) or 0)
+        warmup_floor = float(getattr(self.config, 'memory_gate_warmup_floor', 0.0) or 0.0)
+        if warmup_steps <= 0.0 or warmup_floor <= 0.0:
+            return gate
+        warmup_floor = min(max(warmup_floor, 0.0), 0.95)
+        step = self.memory_gate_warmup_step.to(device=gate.device, dtype=torch.float32)
+        progress = torch.clamp(step / warmup_steps, min=0.0, max=1.0)
+        floor = gate.new_tensor(warmup_floor) * (1.0 - progress.to(dtype=gate.dtype))
+        return floor + (1.0 - floor) * gate
     
     def __init__(self, config):
         super().__init__()
@@ -236,12 +254,18 @@ class HierarchosCore(nn.Module):
             nn.init.ones_(self.l_deepemb.weight)
         
         # V8 ROSA Embed - default to True
+        self.memory_token_routers = bool(getattr(config, 'memory_token_routers', True))
+        self.register_buffer("memory_gate_warmup_step", torch.zeros((), dtype=torch.float32), persistent=False)
         self.use_rosa = getattr(config, 'use_rosa', True)
         if self.use_rosa:
             self.rosa_emb = nn.Embedding(config.vocab_size + 1, config.context_dim)
             nn.init.zeros_(self.rosa_emb.weight)
             # Learnable gate: sigmoid(-1.0) ≈ 0.27 initial injection strength
             self.rosa_gate_logit = nn.Parameter(torch.tensor(-1.0))
+            if self.memory_token_routers:
+                self.rosa_router = nn.Linear(config.context_dim, 1)
+                nn.init.zeros_(self.rosa_router.weight)
+                nn.init.zeros_(self.rosa_router.bias)
         
         # Global Learnable State
         self.persistent_dim = getattr(config, 'persistent_dim', 128)
@@ -249,6 +273,10 @@ class HierarchosCore(nn.Module):
         
         # Learnable LTM Gate
         self.ltm_gate_logit = nn.Parameter(torch.tensor(-2.0))
+        if self.memory_token_routers:
+            self.ltm_router = nn.Linear(config.context_dim, 1)
+            nn.init.zeros_(self.ltm_router.weight)
+            nn.init.zeros_(self.ltm_router.bias)
 
         # LTM System
         self.ltm = LTMModule(
@@ -480,8 +508,13 @@ class HierarchosCore(nn.Module):
             rosa_batch_tensor, rosa_input, new_rosa_states = rosa_finalize()
 
             rosa_embs = self.rosa_emb(rosa_batch_tensor)
-            # Learnable injection gate (controls ROSA signal strength)
-            rosa_gate = torch.sigmoid(torch.clamp(self.rosa_gate_logit, min=-50.0, max=50.0))
+            # Per-token router controls exact-memory injection without branching.
+            if self.memory_token_routers and hasattr(self, "rosa_router"):
+                rosa_gate_logits = self.rosa_gate_logit + self.rosa_router(x)
+            else:
+                rosa_gate_logits = self.rosa_gate_logit
+            rosa_gate = torch.sigmoid(torch.clamp(rosa_gate_logits, min=-50.0, max=50.0))
+            rosa_gate = self._apply_memory_gate_warmup(rosa_gate)
             x = x + rosa_gate * rosa_embs  # Gated Neurosymbolic Inner Monologue Mix
 
             # Store past_tokens for cross-chunk continuity (capped by rosa_max_ctx)
@@ -575,8 +608,14 @@ class HierarchosCore(nn.Module):
                 pe = torch.cat([pe, torch.zeros_like(pe[..., :1])], dim=-1)
             topk_vals = topk_vals + pe
             
-            gate_input = torch.clamp(self.ltm_gate_logit, min=-50.0, max=50.0)
-            gate = torch.sigmoid(gate_input)
+            if self.memory_token_routers and hasattr(self, "ltm_router"):
+                gate_input = self.ltm_gate_logit + self.ltm_router(token_x)
+            else:
+                gate_input = self.ltm_gate_logit
+            gate = torch.sigmoid(torch.clamp(gate_input, min=-50.0, max=50.0))
+            gate = self._apply_memory_gate_warmup(gate)
+            if gate.dim() == 2:
+                gate = gate.unsqueeze(1)
             gated_vals = topk_vals * gate
             mac_in = torch.cat([token_x, p, gated_vals.view(B, -1)], dim=-1)
             

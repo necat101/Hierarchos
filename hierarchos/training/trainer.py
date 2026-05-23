@@ -27,6 +27,17 @@ def validate_loss(loss: torch.Tensor, name: str = "loss") -> bool:
         return False
     return True
 
+def set_model_training_step(model, step: int):
+    setter = getattr(model, "set_training_step", None)
+    if callable(setter):
+        setter(step)
+        return
+    base_model = getattr(model, "base_model", None)
+    inner_model = getattr(base_model, "model", None)
+    setter = getattr(inner_model, "set_training_step", None)
+    if callable(setter):
+        setter(step)
+
 def compute_chunk_training_weights(labels: torch.Tensor, attention_mask: torch.Tensor = None, chunk_size: int = 128):
     """
     Build TBPTT chunk weights that match the causal objective.
@@ -259,6 +270,7 @@ def should_update_progress(step: int, args, total_steps: int = None, first_step:
 def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, running_states, collect_metrics=True):
     """Training step with temporal chunking to match original hierarchos.py."""
     device = next(model.parameters()).device
+    set_model_training_step(model, getattr(args, '_current_global_step', step))
     _nb = (device.type == 'cuda')  # non_blocking for async CUDA transfer
     full_input_ids = batch['input_ids']
     full_attention_mask = batch.get('attention_mask')
@@ -926,6 +938,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
 
             first_logged_step = start_step if epoch == start_epoch else 0
             collect_metrics = should_update_progress(step, args, dataloader_len, first_logged_step)
+            args._current_global_step = epoch * dataloader_len + step
             outputs, running_states = train_step(
                 model,
                 batch,
@@ -1298,6 +1311,7 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
             if attention_mask is not None:
                 attention_mask = attention_mask.to(device, non_blocking=non_blocking)
             labels = labels.to(device, non_blocking=non_blocking)
+            set_model_training_step(model, epoch * dataloader_len + i)
 
             autocast_device_type = 'cpu' if is_directml_device(device) else device.type
             with autocast(device_type=autocast_device_type, dtype=amp_dtype, enabled=use_amp):

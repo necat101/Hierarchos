@@ -27,6 +27,15 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from ..utils.device import is_directml_device
 from ..utils.checkpoint import load_full_model_with_config
+from .chat_state import (
+    CHAT_STATE_KIND,
+    CHAT_STATE_VERSION,
+    chat_state_config_signature,
+    normalize_recurrent_state_for_model,
+    recurrent_state_metadata,
+    tensor_to_cpu,
+    validate_chat_state_payload_compatible,
+)
 
 # --- Signal Handling for Interrupt ---
 _interrupt_flag = False
@@ -156,31 +165,12 @@ def parse_temperature_setting(raw_value: str) -> float:
     return stepped
 
 
-def _chat_state_config_signature(config):
-    """Small architecture fingerprint for model-neutral chat state files."""
-    keys = (
-        "context_dim",
-        "h_hidden",
-        "l_hidden",
-        "h_stride",
-        "max_h_steps",
-        "max_l_steps",
-        "vocab_size",
-    )
-    signature = {}
-    for key in keys:
-        if hasattr(config, key):
-            value = getattr(config, key)
-            try:
-                value = int(value)
-            except Exception:
-                pass
-            signature[key] = value
-    return signature
+def _chat_state_config_signature(config, model=None):
+    return chat_state_config_signature(config, model)
 
 
 def _tensor_to_cpu(value):
-    return value.detach().cpu().clone() if torch.is_tensor(value) else None
+    return tensor_to_cpu(value)
 
 
 def _default_chat_state_path(model_path: str) -> str:
@@ -199,6 +189,7 @@ def save_hierarchical_chat_state(
     path,
     *,
     config,
+    model=None,
     model_path,
     h_state,
     l_state,
@@ -215,11 +206,11 @@ def save_hierarchical_chat_state(
     os.makedirs(os.path.dirname(path), exist_ok=True)
     rosa_past_tokens = _rosa_past_tokens_from_ltm_state(ltm_state)
     payload = {
-        "version": 1,
-        "kind": "hierarchos_chat_runtime_state",
+        "version": CHAT_STATE_VERSION,
+        "kind": CHAT_STATE_KIND,
         "saved_at": time.time(),
         "model_path": os.path.abspath(model_path) if model_path else None,
-        "config_signature": _chat_state_config_signature(config),
+        "config_signature": _chat_state_config_signature(config, model=model),
         "total_tokens_generated": int(total_tokens_generated or 0),
         "h_state": _tensor_to_cpu(h_state),
         "l_state": _tensor_to_cpu(l_state),
@@ -228,39 +219,58 @@ def save_hierarchical_chat_state(
         "drift_state": _tensor_to_cpu(drift_state),
         "rosa_past_tokens": rosa_past_tokens,
     }
+    payload.update(
+        recurrent_state_metadata(
+            model=model,
+            config=config,
+            h_state=h_state,
+            l_state=l_state,
+        )
+    )
     tmp_path = path + ".tmp"
     torch.save(payload, tmp_path)
     os.replace(tmp_path, path)
     return path
 
 
-def load_hierarchical_chat_state(path, *, config, device):
+def load_hierarchical_chat_state(path, *, config, device, model=None):
     """Load a tiny chat state file without restoring LTM working memory."""
     path = _normalize_chat_state_path(path)
     if not os.path.exists(path):
         raise FileNotFoundError(f"Chat state file not found: {path}")
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    if not isinstance(payload, dict) or payload.get("kind") != "hierarchos_chat_runtime_state":
+    if not isinstance(payload, dict) or payload.get("kind") != CHAT_STATE_KIND:
         raise RuntimeError(f"Not a Hierarchos chat runtime state file: {path}")
 
-    saved = payload.get("config_signature") or {}
-    current = _chat_state_config_signature(config)
-    for key in ("context_dim", "h_hidden", "l_hidden", "vocab_size"):
-        if key in saved and key in current and saved[key] != current[key]:
-            raise RuntimeError(
-                f"Chat state was saved for {key}={saved[key]}, "
-                f"but the loaded model has {key}={current[key]}."
-            )
+    validate_chat_state_payload_compatible(payload, config, model=model)
 
     def tensor(name):
         value = payload.get(name)
         if torch.is_tensor(value):
             return value.to(device)
         return None
+    
+    h_state = tensor("h_state")
+    l_state = tensor("l_state")
+    if model is not None:
+        if h_state is not None:
+            h_state = normalize_recurrent_state_for_model(
+                h_state,
+                model,
+                "h_rnn",
+                device=device,
+            )
+        if l_state is not None:
+            l_state = normalize_recurrent_state_for_model(
+                l_state,
+                model,
+                "l_rnn",
+                device=device,
+            )
 
     return {
-        "h_state": tensor("h_state"),
-        "l_state": tensor("l_state"),
+        "h_state": h_state,
+        "l_state": l_state,
         "prev_context": tensor("prev_context"),
         "target_context": tensor("target_context"),
         "drift_state": tensor("drift_state"),
@@ -826,6 +836,7 @@ def chat(args, device, tokenizer):
             save_hierarchical_chat_state(
                 path,
                 config=config,
+                model=model,
                 model_path=args.model_path,
                 h_state=h_state,
                 l_state=l_state,
@@ -914,6 +925,7 @@ def chat(args, device, tokenizer):
                     chat_state_path,
                     config=config,
                     device=rnn_device,
+                    model=model,
                 )
                 if restored["h_state"] is not None:
                     h_state = restored["h_state"]

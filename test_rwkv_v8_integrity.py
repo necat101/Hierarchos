@@ -1,10 +1,12 @@
 import unittest
 import os
+import tempfile
 
 import torch
 
 import hierarchos
 from hierarchos import AttrDict, HierarchosCore
+from hierarchos.inference.chat import load_hierarchical_chat_state, save_hierarchical_chat_state
 from hierarchos.models.core import _resolve_compile_kwargs
 from hierarchos.models.rwkv_cell import RWKVCell
 from hierarchos.utils.rosa import precompute_rosa_ids_for_chunks
@@ -459,6 +461,123 @@ class RWKVV8IntegrityTests(unittest.TestCase):
         for name, param in cell.named_parameters():
             if param.grad is not None:
                 self.assertTrue(torch.isfinite(param.grad).all(), f"{name} gradient is not finite")
+
+    def test_chat_state_export_records_rwkv_v8_layout(self):
+        torch.manual_seed(41)
+        cfg = _tiny_config()
+        model = HierarchosCore(cfg)
+        model.eval()
+
+        input_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
+        with torch.no_grad():
+            out = model(input_ids, return_topk_values=False)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "chat-state.pt")
+            save_hierarchical_chat_state(
+                path,
+                config=cfg,
+                model=model,
+                model_path=tmpdir,
+                h_state=out["h_state"],
+                l_state=out["l_state"],
+                prev_context=out["prev_context"],
+                target_context=out["target_context"],
+                drift_state=out["drift_state"],
+                ltm_state=out["ltm_memory_state"],
+                total_tokens_generated=input_ids.shape[1],
+            )
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+
+            self.assertEqual(payload["version"], 2)
+            self.assertEqual(payload["recurrent_state_layout"]["h"]["layout"], "rwkv_v8_matrix_packed")
+            self.assertEqual(payload["recurrent_state_layout"]["h"]["head_size"], model.h_rnn.head_size)
+            self.assertEqual(payload["recurrent_state_layout"]["h"]["state_size"], model.h_rnn.state_size)
+            self.assertEqual(payload["recurrent_state_shapes"]["h_state"], list(out["h_state"].shape))
+
+            restored = load_hierarchical_chat_state(path, config=cfg, device="cpu", model=model)
+            self.assertEqual(tuple(restored["h_state"].shape), tuple(out["h_state"].shape))
+            self.assertEqual(tuple(restored["l_state"].shape), tuple(out["l_state"].shape))
+
+    def test_chat_state_loader_migrates_legacy_five_slot_state_to_v8(self):
+        torch.manual_seed(43)
+        cfg = _tiny_config()
+        model = HierarchosCore(cfg)
+        model.eval()
+
+        legacy_h = torch.zeros(1, cfg.h_hidden, 5)
+        legacy_l = torch.zeros(1, cfg.l_hidden, 5)
+        legacy_h[:, :, 0] = torch.randn(1, cfg.h_hidden)
+        legacy_h[:, :, 4] = torch.randn(1, cfg.h_hidden)
+        legacy_l[:, :, 0] = torch.randn(1, cfg.l_hidden)
+        legacy_l[:, :, 4] = torch.randn(1, cfg.l_hidden)
+        legacy_h[:, :, 3] = -1e30
+        legacy_l[:, :, 3] = -1e30
+
+        payload = {
+            "version": 1,
+            "kind": "hierarchos_chat_runtime_state",
+            "config_signature": {
+                "context_dim": cfg.context_dim,
+                "h_hidden": cfg.h_hidden,
+                "l_hidden": cfg.l_hidden,
+                "vocab_size": cfg.vocab_size,
+            },
+            "h_state": legacy_h,
+            "l_state": legacy_l,
+            "prev_context": torch.zeros(1, cfg.context_dim),
+            "target_context": torch.zeros(1, cfg.context_dim),
+            "drift_state": torch.zeros(1, cfg.context_dim),
+            "total_tokens_generated": 7,
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "legacy-chat-state.pt")
+            torch.save(payload, path)
+            restored = load_hierarchical_chat_state(path, config=cfg, device="cpu", model=model)
+
+        self.assertEqual(tuple(restored["h_state"].shape), (1, cfg.h_hidden, model.h_rnn.state_size))
+        self.assertEqual(tuple(restored["l_state"].shape), (1, cfg.l_hidden, model.l_rnn.state_size))
+        torch.testing.assert_close(restored["h_state"][:, :, 0], legacy_h[:, :, 0])
+        torch.testing.assert_close(restored["h_state"][:, :, 1], legacy_h[:, :, 4])
+        torch.testing.assert_close(restored["l_state"][:, :, 0], legacy_l[:, :, 0])
+        torch.testing.assert_close(restored["l_state"][:, :, 1], legacy_l[:, :, 4])
+        self.assertEqual(restored["total_tokens_generated"], 7)
+
+    def test_chat_state_loader_rejects_mismatched_v8_head_layout(self):
+        torch.manual_seed(47)
+        cfg = _tiny_config()
+        model = HierarchosCore(cfg)
+        model.eval()
+
+        other_cfg = _tiny_config()
+        other_cfg.rwkv_head_size = 8
+        other_model = HierarchosCore(other_cfg)
+        other_model.eval()
+        self.assertNotEqual(model.h_rnn.state_size, other_model.h_rnn.state_size)
+
+        input_ids = torch.tensor([[1, 2]], dtype=torch.long)
+        with torch.no_grad():
+            out = model(input_ids, return_topk_values=False)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "chat-state.pt")
+            save_hierarchical_chat_state(
+                path,
+                config=cfg,
+                model=model,
+                model_path=tmpdir,
+                h_state=out["h_state"],
+                l_state=out["l_state"],
+                prev_context=out["prev_context"],
+                target_context=out["target_context"],
+                drift_state=out["drift_state"],
+                ltm_state=out["ltm_memory_state"],
+                total_tokens_generated=input_ids.shape[1],
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "recurrent layout mismatch"):
+                load_hierarchical_chat_state(path, config=other_cfg, device="cpu", model=other_model)
 
 
 if __name__ == "__main__":

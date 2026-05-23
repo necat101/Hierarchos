@@ -299,34 +299,15 @@ def _chat_state_config_signature():
     """Small architecture fingerprint for model-neutral chat state files."""
     if not _config:
         return {}
-    keys = (
-        "context_dim",
-        "h_hidden",
-        "l_hidden",
-        "h_stride",
-        "max_h_steps",
-        "max_l_steps",
-        "vocab_size",
-    )
-    signature = {}
-    for key in keys:
-        if key in _config:
-            try:
-                signature[key] = int(_config[key])
-            except Exception:
-                signature[key] = _config[key]
-    return signature
+    from hierarchos.inference.chat_state import chat_state_config_signature
+
+    return chat_state_config_signature(_config, _model)
 
 
 def _tensor_to_cpu(value):
-    try:
-        import torch
+    from hierarchos.inference.chat_state import tensor_to_cpu
 
-        if torch.is_tensor(value):
-            return value.detach().cpu().clone()
-    except Exception:
-        pass
-    return None
+    return tensor_to_cpu(value)
 
 
 def _rosa_past_tokens_from_ltm_state(ltm_state):
@@ -376,7 +357,7 @@ def _write_chat_runtime_state(path: str):
     import torch
 
     payload = {
-        "version": 1,
+        "version": 2,
         "kind": "hierarchos_chat_runtime_state",
         "saved_at": time.time(),
         "model_dir": _model_dir,
@@ -389,6 +370,16 @@ def _write_chat_runtime_state(path: str):
         "drift_state": _tensor_to_cpu(_drift_state),
         "rosa_past_tokens": _rosa_past_tokens_from_ltm_state(_ltm_state),
     }
+    from hierarchos.inference.chat_state import recurrent_state_metadata
+
+    payload.update(
+        recurrent_state_metadata(
+            model=_model,
+            config=_config,
+            h_state=_h_state,
+            l_state=_l_state,
+        )
+    )
 
     temp_path = path + ".tmp"
     torch.save(payload, temp_path)
@@ -397,14 +388,9 @@ def _write_chat_runtime_state(path: str):
 
 
 def _validate_chat_state_signature(payload: dict):
-    saved = payload.get("config_signature") or {}
-    current = _chat_state_config_signature()
-    for key in ("context_dim", "h_hidden", "l_hidden", "vocab_size"):
-        if key in saved and key in current and saved[key] != current[key]:
-            raise RuntimeError(
-                f"Chat state was saved for {key}={saved[key]}, "
-                f"but the loaded model has {key}={current[key]}."
-            )
+    from hierarchos.inference.chat_state import validate_chat_state_payload_compatible
+
+    validate_chat_state_payload_compatible(payload, _config, model=_model)
 
 
 def _load_chat_runtime_state(path: str):
@@ -423,8 +409,20 @@ def _load_chat_runtime_state(path: str):
         raise RuntimeError(f"Not a Hierarchos chat runtime state file: {path}")
 
     _validate_chat_state_signature(payload)
-    _h_state = payload.get("h_state")
-    _l_state = payload.get("l_state")
+    from hierarchos.inference.chat_state import normalize_recurrent_state_for_model
+
+    _h_state = normalize_recurrent_state_for_model(
+        payload.get("h_state"),
+        _model,
+        "h_rnn",
+        device="cpu",
+    )
+    _l_state = normalize_recurrent_state_for_model(
+        payload.get("l_state"),
+        _model,
+        "l_rnn",
+        device="cpu",
+    )
     _prev_context = payload.get("prev_context")
     _target_context = payload.get("target_context")
     _drift_state = payload.get("drift_state")

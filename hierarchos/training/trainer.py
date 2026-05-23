@@ -267,6 +267,14 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
         full_input_ids, full_labels, full_attention_mask
     )
     chunk_size = getattr(args, 'training_chunk_size', 128)
+    padding_stats = None
+    if collect_metrics:
+        pre_static_tokens = int(full_input_ids.numel())
+        pre_static_seq_len = int(full_input_ids.shape[1]) if full_input_ids.ndim == 2 else 0
+        if isinstance(full_attention_mask, torch.Tensor):
+            real_tokens = int(full_attention_mask.sum().item())
+        else:
+            real_tokens = pre_static_tokens
     if (
         device.type == 'cuda'
         and getattr(args, 'compile', False)
@@ -279,6 +287,18 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
             multiple=chunk_size,
             pad_token_id=getattr(args, 'pad_token_id', 0),
         )
+    if collect_metrics:
+        total_tokens = int(full_input_ids.numel())
+        padded_seq_len = int(full_input_ids.shape[1]) if full_input_ids.ndim == 2 else 0
+        padding_tokens = max(0, total_tokens - real_tokens)
+        padding_stats = {
+            "token_efficiency": real_tokens / float(max(1, total_tokens)),
+            "padding_fraction": padding_tokens / float(max(1, total_tokens)),
+            "bucket_padding_tokens": max(0, pre_static_tokens - real_tokens),
+            "compile_padding_tokens": max(0, total_tokens - pre_static_tokens),
+            "seq_len": padded_seq_len,
+            "pre_static_seq_len": pre_static_seq_len,
+        }
     
     # --- [NEW] Track Sequence Poisoning (Parity Fix) ---
     if full_labels.is_floating_point() and torch.isnan(full_labels).any():
@@ -554,6 +574,8 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                 'ponder_cost': total_ponder.detach() if has_ponder else None,
                 'commitment_cost': total_commit.detach() if has_commitment else None,
             }
+            if padding_stats is not None:
+                avg_outputs.update(padding_stats)
         
         next_states = (h_state, l_state, prev_ctx, target_ctx, drift_state, ltm_state)
         return avg_outputs, next_states
@@ -915,6 +937,9 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                     postfix["ponder"] = f"{outputs['ponder_cost'].item():.2f}"
                 if outputs.get('commitment_cost') is not None:
                     postfix["commit"] = f"{outputs['commitment_cost'].item():.2e}"
+                if outputs.get('token_efficiency') is not None:
+                    postfix["tok_eff"] = f"{outputs['token_efficiency'] * 100.0:.1f}%"
+                    postfix["seq"] = int(outputs.get('seq_len', 0) or 0)
                 if scheduler:
                     postfix["lr"] = f"{scheduler.get_last_lr()[0]:.2e}"
                 pbar.set_postfix(postfix)

@@ -135,6 +135,22 @@ def _length_bucketing_enabled(args, default=True):
         return bool(default)
     return bool(value)
 
+def resolve_length_bucket_size(length_bucket_size, device, batch_size, hf_token_cache=False):
+    if length_bucket_size is not None:
+        return length_bucket_size, None
+    device_type = getattr(device, "type", str(device)).lower()
+    if device_type == "cuda" and int(batch_size or 1) >= 64:
+        if bool(hf_token_cache):
+            return (
+                65536,
+                "INFO: Length bucket window auto-set to 65536 for CUDA batch>=64 with HF token cache.",
+            )
+        return (
+            8192,
+            "INFO: Length bucket window auto-set to 8192 for CUDA batch>=64.",
+        )
+    return length_bucket_size, None
+
 
 def _hf_shard_cache_key(args, num_shards):
     payload = {
@@ -746,7 +762,7 @@ def main():
     train_group.add_argument("--prefetch-factor", "--prefetch_factor", dest="prefetch_factor", type=int, default=None, help="Batches prefetched per DataLoader worker (auto keeps total queued batches tied to worker count).")
     train_group.add_argument("--pt-cache-size", "--pt_cache_size", dest="pt_cache_size", type=int, default=2, help="Number of .pt chunk files to keep hot per worker for --pre_pt_dataset.")
     train_group.add_argument("--no-length-bucketing", dest="length_bucketing", action="store_false", help="Disable length-aware batching for training datasets.")
-    train_group.add_argument("--length-bucket-size", "--length_bucket_size", dest="length_bucket_size", type=int, default=None, help="Samples per length bucket/window. Larger lowers padding; smaller lowers streaming latency.")
+    train_group.add_argument("--length-bucket-size", "--length_bucket_size", dest="length_bucket_size", type=int, default=None, help="Samples per length bucket/window. Larger lowers padding; smaller lowers streaming latency. CUDA batch>=64 auto-uses 65536 with HF token cache, otherwise 8192.")
     train_group.add_argument("--no-streaming-datasets", dest="streaming_datasets", action="store_false", help="Disable streaming for raw JSONL/Hugging Face datasets and use map-style loading.")
     train_group.add_argument("--hf-streaming-shuffle-buffer", "--hf_streaming_shuffle_buffer", dest="hf_streaming_shuffle_buffer", type=int, default=10000, help="Buffered shuffle size for Hugging Face streaming datasets.")
     train_group.add_argument("--hf-auto-shard", dest="hf_auto_shard", action="store_true", help="Opt into local tokenized shard caching for single-shard HF streaming datasets.")
@@ -852,13 +868,14 @@ def main():
         setup_msvc_environment()
     pt_device = pick_device(args)
     args.num_workers = resolve_num_workers(args.num_workers, pt_device, args.batch_size)
-    if (
-        pt_device.type == "cuda"
-        and args.length_bucket_size is None
-        and int(args.batch_size or 1) >= 64
-    ):
-        args.length_bucket_size = 8192
-        print("INFO: Length bucket window auto-set to 8192 for CUDA batch>=64.")
+    args.length_bucket_size, bucket_message = resolve_length_bucket_size(
+        args.length_bucket_size,
+        pt_device,
+        args.batch_size,
+        hf_token_cache=getattr(args, "hf_token_cache", False),
+    )
+    if bucket_message:
+        print(bucket_message)
     print(f"INFO: DataLoader workers set to {args.num_workers} for device={pt_device}.")
     
     # Tokenizer Loading

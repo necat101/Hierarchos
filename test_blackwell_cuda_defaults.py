@@ -3,7 +3,7 @@ from unittest import mock
 
 from hierarchos.training.datasets import _resolve_prefetch_factor
 from hierarchos.training.trainer import estimate_cuda_loss_chunk_rows
-from hierarchos_cli import resolve_num_workers
+from hierarchos_cli import resolve_length_bucket_size, resolve_num_workers
 
 
 class _Device:
@@ -15,6 +15,15 @@ class BlackwellCudaDefaultTests(unittest.TestCase):
         with mock.patch("os.cpu_count", return_value=24):
             self.assertEqual(resolve_num_workers(-1, _Device(), 64), 8)
             self.assertEqual(resolve_num_workers(-1, _Device(), 32), 4)
+
+    def test_cuda_hf_token_cache_uses_large_bucket_window(self):
+        size, message = resolve_length_bucket_size(None, _Device(), 64, hf_token_cache=True)
+        self.assertEqual(size, 65536)
+        self.assertIn("HF token cache", message)
+
+        size, message = resolve_length_bucket_size(None, _Device(), 64, hf_token_cache=False)
+        self.assertEqual(size, 8192)
+        self.assertIn("CUDA batch>=64", message)
 
     def test_pin_memory_prefetch_keeps_two_batches_per_worker_at_eight_workers(self):
         self.assertEqual(_resolve_prefetch_factor(8, prefetch_factor=None, pin_memory=True), 2)

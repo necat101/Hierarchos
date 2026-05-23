@@ -267,8 +267,14 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
         full_input_ids, full_labels, full_attention_mask
     )
     chunk_size = getattr(args, 'training_chunk_size', 128)
+    padding_metric_steps = int(getattr(args, 'padding_metric_steps', 100) or 0)
+    collect_padding_metrics = (
+        collect_metrics
+        and bool(getattr(args, 'padding_metrics', True))
+        and (padding_metric_steps < 0 or step < padding_metric_steps)
+    )
     padding_stats = None
-    if collect_metrics:
+    if collect_padding_metrics:
         pre_static_tokens = int(full_input_ids.numel())
         pre_static_seq_len = int(full_input_ids.shape[1]) if full_input_ids.ndim == 2 else 0
         if isinstance(full_attention_mask, torch.Tensor):
@@ -287,7 +293,7 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
             multiple=chunk_size,
             pad_token_id=getattr(args, 'pad_token_id', 0),
         )
-    if collect_metrics:
+    if collect_padding_metrics:
         total_tokens = int(full_input_ids.numel())
         padded_seq_len = int(full_input_ids.shape[1]) if full_input_ids.ndim == 2 else 0
         padding_tokens = max(0, total_tokens - real_tokens)

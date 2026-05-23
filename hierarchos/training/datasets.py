@@ -605,6 +605,8 @@ class TokenizedBinaryDataset(Dataset):
         index = torch.load(index_path, map_location="cpu")
         self.offsets = index["offsets"].to(dtype=torch.long).contiguous()
         self.lengths = index["lengths"].to(dtype=torch.long).contiguous()
+        self.has_rosa_ids = bool(index.get("has_rosa_ids", False))
+        self.rosa_sentinel = int(index.get("rosa_sentinel", 0))
         if self.offsets.numel() != self.lengths.numel():
             raise ValueError("Token cache index offsets/lengths size mismatch")
         self.sample_lengths = [
@@ -660,11 +662,21 @@ class TokenizedBinaryDataset(Dataset):
         label_offset = offset + (stored_length * 4)
         input_ids = torch.frombuffer(self._mmap, dtype=torch.int32, count=length, offset=offset)
         labels = torch.frombuffer(self._mmap, dtype=torch.int32, count=length, offset=label_offset)
-        return {
+        item = {
             "input_ids": input_ids,
             "labels": labels,
             "_length": length,
         }
+        if self.has_rosa_ids:
+            rosa_offset = label_offset + (stored_length * 4)
+            item["rosa_ids"] = torch.frombuffer(
+                self._mmap,
+                dtype=torch.int32,
+                count=length,
+                offset=rosa_offset,
+            )
+            item["_rosa_sentinel"] = self.rosa_sentinel
+        return item
 
     def get_sample_lengths(self):
         return self.sample_lengths
@@ -1105,6 +1117,13 @@ def _collate_training_batch(batch, pad_token_id):
     ids = torch.full((len(batch), ml), pad_token_id, dtype=torch.long)
     labels = torch.full((len(batch), ml), -100, dtype=torch.long)
     mask = torch.zeros((len(batch), ml), dtype=torch.long)
+    has_rosa_ids = any("rosa_ids" in item for item in batch)
+    rosa_ids = None
+    if has_rosa_ids:
+        sentinel = next((int(item.get("_rosa_sentinel")) for item in batch if "_rosa_sentinel" in item), None)
+        if sentinel is None:
+            raise ValueError("Cached ROSA samples must include _rosa_sentinel")
+        rosa_ids = torch.full((len(batch), ml), sentinel, dtype=torch.long)
     for i, item in enumerate(batch):
         item_ids = _as_long_tensor(item["input_ids"])
         item_labels = _as_long_tensor(item["labels"])
@@ -1117,7 +1136,15 @@ def _collate_training_batch(batch, pad_token_id):
         ids[i, :sl] = item_ids[:sl]
         labels[i, :sl] = item_labels[:sl]
         mask[i, :sl] = item_mask[:sl] if item_mask is not None else 1
-    return {"input_ids": ids, "labels": labels, "attention_mask": mask}
+        if rosa_ids is not None:
+            if "rosa_ids" not in item:
+                raise ValueError("Cannot mix cached-ROSA and live-ROSA samples in one batch")
+            item_rosa = _as_long_tensor(item["rosa_ids"])
+            rosa_ids[i, :min(sl, item_rosa.numel())] = item_rosa[:min(sl, item_rosa.numel())]
+    batch_out = {"input_ids": ids, "labels": labels, "attention_mask": mask}
+    if rosa_ids is not None:
+        batch_out["rosa_ids"] = rosa_ids
+    return batch_out
 
 def _collate_fn_dynamic_padding(batch, pad_token_id):
     return _collate_training_batch(batch, pad_token_id)

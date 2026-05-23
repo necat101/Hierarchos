@@ -299,39 +299,48 @@ if _NUMBA_OK:
         d = np.zeros(s, dtype=np.int64)       # lengths
         e = np.full(s, -1, dtype=np.int64)    # endpos (rightmost)
 
-        # Transitions stored as parallel arrays (state, symbol) -> target
-        # Use a simple dict-like structure via sorted arrays per state
-        # For Numba, we use a flat array of (parent, symbol, child) triples
+        # Transitions stored as an adjacency list mapped to contiguous flat arrays
+        # head[state] points to the first transition index.
+        # next_tr[tr_idx] points to the next transition index for the same parent.
         MAX_TRANS = 4 * n + 4
-        tr_parent = np.full(MAX_TRANS, -1, dtype=np.int64)
+        head = np.full(s, -1, dtype=np.int64)
+        next_tr = np.full(MAX_TRANS, -1, dtype=np.int64)
         tr_symbol = np.full(MAX_TRANS, -1, dtype=np.int64)
         tr_child = np.full(MAX_TRANS, -1, dtype=np.int64)
         tr_count = 0
 
         def _find_trans(parent, symbol):
-            """Linear scan for transition. Fast for small fan-out (typical for token-level SA)."""
-            for idx in range(tr_count):
-                if tr_parent[idx] == parent and tr_symbol[idx] == symbol:
+            """Scan only the outgoing transitions of parent state using adjacency list."""
+            idx = head[parent]
+            while idx != -1:
+                if tr_symbol[idx] == symbol:
                     return tr_child[idx], idx
+                idx = next_tr[idx]
             return -1, -1
 
         def _set_trans(parent, symbol, child):
             nonlocal tr_count
-            for idx in range(tr_count):
-                if tr_parent[idx] == parent and tr_symbol[idx] == symbol:
+            # Try to update existing transition
+            idx = head[parent]
+            while idx != -1:
+                if tr_symbol[idx] == symbol:
                     tr_child[idx] = child
                     return
+                idx = next_tr[idx]
+            # Create new transition
             if tr_count < MAX_TRANS:
-                tr_parent[tr_count] = parent
                 tr_symbol[tr_count] = symbol
                 tr_child[tr_count] = child
+                next_tr[tr_count] = head[parent]
+                head[parent] = tr_count
                 tr_count += 1
 
         def _copy_trans(src_state, dst_state):
-            """Copy all transitions from src to dst."""
-            for idx in range(tr_count):
-                if tr_parent[idx] == src_state:
-                    _set_trans(dst_state, tr_symbol[idx], tr_child[idx])
+            """Copy all transitions of src_state to dst_state."""
+            idx = head[src_state]
+            while idx != -1:
+                _set_trans(dst_state, tr_symbol[idx], tr_child[idx])
+                idx = next_tr[idx]
 
         g = 0  # last state
         z = 1  # next free state
@@ -471,6 +480,51 @@ def rosa_batch_parallel(
 # ─────────────────────────────────────────────────────────────
 # Async GPU Pipeline
 # ─────────────────────────────────────────────────────────────
+def precompute_rosa_ids_for_chunks(
+    tokens: List[int],
+    vocab_size: int,
+    chunk_size: int,
+    rosa_max_ctx: int = 512,
+) -> List[int]:
+    """
+    Precompute the exact ROSA ids produced by the training forward path.
+
+    The live path caps ROSA context at the TBPTT chunk boundary, not separately
+    for each token, so this mirrors rosa_async_pipeline chunk-by-chunk.
+    """
+    tokens = [int(token) for token in tokens]
+    total = len(tokens)
+    if total == 0:
+        return []
+
+    no_prediction = int(vocab_size)
+    chunk_size = max(1, int(chunk_size or total))
+    rosa_max_ctx = max(1, int(rosa_max_ctx or total))
+    cached = [no_prediction] * total
+
+    for start in range(0, total, chunk_size):
+        end = min(start + chunk_size, total)
+        window_start = max(0, end - rosa_max_ctx)
+        window = tokens[window_start:end]
+        overlap_start = max(window_start, start)
+        overlap_len = max(0, end - overlap_start)
+        current_len = end - start
+        current_pad_len = max(0, current_len - overlap_len)
+
+        if overlap_len > 0:
+            window_preds = _rosa_jit(window) if _NUMBA_OK and _rosa_jit is not None else ROSA(window)
+            preds = window_preds[-overlap_len:]
+        else:
+            preds = []
+        rosa_chunk = ([-1] * current_pad_len) + preds
+        cached[start:end] = [
+            no_prediction if int(pred) == -1 else int(pred)
+            for pred in rosa_chunk
+        ]
+
+    return cached
+
+
 class _ImmediateFuture:
     """A future-like object that wraps an already-computed value."""
     __slots__ = ("_value",)

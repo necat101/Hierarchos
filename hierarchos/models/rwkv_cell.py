@@ -157,6 +157,15 @@ class RWKVCell(nn.Module):
             dtype=dtype,
         )
 
+    def _empty_state(self, batch_size: int, device=None, dtype=torch.float32) -> torch.Tensor:
+        return torch.empty(
+            int(batch_size),
+            self.n_embd,
+            self.state_size,
+            device=device,
+            dtype=dtype,
+        )
+
     def state_hidden(self, state: torch.Tensor) -> torch.Tensor:
         if state is None:
             raise ValueError("state_hidden requires a non-None state")
@@ -297,11 +306,12 @@ class RWKVCell(nn.Module):
             ffn = ffn * deepemb_vec.to(dtype=ffn.dtype, device=ffn.device)
         x = x_resid_cm + self.value_cm(ffn)
 
-        new_state = self.initial_state(B, device=x.device, dtype=torch.float32)
-        new_state[:, :, 0] = x_norm.float()
-        new_state[:, :, 1] = x_norm2.float()
-        new_state[:, :, 2] = v_first.float()
-        new_state[:, :, 3:] = state_f.reshape(B, C, N)
+        new_state = torch.cat([
+            x_norm.float().unsqueeze(-1),
+            x_norm2.float().unsqueeze(-1),
+            v_first.float().unsqueeze(-1),
+            state_f.reshape(B, C, N)
+        ], dim=-1)
         if self.state_clamp is not None:
             new_state = torch.clamp(new_state, min=-self.state_clamp, max=self.state_clamp)
 

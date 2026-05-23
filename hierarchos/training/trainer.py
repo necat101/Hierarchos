@@ -275,11 +275,14 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
     full_input_ids = batch['input_ids']
     full_attention_mask = batch.get('attention_mask')
     full_labels = batch['labels']
+    full_rosa_ids = batch.get('rosa_ids')
     full_input_ids, full_labels, full_attention_mask = trim_trailing_padding(
         full_input_ids, full_labels, full_attention_mask
     )
+    if full_rosa_ids is not None:
+        full_rosa_ids = full_rosa_ids[:, :full_input_ids.shape[1]].contiguous()
     chunk_size = getattr(args, 'training_chunk_size', 128)
-    padding_metric_steps = int(getattr(args, 'padding_metric_steps', 100) or 0)
+    padding_metric_steps = int(getattr(args, 'padding_metric_steps', 0) or 0)
     collect_padding_metrics = (
         collect_metrics
         and bool(getattr(args, 'padding_metrics', True))
@@ -298,6 +301,7 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
         and getattr(args, 'compile', False)
         and getattr(args, 'compile_pad_to_chunk_size', True)
     ):
+        pre_pad_seq_len = full_input_ids.shape[1]
         full_input_ids, full_labels, full_attention_mask = pad_training_batch_to_multiple(
             full_input_ids,
             full_labels,
@@ -305,6 +309,11 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
             multiple=chunk_size,
             pad_token_id=getattr(args, 'pad_token_id', 0),
         )
+        if full_rosa_ids is not None and full_input_ids.shape[1] > pre_pad_seq_len:
+            pad_cols = full_input_ids.shape[1] - pre_pad_seq_len
+            rosa_sentinel = int(getattr(model.config, 'vocab_size', getattr(args, 'vocab_size', 0)))
+            rosa_pad = full_rosa_ids.new_full((full_rosa_ids.shape[0], pad_cols), rosa_sentinel)
+            full_rosa_ids = torch.cat([full_rosa_ids, rosa_pad], dim=1).contiguous()
     if collect_padding_metrics:
         total_tokens = int(full_input_ids.numel())
         padded_seq_len = int(full_input_ids.shape[1]) if full_input_ids.ndim == 2 else 0
@@ -372,6 +381,7 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
     full_input_ids = full_input_ids.to(device, non_blocking=_nb)
     if full_attention_mask is not None: full_attention_mask = full_attention_mask.to(device, non_blocking=_nb)
     full_labels = full_labels.to(device, non_blocking=_nb)
+    if full_rosa_ids is not None: full_rosa_ids = full_rosa_ids.to(device, non_blocking=_nb)
     
     total_loss = torch.zeros((), device=device, dtype=torch.float32)
     total_ponder = torch.zeros((), device=device, dtype=torch.float32)
@@ -402,6 +412,7 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
             input_ids = full_input_ids[:, start_t:end_t]
             attention_mask = full_attention_mask[:, start_t:end_t] if full_attention_mask is not None else None
             labels = full_labels[:, start_t:end_t]
+            rosa_ids = full_rosa_ids[:, start_t:end_t] if full_rosa_ids is not None else None
             
             with autocast(device_type=autocast_device, dtype=amp_dtype, enabled=args.amp):
                 outputs = model(
@@ -410,7 +421,8 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                     target_context=target_ctx, drift_state=drift_state, ltm_memory_state=ltm_state,
                     global_pos_offset=start_t,
                     return_logits=not fast_lm_loss,
-                    return_topk_values=False
+                    return_topk_values=False,
+                    rosa_ids=rosa_ids,
                 )
                 
                 # LTM fast-memory update needs gradients from the exact tensors used
@@ -1303,19 +1315,24 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
             input_ids = batch["input_ids"]
             attention_mask = batch.get("attention_mask")
             labels = batch["labels"]
+            rosa_ids = batch.get("rosa_ids")
             input_ids, labels, attention_mask = trim_trailing_padding(
                 input_ids, labels, attention_mask
             )
+            if rosa_ids is not None:
+                rosa_ids = rosa_ids[:, :input_ids.shape[1]].contiguous()
             non_blocking = device.type == 'cuda'
             input_ids = input_ids.to(device, non_blocking=non_blocking)
             if attention_mask is not None:
                 attention_mask = attention_mask.to(device, non_blocking=non_blocking)
             labels = labels.to(device, non_blocking=non_blocking)
+            if rosa_ids is not None:
+                rosa_ids = rosa_ids.to(device, non_blocking=non_blocking)
             set_model_training_step(model, epoch * dataloader_len + i)
 
             autocast_device_type = 'cpu' if is_directml_device(device) else device.type
             with autocast(device_type=autocast_device_type, dtype=amp_dtype, enabled=use_amp):
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels, rosa_ids=rosa_ids)
                 
                 # AMP FIX: Cast topk_vals to float32 before retain_grad (same fix as train path).
                 # Prevents masked_scatter_ dtype mismatch crash under BFloat16 AMP.

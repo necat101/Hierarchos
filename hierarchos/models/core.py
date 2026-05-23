@@ -441,6 +441,7 @@ class HierarchosCore(nn.Module):
         allow_hebbian_update = kwargs.pop("allow_hebbian_update", False)
         return_logits = kwargs.pop("return_logits", True)
         return_topk_values = kwargs.pop("return_topk_values", True)
+        cached_rosa_ids = kwargs.pop("rosa_ids", None)
         suppress_hebbian = kwargs.pop("suppress_hebbian", getattr(self, "suppress_hebbian", True))
         if allow_hebbian_update:
             suppress_hebbian = False
@@ -488,24 +489,46 @@ class HierarchosCore(nn.Module):
         if self.use_rosa:
             rosa_max_ctx = getattr(self.config, 'rosa_max_context', 512)
 
-            # --- Datacenter-Optimized Async ROSA Pipeline ---
-            # Launch CPU suffix automaton work immediately (overlaps with GPU tok_emb)
-            # Uses: Numba JIT, parallel batch threads, pinned memory, CUDA streams,
-            #       and persistent automaton state across TBPTT chunks
-            rosa_finalize = rosa_async_pipeline(
-                input_ids=input_ids,
-                past_tokens=past_tokens,
-                rosa_states=rosa_states,
-                vocab_size=self.config.vocab_size,
-                device=device,
-                rosa_max_ctx=rosa_max_ctx,
-            )
+            if cached_rosa_ids is None:
+                # --- Datacenter-Optimized Async ROSA Pipeline ---
+                # Launch CPU suffix automaton work immediately (overlaps with GPU tok_emb)
+                # Uses: Numba JIT, parallel batch threads, pinned memory, CUDA streams,
+                #       and persistent automaton state across TBPTT chunks
+                rosa_finalize = rosa_async_pipeline(
+                    input_ids=input_ids,
+                    past_tokens=past_tokens,
+                    rosa_states=rosa_states,
+                    vocab_size=self.config.vocab_size,
+                    device=device,
+                    rosa_max_ctx=rosa_max_ctx,
+                )
+            else:
+                if cached_rosa_ids.shape != input_ids.shape:
+                    raise ValueError(
+                        f"Cached ROSA shape {tuple(cached_rosa_ids.shape)} does not match "
+                        f"input_ids shape {tuple(input_ids.shape)}"
+                    )
+                no_prediction = int(self.config.vocab_size)
+                cached_rosa_ids = cached_rosa_ids.to(device=device, dtype=torch.long, non_blocking=(device.type == "cuda"))
+                cached_rosa_ids = torch.where(
+                    (cached_rosa_ids >= 0) & (cached_rosa_ids <= no_prediction),
+                    cached_rosa_ids,
+                    torch.full_like(cached_rosa_ids, no_prediction),
+                )
 
         x = self.tok_emb(input_ids)
 
         if self.use_rosa:
-            # Finalize: wait for CPU work, async H2D transfer
-            rosa_batch_tensor, rosa_input, new_rosa_states = rosa_finalize()
+            if cached_rosa_ids is None:
+                # Finalize: wait for CPU work, async H2D transfer
+                rosa_batch_tensor, rosa_input, new_rosa_states = rosa_finalize()
+                # Store past_tokens for cross-chunk continuity (capped by rosa_max_ctx)
+                # Detach and move to CPU immediately to prevent GPU memory leak across chunks
+                new_past_tokens = rosa_input.detach().cpu()
+            else:
+                rosa_batch_tensor = cached_rosa_ids
+                new_past_tokens = past_tokens
+                new_rosa_states = rosa_states
 
             rosa_embs = self.rosa_emb(rosa_batch_tensor)
             # Per-token router controls exact-memory injection without branching.
@@ -516,10 +539,6 @@ class HierarchosCore(nn.Module):
             rosa_gate = torch.sigmoid(torch.clamp(rosa_gate_logits, min=-50.0, max=50.0))
             rosa_gate = self._apply_memory_gate_warmup(rosa_gate)
             x = x + rosa_gate * rosa_embs  # Gated Neurosymbolic Inner Monologue Mix
-
-            # Store past_tokens for cross-chunk continuity (capped by rosa_max_ctx)
-            # Detach and move to CPU immediately to prevent GPU memory leak across chunks
-            new_past_tokens = rosa_input.detach().cpu()
         else:
             new_past_tokens = None
 

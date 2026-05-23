@@ -3,7 +3,13 @@ import unittest
 
 import torch
 
-from hierarchos.utils.rosa import ROSA, rosa_async_pipeline, rosa_batch_parallel, rosa_single
+from hierarchos.utils.rosa import (
+    ROSA,
+    precompute_rosa_ids_for_chunks,
+    rosa_async_pipeline,
+    rosa_batch_parallel,
+    rosa_single,
+)
 
 
 def _decode_sentinel(values, sentinel):
@@ -151,6 +157,40 @@ class ROSACorrectnessTests(unittest.TestCase):
 
         self.assertEqual(actual, ROSA(seq))
 
+    def test_async_resume_from_saved_past_tokens_without_automaton_state(self):
+        seq = [8, 1, 8, 1, 2, 8, 1, 2, 3, 8, 1, 2]
+        sentinel = 99
+        device = torch.device("cpu")
+
+        first = torch.tensor([seq[:7]], dtype=torch.long)
+        finalize = rosa_async_pipeline(
+            first,
+            past_tokens=None,
+            rosa_states=None,
+            vocab_size=sentinel,
+            device=device,
+            rosa_max_ctx=64,
+        )
+        _, saved_past, _states = finalize()
+
+        # Chat persistence stores the capped token window, not the Python
+        # automaton object. Rebuilding from saved tokens must preserve ROSA.
+        second = torch.tensor([seq[7:]], dtype=torch.long)
+        finalize = rosa_async_pipeline(
+            second,
+            past_tokens=saved_past,
+            rosa_states=None,
+            vocab_size=sentinel,
+            device=device,
+            rosa_max_ctx=64,
+        )
+        out, past, states = finalize()
+
+        expected = ROSA(seq)[7:]
+        self.assertEqual(_decode_sentinel(out[0].tolist(), sentinel), expected)
+        self.assertEqual(past.tolist(), [seq])
+        self.assertEqual(states[0].tokens, seq)
+
     def test_async_sliding_window_alignment(self):
         seq = [6, 3, 6, 3, 7, 6, 3, 8, 6]
         chunks = [2, 3, 1, 3]
@@ -202,6 +242,32 @@ class ROSACorrectnessTests(unittest.TestCase):
         self.assertEqual(_decode_sentinel(out[0].tolist(), sentinel), [-1, -1])
         self.assertEqual(past.tolist(), [[3]])
         self.assertEqual(states[0].tokens, [3])
+
+    def test_precomputed_chunk_ids_match_async_pipeline(self):
+        seq = [1, 2, 1, 2, 3, 1, 2, 4, 1, 2, 3, 5, 1]
+        sentinel = 99
+        chunk_size = 4
+        cap = 7
+        expected = precompute_rosa_ids_for_chunks(seq, sentinel, chunk_size, cap)
+
+        device = torch.device("cpu")
+        past = None
+        states = None
+        actual = []
+        for pos in range(0, len(seq), chunk_size):
+            cur = seq[pos:pos + chunk_size]
+            finalize = rosa_async_pipeline(
+                torch.tensor([cur], dtype=torch.long),
+                past,
+                states,
+                sentinel,
+                device,
+                rosa_max_ctx=cap,
+            )
+            out, past, states = finalize()
+            actual.extend(out[0].tolist())
+
+        self.assertEqual(actual, expected)
 
 
 if __name__ == "__main__":

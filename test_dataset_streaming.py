@@ -494,6 +494,8 @@ def test_cli_builds_and_uses_hf_token_cache():
     assert isinstance(dataloader.dataset, TokenizedBinaryDataset)
     assert isinstance(dataloader.batch_sampler, LengthGroupedBatchSampler)
     assert sum(batch["input_ids"].shape[0] for batch in batches) == len(rows)
+    assert all("rosa_ids" in batch for batch in batches)
+    assert all(batch["rosa_ids"].shape == batch["input_ids"].shape for batch in batches)
     assert max(_batch_length_spreads(batches)) <= 32
 
 

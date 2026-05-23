@@ -31,6 +31,7 @@ from hierarchos import (
     create_dataloader_pt_chunked,
     create_dataloader_for_tokenized_cache
 )
+from hierarchos.utils.rosa import precompute_rosa_ids_for_chunks
 
 
 def load_hf_dataset(dataset_name, dataset_config=None, split="train", streaming=False):
@@ -96,6 +97,16 @@ def _steps_from_samples(sample_count, batch_size):
 
 def _is_jsonl_path(path):
     return str(path).lower().endswith((".jsonl", ".ndjson"))
+
+
+def _tokenizer_vocab_size(tokenizer):
+    try:
+        return int(len(tokenizer))
+    except Exception:
+        vocab_size = getattr(tokenizer, "vocab_size", None)
+        if vocab_size is not None:
+            return int(vocab_size)
+        return 50257
 
 
 def _jsonl_source_files(path):
@@ -335,6 +346,9 @@ def _hf_shard_cache_key(args, num_shards):
         "text_column": getattr(args, "text_column", None),
         "prompt_column": getattr(args, "prompt_column", None),
         "completion_column": getattr(args, "completion_column", None),
+        "precompute_rosa": bool(getattr(args, "use_rosa", True)),
+        "rosa_max_context": int(getattr(args, "rosa_max_context", 512) or 512),
+        "training_chunk_size": int(getattr(args, "training_chunk_size", 256) or 256),
     }
     return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
@@ -353,17 +367,30 @@ def _estimate_hf_total_for_progress(args):
         return None
 
 
-def _processed_sample_to_cached_item(processed):
+def _processed_sample_to_cached_item(processed, args=None, tokenizer=None):
     input_ids = processed["input_ids"].detach().cpu().to(dtype=torch.int32)
     labels = processed["labels"].detach().cpu().to(dtype=torch.int32)
     length = int(processed.get("_length", input_ids.numel()))
     length = max(1, min(int(input_ids.numel()), length))
-    return {
+    item = {
         "input_ids": input_ids,
         "labels": labels,
         "attention_mask": torch.ones(input_ids.numel(), dtype=torch.uint8),
         "_length": length,
     }
+    if args is not None and tokenizer is not None and bool(getattr(args, "use_rosa", True)):
+        rosa_sentinel = _tokenizer_vocab_size(tokenizer)
+        item["rosa_ids"] = torch.tensor(
+            precompute_rosa_ids_for_chunks(
+                input_ids[:length].tolist(),
+                vocab_size=rosa_sentinel,
+                chunk_size=getattr(args, "training_chunk_size", 256),
+                rosa_max_ctx=getattr(args, "rosa_max_context", 512),
+            ),
+            dtype=torch.int32,
+        )
+        item["_rosa_sentinel"] = int(rosa_sentinel)
+    return item
 
 
 def materialize_hf_dataset_pt_cache(args, tokenizer, num_shards):
@@ -447,7 +474,7 @@ def materialize_hf_dataset_pt_cache(args, tokenizer, num_shards):
             if processed is None:
                 skipped += 1
                 continue
-            item = _processed_sample_to_cached_item(processed)
+            item = _processed_sample_to_cached_item(processed, args=args, tokenizer=tokenizer)
             item["_source_idx"] = sample_idx
             shard_idx = accepted % num_shards
             shard_buffers[shard_idx].append(item)
@@ -487,7 +514,7 @@ def materialize_hf_dataset_shards(args, tokenizer, num_shards):
 
 def _hf_token_cache_key(args):
     payload = {
-        "format": "map-token-bin-v2",
+        "format": "map-token-bin-v3",
         "formatter": "alpaca-input-section-v1",
         "dataset": args.hf_dataset,
         "config": args.hf_dataset_config,
@@ -503,6 +530,9 @@ def _hf_token_cache_key(args):
         "text_column": getattr(args, "text_column", None),
         "prompt_column": getattr(args, "prompt_column", None),
         "completion_column": getattr(args, "completion_column", None),
+        "precompute_rosa": bool(getattr(args, "use_rosa", True)),
+        "rosa_max_context": int(getattr(args, "rosa_max_context", 512) or 512),
+        "training_chunk_size": int(getattr(args, "training_chunk_size", 256) or 256),
     }
     return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
@@ -552,6 +582,10 @@ def materialize_hf_token_cache(args, tokenizer):
     skipped = 0
     total_bytes = 0
     tmp_data_path = os.path.join(tmp_dir, "tokens.bin")
+    precompute_rosa = bool(getattr(args, "use_rosa", True))
+    rosa_sentinel = _tokenizer_vocab_size(tokenizer)
+    rosa_chunk_size = int(getattr(args, "training_chunk_size", 256) or 256)
+    rosa_max_context = int(getattr(args, "rosa_max_context", 512) or 512)
 
     def iter_hf_samples():
         nonlocal skipped
@@ -606,25 +640,45 @@ def materialize_hf_token_cache(args, tokenizer):
             data_file.write(input_bytes)
             data_file.write(label_bytes)
             total_bytes += len(input_bytes) + len(label_bytes)
+            if precompute_rosa:
+                rosa_ids = torch.tensor(
+                    precompute_rosa_ids_for_chunks(
+                        input_ids.tolist(),
+                        vocab_size=rosa_sentinel,
+                        chunk_size=rosa_chunk_size,
+                        rosa_max_ctx=rosa_max_context,
+                    ),
+                    dtype=torch.int32,
+                )
+                rosa_bytes = rosa_ids.numpy().tobytes()
+                data_file.write(rosa_bytes)
+                total_bytes += len(rosa_bytes)
 
     if not lengths:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise RuntimeError("HF token cache build produced no usable samples.")
 
     torch.save({
-        "format": "map-token-bin-v2",
+        "format": "map-token-bin-v3",
         "formatter": "alpaca-input-section-v1",
         "offsets": torch.tensor(offsets, dtype=torch.long),
         "lengths": torch.tensor(lengths, dtype=torch.int32),
+        "has_rosa_ids": precompute_rosa,
+        "rosa_sentinel": int(rosa_sentinel),
+        "rosa_max_context": int(rosa_max_context),
+        "rosa_training_chunk_size": int(rosa_chunk_size),
     }, os.path.join(tmp_dir, "index.pt"))
     with open(os.path.join(tmp_dir, "_SUCCESS"), "w", encoding="utf-8") as f:
         json.dump({
-            "format": "map-token-bin-v2",
+            "format": "map-token-bin-v3",
             "formatter": "alpaca-input-section-v1",
             "samples": len(lengths),
             "skipped": skipped,
             "bytes": total_bytes,
             "max_length": getattr(args, "max_length", 1024),
+            "has_rosa_ids": precompute_rosa,
+            "rosa_max_context": int(rosa_max_context),
+            "rosa_training_chunk_size": int(rosa_chunk_size),
         }, f, indent=2)
 
     if os.path.exists(cache_dir):
@@ -931,7 +985,7 @@ def main():
     train_group.add_argument("--debug-numerics", action="store_true", help="Enable per-token NaN/Inf debug checks. Slower on CUDA.")
     train_group.add_argument("--save-steps", type=int, default=0, help="Save a checkpoint/adapter every N steps during training/finetuning (0 to disable).")
     train_group.add_argument("--progress-log-steps", "--progress_log_steps", dest="progress_log_steps", type=int, default=25, help="Update tqdm scalar metrics every N steps (1 = every step).")
-    train_group.add_argument("--padding-metric-steps", "--padding_metric_steps", dest="padding_metric_steps", type=int, default=100, help="Report tok_eff only for the first N training steps (-1 = always, 0 = never).")
+    train_group.add_argument("--padding-metric-steps", "--padding_metric_steps", dest="padding_metric_steps", type=int, default=0, help="Report tok_eff only for the first N training steps (-1 = always, 0 = never).")
     train_group.add_argument("--no-padding-metrics", dest="padding_metrics", action="store_false", help="Disable tok_eff/seq padding diagnostics during training.")
     train_group.add_argument("--num_workers", type=int, default=-1, help="DataLoader workers (-1 = auto; CUDA uses prefetched workers, CPU/DML uses 0).")
     train_group.add_argument("--prefetch-factor", "--prefetch_factor", dest="prefetch_factor", type=int, default=None, help="Batches prefetched per DataLoader worker (auto keeps total queued batches tied to worker count).")

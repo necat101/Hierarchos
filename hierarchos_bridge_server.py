@@ -870,6 +870,11 @@ def handle_start_training(params: dict):
                     emit_error(f"Auto max length scan failed: {exc}")
                     return
 
+            train_batch_size = int(params.get("batch_size", 64))
+            train_chunk_size = int(params.get("training_chunk_size", 256))
+            default_workers = 8 if str(_device).startswith("cuda") and train_batch_size >= 64 else 0
+            default_bucket_size = 8192 if str(_device).startswith("cuda") and train_batch_size >= 64 else None
+
             # Build args namespace matching what hierarchos.training.trainer.train() expects
             # (mirrors the argparse in hierarchos_cli.py)
             train_args = argparse.Namespace(
@@ -898,19 +903,20 @@ def handle_start_training(params: dict):
                 rwkv_head_size=train_arch["rwkv_head_size"],
                 # Training hyperparams from GUI
                 epochs=int(params.get("epochs", 3)),
-                batch_size=int(params.get("batch_size", 4)),
+                batch_size=train_batch_size,
                 accumulation_steps=int(params.get("accumulation_steps", 1)),
                 starting_lr=float(params.get("learning_rate", 1e-4)),
                 min_lr=float(params.get("min_lr", 1e-6)),
-                training_chunk_size=int(params.get("training_chunk_size", 128)),
+                training_chunk_size=train_chunk_size,
                 grad_clip=float(params.get("grad_clip", 1.0)),
                 persist_state=bool(params.get("persist_state", False)),
                 amp=bool(params.get("amp", True)),
                 save_steps=int(params.get("save_steps", 0)),
-                num_workers=max(0, int(params.get("num_workers", 0))),
+                num_workers=max(0, int(params.get("num_workers", default_workers))),
                 prefetch_factor=params.get("prefetch_factor", None),
                 length_bucketing=bool(params.get("length_bucketing", True)),
-                length_bucket_size=params.get("length_bucket_size", None),
+                length_bucket_size=params.get("length_bucket_size", default_bucket_size),
+                progress_log_steps=int(params.get("progress_log_steps", 25)),
                 # Defaults for features not exposed in GUI
                 disable_lr_schedule=False,
                 ltm_lr=1e-3,

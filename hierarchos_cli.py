@@ -630,15 +630,16 @@ def resolve_num_workers(requested_workers, device, batch_size):
 
     cpu_count = os.cpu_count() or 1
     if getattr(device, "type", "cpu") == "cuda":
-        # Four workers is the usual sweet spot for pre-tokenized CUDA training:
-        # enough to keep pinned batches ready without spending too much CPU/RAM
-        # bandwidth on loader overhead. Users can still override for heavy HF
-        # tokenization or slow remote storage.
-        by_cpu = max(1, cpu_count // 4)
+        # 96GB Blackwell-class runs with token caches and batch>=64 can keep the
+        # GPU busier with a modestly wider loader pool. Worker threads are capped
+        # so pinned-memory queues stay bounded and CPU preprocessing cannot run
+        # away from the training loop.
+        target = 8 if int(batch_size or 1) >= 64 else 4
+        by_cpu = max(1, cpu_count // 3)
         if cpu_count >= 8:
             by_cpu = max(4, by_cpu)
         by_batch = max(1, int(batch_size or 1) * 2)
-        return min(4, by_cpu, by_batch)
+        return min(target, by_cpu, by_batch)
 
     # CPU and DirectML training usually want the cores for model math. Users can
     # still override this for tokenizer-heavy Hugging Face datasets.
@@ -694,7 +695,7 @@ def main():
     # --- Training Arguments ---
     train_group = parser.add_argument_group('Training')
     train_group.add_argument("--epochs", type=int, default=3)
-    train_group.add_argument("--batch_size", type=int, default=4)
+    train_group.add_argument("--batch_size", type=int, default=64)
     train_group.add_argument("--accumulation-steps", "--accumulation_steps", dest="accumulation_steps", type=int, default=1)
     train_group.add_argument("--starting-lr", type=float, default=1e-4)
     train_group.add_argument("--min-lr", type=float, default=1e-6)
@@ -725,7 +726,7 @@ def main():
     train_group.add_argument("--override-scheduling", action="store_true")
     train_group.add_argument("--persist-state", action="store_true", default=False, help="Persist RNN/LTM states between batches. Default: False.")
     train_group.add_argument("--no-persist-state", dest="persist_state", action="store_false", help="Disable state persistence between chunks.")
-    train_group.add_argument("--training-chunk-size", "--training_chunk_size", type=int, default=128, help="TBPTT chunk size (Default: 128).")
+    train_group.add_argument("--training-chunk-size", "--training_chunk_size", type=int, default=256, help="TBPTT chunk size. Default 256 targets 96GB Blackwell CUDA runs; use 128 if memory gets tight.")
     train_group.add_argument("--cuda-loss-chunk-rows", "--cuda_loss_chunk_rows", type=int, default=0, help="Rows per lm_head loss chunk on CUDA (0 = auto).")
     train_group.add_argument("--no-cuda-chunked-lm-loss", dest="cuda_chunked_lm_loss", action="store_false", help="Disable CUDA chunked LM loss and return full logits during training.")
     train_group.add_argument("--cpu-loss-chunk-rows", "--cpu_loss_chunk_rows", type=int, default=0, help="Rows per lm_head loss chunk on CPU (0 = all supervised rows).")
@@ -740,7 +741,7 @@ def main():
     )
     train_group.add_argument("--debug-numerics", action="store_true", help="Enable per-token NaN/Inf debug checks. Slower on CUDA.")
     train_group.add_argument("--save-steps", type=int, default=0, help="Save a checkpoint/adapter every N steps during training/finetuning (0 to disable).")
-    train_group.add_argument("--progress-log-steps", "--progress_log_steps", dest="progress_log_steps", type=int, default=10, help="Update tqdm scalar metrics every N steps (1 = every step).")
+    train_group.add_argument("--progress-log-steps", "--progress_log_steps", dest="progress_log_steps", type=int, default=25, help="Update tqdm scalar metrics every N steps (1 = every step).")
     train_group.add_argument("--num_workers", type=int, default=-1, help="DataLoader workers (-1 = auto; CUDA uses prefetched workers, CPU/DML uses 0).")
     train_group.add_argument("--prefetch-factor", "--prefetch_factor", dest="prefetch_factor", type=int, default=None, help="Batches prefetched per DataLoader worker (auto keeps total queued batches tied to worker count).")
     train_group.add_argument("--pt-cache-size", "--pt_cache_size", dest="pt_cache_size", type=int, default=2, help="Number of .pt chunk files to keep hot per worker for --pre_pt_dataset.")
@@ -756,11 +757,13 @@ def main():
     train_group.add_argument("--refresh-hf-shards", "--refresh_hf_shards", dest="refresh_hf_shards", action="store_true", help="Rebuild cached local HF tokenized shards before training.")
     train_group.add_argument("--hf-cache-chunks-per-file", "--hf_cache_chunks_per_file", dest="hf_cache_chunks_per_file", type=int, default=2048, help="Tokenized samples per cached HF .pt shard chunk.")
     train_group.add_argument("--hf-token-cache", "--hf_token_cache", dest="hf_token_cache", action="store_true", help="Build/reuse a random-access binary token cache for HF datasets before training.")
+    train_group.add_argument("--no-hf-token-cache", "--no_hf_token_cache", dest="hf_token_cache", action="store_false", help="Disable the default HF random-access token cache.")
     train_group.add_argument("--hf-token-cache-dir", "--hf_token_cache_dir", dest="hf_token_cache_dir", type=str, default=None, help="Directory for random-access HF token caches.")
     train_group.add_argument("--refresh-hf-token-cache", "--refresh_hf_token_cache", dest="refresh_hf_token_cache", action="store_true", help="Rebuild the random-access HF token cache before training.")
     train_group.add_argument("--amp", action="store_true", help="Enable mixed precision (auto-enabled on CUDA).")
     train_group.add_argument("--no-amp", dest="amp", action="store_false", help="Explicitly disable mixed precision.")
     train_group.add_argument("--dataset-size", type=int, default=None, help="Force a specific dataset size (total samples) to calculate steps for the LR scheduler.")
+    train_group.set_defaults(hf_token_cache=True)
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile (auto-enabled on CUDA).")
     parser.add_argument("--force-compile", action="store_true")
     parser.add_argument(
@@ -846,6 +849,13 @@ def main():
         setup_msvc_environment()
     pt_device = pick_device(args)
     args.num_workers = resolve_num_workers(args.num_workers, pt_device, args.batch_size)
+    if (
+        pt_device.type == "cuda"
+        and args.length_bucket_size is None
+        and int(args.batch_size or 1) >= 64
+    ):
+        args.length_bucket_size = 8192
+        print("INFO: Length bucket window auto-set to 8192 for CUDA batch>=64.")
     print(f"INFO: DataLoader workers set to {args.num_workers} for device={pt_device}.")
     
     # Tokenizer Loading

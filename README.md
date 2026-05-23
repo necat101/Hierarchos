@@ -24,7 +24,7 @@ A novel AI architecture that synergistically integrates Google's Titans memory s
 
 #### CUDA Training Loop
 - **Throttled Progress Metrics**: `train_step` only returns display metrics on scheduled progress updates, so CUDA scalar `.item()` calls no longer synchronize every batch by default.
-- **Configurable Logging Interval**: Use `--progress-log-steps N` to update tqdm scalar metrics every N steps. Default is `10`; use `1` for the old every-step behavior.
+- **Configurable Logging Interval**: Use `--progress-log-steps N` to update tqdm scalar metrics every N steps. Default is `25`; use `1` for the old every-step behavior.
 - **Non-Destructive Runtime Patch**: This changes only metric reporting cadence. Model architecture, dataset formatting, labels, losses, optimizer steps, and scheduler behavior are unchanged.
 - **Alpaca Prompt String Documented**: `--alpaca` uses `### Instruction:`, optional `### Input:`, and `### Response:` formatting before the supervised output text.
 
@@ -45,9 +45,9 @@ A novel AI architecture that synergistically integrates Google's Titans memory s
 - **Windows GUI Release Flow**: The README documents the portable GUI bundle workflow for shipping `Hierarchos.exe` with the bundled backend.
 
 #### 🧠 Architecture
-- **RWKV v8 Backbone**: Replaced GRU cells with full RWKV v8 (Receptance Weighted Key Value) cells featuring linear attention, Time Mixing with WKV recurrence, and SwiGLU Channel Mixing.
+- **RWKV v8 Backbone**: Replaced GRU cells with full RWKV v8 (Receptance Weighted Key Value) cells featuring linear attention, Time Mixing with WKV recurrence, and ReLU-squared Channel Mixing.
 - **DeepEmbed (4x Scale)**: New learnable token embeddings at 4× hidden dimension that gate the RWKV channel mixing FFN, providing richer per-token modulation.
-- **ROSA (Receptive Ordered Suffix Automaton)**: A neurosymbolic inner monologue — a CPU-side Suffix Automaton predicts likely next tokens, which are embedded and added to the input representation. Gives the model a "heads up" about upcoming patterns.
+- **ROSA (Rapid Online Suffix Automaton)**: A neurosymbolic inner monologue — a CPU-side Suffix Automaton predicts likely next tokens, which are embedded and added to the input representation. Gives the model a "heads up" about upcoming patterns.
 - **V7 Backward Compatibility**: Set `use_deepembed=False, use_rosa=False` in config to run in pure V7 mode. All V7 checkpoints load cleanly.
 
 #### ⚡ CUDA Datacenter Optimizations (Zero Config)
@@ -77,7 +77,7 @@ This project introduces a novel hybrid model where a deep reasoning engine opera
 Hierarchos is built on three revolutionary, brain-inspired pillars:
 
 🔄 **RWKV v8 Backbone (The Neural Engine)**
-A modernized RNN with linear attention that achieves the parallel training speed of Transformers with the O(1) inference cost of RNNs. Features Time Mixing (WKV recurrence with exponential decay), SwiGLU Channel Mixing, DeepEmbed gating, and ROSA neurosymbolic embeddings.
+A modernized RNN with linear attention that achieves the parallel training speed of Transformers with the O(1) inference cost of RNNs. Features Time Mixing (WKV recurrence with exponential decay), ReLU-squared Channel Mixing, DeepEmbed gating, and ROSA neurosymbolic embeddings.
 
 🧠 **Titans Architecture (The Cognitive Substrate)**
 A sophisticated, multi-tiered memory workspace that enables dynamic, lifelong learning. It learns *what to remember* based on the principle of "surprise," and its memory slots are now structured with timestamps and source metadata, allowing for sophisticated, context-aware queries.
@@ -113,7 +113,7 @@ A powerful, data-efficient, and deep reasoning engine. Its dual-module design (a
 
 ## Features ✨
 
-  * 🔄 **RWKV v8 Backbone**: Linear-complexity attention with O(1) inference cost. WKV recurrence, SwiGLU FFN, DeepEmbed gating, and ROSA neurosymbolic embeddings.
+  * 🔄 **RWKV v8 Backbone**: Linear-complexity attention with O(1) inference cost. WKV recurrence, ReLU-squared FFN, DeepEmbed gating, and ROSA neurosymbolic embeddings.
   * ⚙️ **Adaptive CPU/CUDA LTM Math**: Keeps CPU-friendly dense LTM math on CPU while automatically using GPU-friendly gather/scatter retrieval and update paths on CUDA.
   * ⚡ **CUDA Datacenter Ready**: Auto-enables AMP (bfloat16 on Ampere+), TF32 matmul, cuDNN benchmark, torch.compile, non-blocking transfers, CUDA pinned memory, and bounded DataLoader prefetch — zero configuration needed.
   * 🪟 **Windows GUI Bundle**: Build a portable GUI release with `Hierarchos.exe` and a bundled backend for normal inference without requiring users to clone the repo.
@@ -245,8 +245,8 @@ python hierarchos_cli.py train \
     --tokenizer-path "openai-community/gpt2" `# Or your preferred tokenizer` \
     --out-dir "./my_Hierarchos_model" \
     --epochs 3 \
-    --batch_size 4 \
-    --accumulation-steps 2 `# Effective batch size = 8` \
+    --batch_size 64 \
+    --accumulation-steps 1 \
     --auto-max-length `# Automatically determines max sequence length` \
     --context_dim 448 `# ~233M params with GPT-2 vocab, DeepEmbed, ROSA` \
     --h_hidden 448 \
@@ -254,8 +254,7 @@ python hierarchos_cli.py train \
     --rwkv-head-size 64 \
     --max_h_steps 5 \
     --max_l_steps 5 \
-    --amp `# Enable Mixed Precision for speed (NVIDIA GPUs only)` \
-    --gradient-checkpointing # Add this if VRAM is limited
+    --amp `# Auto-enabled on CUDA; explicit here for clarity`
 ```
 
 **(B) Hugging Face Dataset (Text Completion):**
@@ -343,7 +342,7 @@ python hierarchos_cli.py train \
 💡 **CUDA Auto-Optimization:** On NVIDIA GPUs, AMP, TF32, cuDNN benchmark, and torch.compile are **auto-enabled**. Long CUDA runs default to `--compile-mode max-autotune`, static RWKV worker-loop capture, H-RNN cell compilation, and CUDA graphs. Use `--no-amp` to disable AMP.
 💾 **Training on Low Memory:** Use `--gradient-checkpointing` to significantly reduce VRAM usage at the cost of some extra computation.
 🎮 **AMD GPU Training:** Use `--device dml` to train on AMD Radeon GPUs via DirectML. AMP is automatically disabled for stability.
-🚀 **Datacenter Training:** start with auto workers or `--num_workers 4 --batch_size 32 --training-chunk-size 512 --persist-state`, then benchmark higher worker counts only if the input pipeline is still the bottleneck.
+🚀 **Datacenter Training:** the default CUDA profile targets the 232M `448/448/448` run on a 96GB Blackwell-class NVIDIA card: `--batch_size 64`, `--training-chunk-size 256`, HF token cache, length bucketing, auto CUDA workers up to 8, BF16 AMP, TF32, and `torch.compile --compile-mode max-autotune`.
 
 ## ⚠️ **HRM Convergence & Training Speed:** Higher `--max_h_steps` and `--max_l_steps` allow deeper reasoning but **significantly increase training time** per batch due to the iterative HRM process. Adjust based on your task and compute resources.
 
@@ -607,7 +606,7 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.5 --top-
 | `--lora-adapter-path`          | `merge`, `finetune`                 | Path to the trained LoRA adapter directory.                                                                                            | `None`                  |
 | **Training/Fine-Tuning** |                                     |                                                                                                                                          |                         |
 | `--epochs`                     | `train`, `finetune`                 | Number of training epochs.                                                                                                               | `3`                     |
-| `--batch_size`                 | `train`, `finetune`                 | Number of samples per forward pass.                                                                                                      | `4`                     |
+| `--batch_size`                 | `train`, `finetune`                 | Number of samples per forward pass. Default targets the 96GB Blackwell 232M training profile.                                             | `64`                    |
 | `--accumulation-steps`         | `train`, `finetune`                 | Number of steps to accumulate gradients over (simulates larger batch size).                                                              | `1`                     |
 | `--gradient-checkpointing`     | `train`, `finetune`                 | **Enable gradient checkpointing to save VRAM (trades compute for memory).** | `False`                 |
 | `--grad-clip`                  | `train`, `finetune`                 | Gradient clipping value. Prevents gradient explosion (0 to disable).                                                                     | `1.0`                   |
@@ -631,9 +630,10 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.5 --top-
 | `--no-compile-static-worker-loop` | `train`, `finetune`              | Disable the compile-friendly fixed WorkerLoop used by CUDA compile.                                                                       | `False`                 |
 | `--amp`                        | `train`, `finetune`, `chat`         | **Enable Automatic Mixed Precision (auto-enabled on CUDA).**                                                                                     | `False`                 |
 | `--no-amp`                     | `train`, `finetune`                 | **Explicitly disable AMP** (overrides auto-detection on CUDA).                                                                                   | N/A                     |
-| `--num_workers`                | `train`, `finetune`                 | Number of CPU workers for data loading (`-1` = auto; CUDA defaults conservatively, CPU/DML use 0).                                      | `-1`                    |
+| `--num_workers`                | `train`, `finetune`                 | Number of CPU workers for data loading (`-1` = auto; CUDA uses up to 8 for batch>=64, CPU/DML use 0).                                   | `-1`                    |
 | `--prefetch-factor`            | `train`, `finetune`                 | Batches prefetched per DataLoader worker. Omit it to keep total queued batches tied to worker count.                                    | `None`                  |
-| `--progress-log-steps`         | `train`                             | Update tqdm scalar metrics every N steps to reduce CUDA sync overhead from progress logging (`1` = every step).                         | `10`                    |
+| `--progress-log-steps`         | `train`                             | Update tqdm scalar metrics every N steps to reduce CUDA sync overhead from progress logging (`1` = every step).                         | `25`                    |
+| `--hf-token-cache`             | `train`, `finetune`                 | Build/reuse a random-access binary token cache for HF datasets. Enabled by default; use `--no-hf-token-cache` to disable.               | `True`                  |
 | `--pt-cache-size`              | `train`, `finetune`                 | Number of `.pt` chunk files to keep hot per worker when using `--pre_pt_dataset`.                                                       | `2`                     |
 | `--lora_r`                     | `finetune`                          | LoRA rank 'r'.                                                                                                                           | `8`                     |
 | `--lora_alpha`                 | `finetune`                          | LoRA alpha scaling factor.                                                                                                               | `16`                    |\n| `--finetune-unlock-percent`    | `finetune`                          | Target % of params to train (approx.). Overrides `--lora_r` if set.                                                                     | `None`                  |
@@ -662,7 +662,8 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.5 --top-
 | `--max_l_steps`                | `train`                             | **Maximum** number of iterations for L-module convergence per H-step. **Impacts training speed.** | `5`                     |
 | `--l_conv_atol`                | `train`                             | Absolute tolerance for checking L-module state convergence.                                                                              | `1e-4`                  |
 | `--ltm_topk`                   | `train`                             | Number of LTM slots to retrieve per token.                                                                                               | `4`                     |
-| `--detach-every-n-steps`       | `train`                             | **Truncated BPTT:** Detach RNN state gradients every N timesteps. Set to `None` for full BPTT (memory intensive). Lower values = less memory, less temporal learning. | `32`                    |
+| `--detach-every-n-steps`       | `train`                             | **Truncated BPTT:** Detach RNN state gradients every N timesteps. Lower values = less memory, less temporal learning.                   | `32`                    |
+| `--training-chunk-size`        | `train`, `finetune`                 | TBPTT chunk length. Default 256 targets batch 64 on 96GB Blackwell-class CUDA; use 128 if memory gets tight.                            | `256`                   |
 | `--max_length`                 | `train`, `finetune`                 | Maximum sequence length. **Required if using pre-chunked formats.** Set via scan (`--auto-max-length`), manually, or loaded from config. | `1024`                  |
 | `--auto-max-length`            | `train`, `finetune`                 | Automatically scan dataset (`--train` or `--hf_dataset`) to set `max_length`. **Ignored if using pre-chunked formats.** | `False`                 |
 | **Other** |                                     |                                                                                                                                          |                         |
@@ -726,7 +727,7 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
 ### v0.19.3 (alpha)
 
   * **Progress Sync Throttling**: Training progress metrics are now collected only on scheduled tqdm updates, reducing CUDA synchronization from per-step `.item()` logging.
-  * **`--progress-log-steps`**: New train flag controls metric update cadence; default `10`, with `1` restoring every-step logging.
+  * **`--progress-log-steps`**: Train flag controls metric update cadence; default `25`, with `1` restoring every-step logging.
   * **Alpaca Prompt String**: The `--alpaca` formatter is documented as `### Instruction:`, optional `### Input:`, and `### Response:` before the supervised output string.
 
 ### v0.19.2 (alpha)
@@ -748,11 +749,11 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
 
   * **🧠 RWKV v8 Backbone**: Complete replacement of GRU cells with RWKV v8 cells featuring:
       * **Time Mixing**: WKV (Weighted Key Value) recurrence with exponential decay and `time_first` / `time_decay` learnable parameters.
-      * **Channel Mixing**: SwiGLU-gated feed-forward network with 4× expansion.
+      * **Channel Mixing**: ReLU-squared feed-forward network with 4× expansion.
       * **5-Slot State**: `(sx, aa, bb, pp, sx_cm)` replaces the old 3-slot GRU state for richer temporal representation.
       * **Float32 WKV**: Critical exponential calculations run in float32 for numerical stability, even under AMP.
   * **🎨 DeepEmbed (4× Scale)**: New `h_deepemb` and `l_deepemb` embeddings at `hidden_dim × 4` that gate the RWKV channel mixing FFN, providing per-token modulation of the feed-forward pathway.
-  * **🔮 ROSA (Receptive Ordered Suffix Automaton)**: A neurosymbolic inner monologue module:
+  * **🔮 ROSA (Rapid Online Suffix Automaton)**: A neurosymbolic inner monologue module:
       * CPU-side Suffix Automaton predicts likely next tokens from input history.
       * Predictions are embedded via `rosa_emb` and added to the input representation.
       * Gives the model a "heads up" about upcoming patterns (O(n) precomputation).

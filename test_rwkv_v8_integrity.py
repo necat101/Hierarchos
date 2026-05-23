@@ -5,6 +5,7 @@ import torch
 
 import hierarchos
 from hierarchos import AttrDict, HierarchosCore
+from hierarchos.models.core import _resolve_compile_kwargs
 from hierarchos.models.rwkv_cell import RWKVCell
 
 
@@ -37,6 +38,28 @@ class RWKVV8IntegrityTests(unittest.TestCase):
     def test_import_uses_modular_package_not_legacy_monolith(self):
         loaded = os.path.normcase(os.path.abspath(hierarchos.__file__))
         self.assertTrue(loaded.endswith(os.path.normcase(os.path.join("hierarchos", "__init__.py"))), loaded)
+
+    def test_cuda_compile_kwargs_do_not_mix_mode_and_options(self):
+        cfg = AttrDict(
+            compile_mode="max-autotune",
+            compile_dynamic=False,
+            compile_cudagraphs=True,
+            compile_backend=None,
+        )
+
+        kwargs, mode, cudagraphs = _resolve_compile_kwargs(cfg, "cuda")
+
+        self.assertEqual(mode, "max-autotune")
+        self.assertTrue(cudagraphs)
+        self.assertEqual(kwargs["mode"], "max-autotune")
+        self.assertNotIn("options", kwargs)
+
+        cfg.compile_cudagraphs = False
+        kwargs, mode, cudagraphs = _resolve_compile_kwargs(cfg, "cuda")
+        self.assertEqual(mode, "max-autotune-no-cudagraphs")
+        self.assertFalse(cudagraphs)
+        self.assertEqual(kwargs["mode"], "max-autotune-no-cudagraphs")
+        self.assertNotIn("options", kwargs)
 
     def test_conservative_448_default_stays_near_233m_with_real_rwkv_heads(self):
         cfg = AttrDict(

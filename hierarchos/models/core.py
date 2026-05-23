@@ -3,6 +3,7 @@ HierarchosCore - Full parity version with original forward method.
 This is a direct port from hierarchos.py to achieve exact training parity.
 """
 import os
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,6 +17,22 @@ from .ltm import LTMModule
 from ..utils.device import setup_msvc_environment, is_directml_device
 from ..utils.rosa import ROSA, rosa_async_pipeline, ROSAState
 
+def _quiet_torch_compile_logs():
+    """Keep useful compiler warnings while hiding routine autotune chatter."""
+    try:
+        import torch._inductor.config as inductor_config
+        if hasattr(inductor_config, "verbose_progress"):
+            inductor_config.verbose_progress = False
+    except Exception:
+        pass
+    for logger_name in (
+        "torch._dynamo",
+        "torch._inductor",
+        "torch._inductor.select_algorithm",
+        "torch._inductor.cudagraph_trees",
+    ):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
+
 def _resolve_compile_kwargs(config, device_type: str, fullgraph: bool = False):
     compile_mode = getattr(config, 'compile_mode', 'reduce-overhead')
     if compile_mode in (None, '', 'default'):
@@ -24,7 +41,7 @@ def _resolve_compile_kwargs(config, device_type: str, fullgraph: bool = False):
     if compile_backend in (None, '', 'default'):
         compile_backend = None
     compile_dynamic = bool(getattr(config, 'compile_dynamic', False))
-    compile_cudagraphs = bool(getattr(config, 'compile_cudagraphs', device_type == 'cuda'))
+    compile_cudagraphs = bool(getattr(config, 'compile_cudagraphs', False))
 
     # Some PyTorch builds reject passing both mode=... and options=....
     # CUDA-graph preference is encoded with the mode when possible; options are
@@ -341,6 +358,8 @@ class HierarchosCore(nn.Module):
                 )
                 compile_dynamic = bool(compile_kwargs.get("dynamic", False))
                 compile_fullgraph_worker = bool(getattr(self.config, 'compile_fullgraph_worker', False))
+                if bool(getattr(self.config, 'compile_quiet', True)):
+                    _quiet_torch_compile_logs()
 
                 print(
                     "INFO: Compiling RWKV hot path "
@@ -372,6 +391,11 @@ class HierarchosCore(nn.Module):
                     **worker_compile_kwargs,
                 )
                 print("INFO: RWKV hot path compiled successfully.")
+                if device_type == 'cuda' and compile_mode in ('max-autotune', 'max-autotune-no-cudagraphs'):
+                    print(
+                        "INFO: The first CUDA train step may spend several minutes autotuning kernels; "
+                        "judge steady-state throughput after steps 3-5."
+                    )
         except Exception as e:
             print(f"Warning: Compilation failed! Falling back to eager mode. {e}")
             self.config.compile = False

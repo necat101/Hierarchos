@@ -117,8 +117,9 @@ def estimate_cuda_loss_chunk_rows(free_bytes: int, batch_size: int, chunk_size: 
     """
     Pick a CUDA lm_head loss chunk size from live free VRAM and current batch shape.
 
-    On 96GB-class GPUs this targets 16834 rows by default, which is large enough
-    to cover batch sizes around 132 at a 128-token TBPTT chunk in one loss pass.
+    On 96GB-class GPUs this targets enough rows to cover batch=64 at a
+    256-token TBPTT chunk in one loss pass while still reserving most VRAM for
+    activations, optimizer state, CUDA graphs, and fragmentation.
     """
     requested_rows = int(requested_rows or 0)
     if requested_rows > 0:

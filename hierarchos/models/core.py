@@ -16,6 +16,41 @@ from .ltm import LTMModule
 from ..utils.device import setup_msvc_environment, is_directml_device
 from ..utils.rosa import ROSA, rosa_async_pipeline, ROSAState
 
+def _resolve_compile_kwargs(config, device_type: str, fullgraph: bool = False):
+    compile_mode = getattr(config, 'compile_mode', 'reduce-overhead')
+    if compile_mode in (None, '', 'default'):
+        compile_mode = None
+    compile_backend = getattr(config, 'compile_backend', None)
+    if compile_backend in (None, '', 'default'):
+        compile_backend = None
+    compile_dynamic = bool(getattr(config, 'compile_dynamic', False))
+    compile_cudagraphs = bool(getattr(config, 'compile_cudagraphs', device_type == 'cuda'))
+
+    # Some PyTorch builds reject passing both mode=... and options=....
+    # CUDA-graph preference is encoded with the mode when possible; options are
+    # used only for default-mode compile where PyTorch accepts them.
+    effective_mode = compile_mode
+    effective_cudagraphs = compile_cudagraphs
+    if device_type == 'cuda':
+        if effective_mode == 'max-autotune' and not compile_cudagraphs:
+            effective_mode = 'max-autotune-no-cudagraphs'
+            effective_cudagraphs = False
+        elif effective_mode == 'max-autotune-no-cudagraphs':
+            effective_cudagraphs = False
+
+    kwargs = {
+        "dynamic": compile_dynamic,
+        "fullgraph": bool(fullgraph),
+    }
+    if compile_backend is not None:
+        kwargs["backend"] = compile_backend
+    if effective_mode is not None:
+        kwargs["mode"] = effective_mode
+    elif device_type == 'cuda':
+        kwargs["options"] = {"triton.cudagraphs": effective_cudagraphs}
+
+    return kwargs, effective_mode, effective_cudagraphs
+
 class WorkerLoop:
     """
     Encapsulates the Worker's iterative refinement loop.
@@ -299,15 +334,13 @@ class HierarchosCore(nn.Module):
 
         try:
             if hasattr(torch, "compile"):
-                compile_mode = getattr(self.config, 'compile_mode', 'reduce-overhead')
-                if compile_mode in (None, '', 'default'):
-                    compile_mode = None
-                compile_backend = getattr(self.config, 'compile_backend', None)
-                if compile_backend in (None, '', 'default'):
-                    compile_backend = None
-                compile_dynamic = bool(getattr(self.config, 'compile_dynamic', False))
+                compile_kwargs, compile_mode, compile_cudagraphs = _resolve_compile_kwargs(
+                    self.config,
+                    device_type,
+                    fullgraph=False,
+                )
+                compile_dynamic = bool(compile_kwargs.get("dynamic", False))
                 compile_fullgraph_worker = bool(getattr(self.config, 'compile_fullgraph_worker', False))
-                compile_cudagraphs = bool(getattr(self.config, 'compile_cudagraphs', device_type == 'cuda'))
 
                 print(
                     "INFO: Compiling RWKV hot path "
@@ -325,27 +358,15 @@ class HierarchosCore(nn.Module):
                 self.l_rnn.allow_legacy_state_migration = False
                 static_loop = getattr(self.config, 'compile_static_worker_loop', None)
                 self.worker_loop_module.compile_static_worker_loop = True if static_loop is None else bool(static_loop)
-                
-                compile_options = {}
-                if device_type == 'cuda':
-                    compile_options["triton.cudagraphs"] = compile_cudagraphs
-
-                compile_kwargs = {
-                    "dynamic": compile_dynamic,
-                    "fullgraph": False,
-                }
-                if compile_backend is not None:
-                    compile_kwargs["backend"] = compile_backend
-                if compile_mode is not None:
-                    compile_kwargs["mode"] = compile_mode
-                if compile_options:
-                    compile_kwargs["options"] = compile_options
 
                 if bool(getattr(self.config, 'compile_h_rnn', True)):
                     self.h_rnn.compile_forward(**compile_kwargs)
 
-                worker_compile_kwargs = dict(compile_kwargs)
-                worker_compile_kwargs["fullgraph"] = compile_fullgraph_worker
+                worker_compile_kwargs, _, _ = _resolve_compile_kwargs(
+                    self.config,
+                    device_type,
+                    fullgraph=compile_fullgraph_worker,
+                )
                 self.worker_loop_module = torch.compile(
                     self.worker_loop_module,
                     **worker_compile_kwargs,

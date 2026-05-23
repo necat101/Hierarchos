@@ -130,7 +130,7 @@ def _resolve_prefetch_factor(num_workers: int, prefetch_factor=None, pin_memory:
     if prefetch_factor is not None:
         return max(1, int(prefetch_factor))
 
-    target_prefetched_batches = 8 if pin_memory else 4
+    target_prefetched_batches = 16 if pin_memory else 4
     return max(1, (target_prefetched_batches + num_workers - 1) // num_workers)
 
 def _create_dataloader(dataset, *, batch_size=None, collate_fn=None, num_workers=0,

@@ -187,10 +187,10 @@ impl Default for TrainingConfig {
         Self {
             data_path: String::new(),
             epochs: 3,
-            batch_size: 4,
+            batch_size: 64,
             learning_rate: 1e-4,
             min_lr: 1e-6,
-            training_chunk_size: 128,
+            training_chunk_size: 256,
             accumulation_steps: 1,
             grad_clip: 1.0,
             persist_state: false,

@@ -907,6 +907,9 @@ def main():
     train_group.add_argument("--encourage-thinking", action="store_true", help="Invert ponder loss to REWARD thinking (for recovery training).")
     train_group.add_argument("--adaptive-ponder", action="store_true", help="Scale ponder target based on CE loss (more thinking for harder content).")
     train_group.add_argument("--ponder-target-scale", type=float, default=0.5, help="Scaling factor for adaptive ponder target. Default: 0.5.")
+    train_group.add_argument("--no-memory-token-routers", dest="memory_token_routers", action="store_false", help="Disable per-token ROSA/LTM memory routers and use scalar gates only.")
+    train_group.add_argument("--memory-gate-warmup-steps", "--memory_gate_warmup_steps", dest="memory_gate_warmup_steps", type=int, default=2000, help="Training batches used to softly keep ROSA/LTM gates open before decaying to learned gates.")
+    train_group.add_argument("--memory-gate-warmup-floor", "--memory_gate_warmup_floor", dest="memory_gate_warmup_floor", type=float, default=0.10, help="Initial minimum memory gate floor during warmup. Decays to 0 over --memory-gate-warmup-steps.")
     train_group.add_argument("--reset-halt-bias", type=float, default=None, metavar="BIAS", help="SURGICAL FIX: Reset h_halt_proj.bias to this value on load (e.g., -2.0 for ~12%% halt prob).")
     train_group.add_argument("--override-scheduling", action="store_true")
     train_group.add_argument("--persist-state", action="store_true", default=False, help="Persist RNN/LTM states between batches. Default: False.")
@@ -923,6 +926,7 @@ def main():
         cpu_chunked_lm_loss=True,
         ltm_cpu_gather_retrieval=True,
         ltm_cpu_sparse_update=True,
+        memory_token_routers=True,
     )
     train_group.add_argument("--debug-numerics", action="store_true", help="Enable per-token NaN/Inf debug checks. Slower on CUDA.")
     train_group.add_argument("--save-steps", type=int, default=0, help="Save a checkpoint/adapter every N steps during training/finetuning (0 to disable).")

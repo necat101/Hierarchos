@@ -110,7 +110,7 @@ class RWKVV8IntegrityTests(unittest.TestCase):
         self.assertEqual(model.l_rnn.head_size, 64)
         self.assertEqual(model.h_rnn.n_head, 7)
         self.assertEqual(model.l_rnn.n_head, 7)
-        self.assertEqual(sum(p.numel() for p in model.parameters()), 232515331)
+        self.assertEqual(sum(p.numel() for p in model.parameters()), 232516229)
 
     def test_450_hidden_auto_head_does_not_collapse_to_scalar_state(self):
         cell = RWKVCell(450)
@@ -339,6 +339,29 @@ class RWKVV8IntegrityTests(unittest.TestCase):
         self.assertIsNotNone(model.rosa_gate_logit.grad)
         self.assertTrue(torch.isfinite(model.rosa_gate_logit.grad).all())
         self.assertGreater(model.rosa_gate_logit.grad.abs().item(), 0.0)
+        self.assertIsNotNone(model.rosa_router.weight.grad)
+        self.assertTrue(torch.isfinite(model.rosa_router.weight.grad).all())
+
+    def test_memory_token_routers_start_as_scalar_gates_with_warmup_floor(self):
+        torch.manual_seed(19)
+        cfg = _tiny_config()
+        cfg.memory_gate_warmup_steps = 100
+        cfg.memory_gate_warmup_floor = 0.1
+        model = HierarchosCore(cfg)
+        model.train()
+
+        x = torch.randn(2, 3, cfg.context_dim)
+        rosa_gate = torch.sigmoid(model.rosa_gate_logit + model.rosa_router(x))
+        expected_rosa = torch.full_like(rosa_gate, torch.sigmoid(model.rosa_gate_logit).item())
+        self.assertTrue(torch.allclose(rosa_gate, expected_rosa, atol=1e-6))
+
+        model.set_training_step(0)
+        warmed = model._apply_memory_gate_warmup(torch.zeros(2, 1))
+        self.assertTrue(torch.allclose(warmed, torch.full_like(warmed, 0.1), atol=1e-6))
+
+        model.set_training_step(100)
+        cooled = model._apply_memory_gate_warmup(torch.zeros(2, 1))
+        self.assertTrue(torch.allclose(cooled, torch.zeros_like(cooled), atol=1e-6))
 
     def test_rwkv_cell_large_input_backward_stays_finite(self):
         torch.manual_seed(321)

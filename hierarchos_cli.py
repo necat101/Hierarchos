@@ -135,11 +135,174 @@ def _length_bucketing_enabled(args, default=True):
         return bool(default)
     return bool(value)
 
-def resolve_length_bucket_size(length_bucket_size, device, batch_size, hf_token_cache=False):
+def _rounded_bucket_size(bucket_size, batch_size, sample_count):
+    batch_size = max(1, int(batch_size or 1))
+    sample_count = max(batch_size, int(sample_count or batch_size))
+    bucket_size = max(batch_size, int(bucket_size or batch_size))
+    bucket_size = min(bucket_size, sample_count)
+    return max(batch_size, (bucket_size // batch_size) * batch_size)
+
+
+def _default_bucket_candidates(sample_count, batch_size):
+    batch_size = max(1, int(batch_size or 1))
+    sample_count = max(batch_size, int(sample_count or batch_size))
+    bases = [
+        batch_size * 50,
+        8192,
+        32768,
+        65536,
+        131072,
+        262144,
+        524288,
+        sample_count,
+    ]
+    candidates = []
+    seen = set()
+    for candidate in bases:
+        rounded = _rounded_bucket_size(candidate, batch_size, sample_count)
+        if rounded not in seen:
+            seen.add(rounded)
+            candidates.append(rounded)
+    return candidates
+
+
+def estimate_bucket_token_efficiency(lengths, batch_size, chunk_size, bucket_size, permutation=None):
+    lengths_t = torch.as_tensor(lengths, dtype=torch.long, device="cpu")
+    batch_size = max(1, int(batch_size or 1))
+    chunk_size = max(1, int(chunk_size or 1))
+    if lengths_t.numel() < batch_size:
+        return {
+            "bucket_size": batch_size,
+            "token_efficiency": 1.0,
+            "real_tokens": int(lengths_t.sum().item()) if lengths_t.numel() else 0,
+            "compiled_tokens": int(lengths_t.sum().item()) if lengths_t.numel() else 0,
+            "batches": 0,
+        }
+
+    full_count = (int(lengths_t.numel()) // batch_size) * batch_size
+    if permutation is None:
+        generator = torch.Generator()
+        generator.manual_seed(12345)
+        permutation = torch.randperm(int(lengths_t.numel()), generator=generator)
+    else:
+        permutation = torch.as_tensor(permutation, dtype=torch.long, device="cpu")
+
+    ordered = lengths_t[permutation[:full_count]].clone()
+    bucket_size = _rounded_bucket_size(bucket_size, batch_size, full_count)
+    for start in range(0, full_count, bucket_size):
+        end = min(start + bucket_size, full_count)
+        ordered[start:end] = torch.sort(ordered[start:end], descending=True).values
+
+    batches = ordered.view(-1, batch_size)
+    max_lengths = batches.max(dim=1).values
+    compiled_lengths = ((max_lengths + chunk_size - 1) // chunk_size) * chunk_size
+    real_tokens = int(batches.sum().item())
+    compiled_tokens = int(compiled_lengths.sum().item()) * batch_size
+    token_efficiency = real_tokens / float(max(1, compiled_tokens))
+    return {
+        "bucket_size": bucket_size,
+        "token_efficiency": token_efficiency,
+        "real_tokens": real_tokens,
+        "compiled_tokens": compiled_tokens,
+        "batches": int(batches.shape[0]),
+    }
+
+
+def choose_length_bucket_size_from_lengths(
+    lengths,
+    batch_size,
+    chunk_size=256,
+    candidates=None,
+    tolerance=0.005,
+    seed=12345,
+):
+    lengths_t = torch.as_tensor(lengths, dtype=torch.long, device="cpu")
+    lengths_t = torch.clamp(lengths_t, min=1)
+    batch_size = max(1, int(batch_size or 1))
+    if lengths_t.numel() < batch_size * 2:
+        bucket_size = _rounded_bucket_size(lengths_t.numel(), batch_size, max(batch_size, int(lengths_t.numel())))
+        result = estimate_bucket_token_efficiency(lengths_t, batch_size, chunk_size, bucket_size)
+        return bucket_size, {"chosen": result, "best": result, "results": [result]}
+
+    full_count = (int(lengths_t.numel()) // batch_size) * batch_size
+    if candidates is None:
+        candidates = _default_bucket_candidates(full_count, batch_size)
+    rounded_candidates = []
+    seen = set()
+    for candidate in candidates:
+        rounded = _rounded_bucket_size(candidate, batch_size, full_count)
+        if rounded not in seen:
+            seen.add(rounded)
+            rounded_candidates.append(rounded)
+
+    generator = torch.Generator()
+    generator.manual_seed(int(seed))
+    permutation = torch.randperm(int(lengths_t.numel()), generator=generator)
+    results = [
+        estimate_bucket_token_efficiency(
+            lengths_t,
+            batch_size,
+            chunk_size,
+            candidate,
+            permutation=permutation,
+        )
+        for candidate in rounded_candidates
+    ]
+    best = max(results, key=lambda item: item["token_efficiency"])
+    threshold = best["token_efficiency"] - max(0.0, float(tolerance or 0.0))
+    chosen = min(
+        (item for item in results if item["token_efficiency"] >= threshold),
+        key=lambda item: item["bucket_size"],
+    )
+    return chosen["bucket_size"], {"chosen": chosen, "best": best, "results": results}
+
+
+def auto_tune_length_bucket_size_from_token_cache(args, cache_dir):
+    index_path = os.path.join(cache_dir, "index.pt")
+    if not os.path.exists(index_path):
+        return None
+    try:
+        index = torch.load(index_path, map_location="cpu")
+        lengths = index["lengths"].to(dtype=torch.long, device="cpu")
+        max_length = int(getattr(args, "max_length", 0) or 0)
+        if max_length > 0:
+            lengths = torch.clamp(lengths, max=max_length)
+        bucket_size, summary = choose_length_bucket_size_from_lengths(
+            lengths,
+            batch_size=getattr(args, "batch_size", 1),
+            chunk_size=getattr(args, "training_chunk_size", 256),
+            tolerance=getattr(args, "length_bucket_auto_tolerance", 0.005),
+        )
+    except Exception as exc:
+        print(f"WARNING: Length bucket auto-tune failed; using fallback. {exc}")
+        return None
+
+    args.length_bucket_size = int(bucket_size)
+    chosen = summary["chosen"]
+    best = summary["best"]
+    result_text = ", ".join(
+        f"{item['bucket_size']}={item['token_efficiency'] * 100.0:.1f}%"
+        for item in summary["results"]
+    )
+    print(
+        "INFO: Auto-tuned HF token-cache length bucket window to "
+        f"{bucket_size} (estimated tok_eff={chosen['token_efficiency'] * 100.0:.1f}%; "
+        f"best={best['bucket_size']} at {best['token_efficiency'] * 100.0:.1f}%; "
+        f"candidates: {result_text})."
+    )
+    return int(bucket_size)
+
+
+def resolve_length_bucket_size(length_bucket_size, device, batch_size, hf_token_cache=False, auto_tune=True):
     if length_bucket_size is not None:
         return length_bucket_size, None
     device_type = getattr(device, "type", str(device)).lower()
     if device_type == "cuda" and int(batch_size or 1) >= 64:
+        if bool(hf_token_cache) and bool(auto_tune):
+            return (
+                None,
+                "INFO: Length bucket window will auto-tune after the HF token cache is ready.",
+            )
         if bool(hf_token_cache):
             return (
                 65536,
@@ -503,6 +666,12 @@ def create_hf_training_dataloader(args, tokenizer, device):
     if getattr(args, "hf_token_cache", False):
         cache_dir = materialize_hf_token_cache(args, tokenizer)
         cache_length_bucketing = _length_bucketing_enabled(args, default=True)
+        if (
+            cache_length_bucketing
+            and getattr(args, "length_bucket_size", None) is None
+            and getattr(args, "auto_length_bucket_size", True)
+        ):
+            auto_tune_length_bucket_size_from_token_cache(args, cache_dir)
         if cache_length_bucketing:
             print("INFO: Using HF random-access token cache with automatic per-step length bucketing.")
         else:
@@ -762,13 +931,16 @@ def main():
     train_group.add_argument("--prefetch-factor", "--prefetch_factor", dest="prefetch_factor", type=int, default=None, help="Batches prefetched per DataLoader worker (auto keeps total queued batches tied to worker count).")
     train_group.add_argument("--pt-cache-size", "--pt_cache_size", dest="pt_cache_size", type=int, default=2, help="Number of .pt chunk files to keep hot per worker for --pre_pt_dataset.")
     train_group.add_argument("--no-length-bucketing", dest="length_bucketing", action="store_false", help="Disable length-aware batching for training datasets.")
-    train_group.add_argument("--length-bucket-size", "--length_bucket_size", dest="length_bucket_size", type=int, default=None, help="Samples per length bucket/window. Larger lowers padding; smaller lowers streaming latency. CUDA batch>=64 auto-uses 65536 with HF token cache, otherwise 8192.")
+    train_group.add_argument("--length-bucket-size", "--length_bucket_size", dest="length_bucket_size", type=int, default=None, help="Samples per length bucket/window. Manual override; by default CUDA HF token-cache runs auto-tune this from cached sample lengths.")
+    train_group.add_argument("--no-auto-length-bucket-size", dest="auto_length_bucket_size", action="store_false", help="Disable startup auto-tuning of HF token-cache length bucket size.")
+    train_group.add_argument("--length-bucket-auto-tolerance", "--length_bucket_auto_tolerance", dest="length_bucket_auto_tolerance", type=float, default=0.005, help="Pick the smallest bucket within this absolute token-efficiency margin of the best auto-tuned bucket. Use 0 for max padding reduction.")
     train_group.add_argument("--no-streaming-datasets", dest="streaming_datasets", action="store_false", help="Disable streaming for raw JSONL/Hugging Face datasets and use map-style loading.")
     train_group.add_argument("--hf-streaming-shuffle-buffer", "--hf_streaming_shuffle_buffer", dest="hf_streaming_shuffle_buffer", type=int, default=10000, help="Buffered shuffle size for Hugging Face streaming datasets.")
     train_group.add_argument("--hf-auto-shard", dest="hf_auto_shard", action="store_true", help="Opt into local tokenized shard caching for single-shard HF streaming datasets.")
     train_group.add_argument("--no-hf-auto-shard", dest="hf_auto_shard", action="store_false", help="Use indexed HF loading instead of local tokenized shard caching for single-shard HF datasets.")
     train_group.set_defaults(hf_auto_shard=False)
     train_group.set_defaults(length_bucketing=True)
+    train_group.set_defaults(auto_length_bucket_size=True)
     train_group.add_argument("--hf-shard-cache-dir", "--hf_shard_cache_dir", dest="hf_shard_cache_dir", type=str, default=None, help="Directory for cached local HF tokenized shard files.")
     train_group.add_argument("--refresh-hf-shards", "--refresh_hf_shards", dest="refresh_hf_shards", action="store_true", help="Rebuild cached local HF tokenized shards before training.")
     train_group.add_argument("--hf-cache-chunks-per-file", "--hf_cache_chunks_per_file", dest="hf_cache_chunks_per_file", type=int, default=2048, help="Tokenized samples per cached HF .pt shard chunk.")
@@ -872,7 +1044,8 @@ def main():
         args.length_bucket_size,
         pt_device,
         args.batch_size,
-        hf_token_cache=getattr(args, "hf_token_cache", False),
+        hf_token_cache=getattr(args, "hf_token_cache", False) and _length_bucketing_enabled(args),
+        auto_tune=getattr(args, "auto_length_bucket_size", True),
     )
     if bucket_message:
         print(bucket_message)

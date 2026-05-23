@@ -334,6 +334,8 @@ if _NUMBA_OK:
                 next_tr[tr_count] = head[parent]
                 head[parent] = tr_count
                 tr_count += 1
+            else:
+                raise RuntimeError("ROSA transition buffer exhausted")
 
         def _copy_trans(src_state, dst_state):
             """Copy all transitions of src_state to dst_state."""

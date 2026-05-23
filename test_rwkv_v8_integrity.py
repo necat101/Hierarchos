@@ -7,6 +7,7 @@ import hierarchos
 from hierarchos import AttrDict, HierarchosCore
 from hierarchos.models.core import _resolve_compile_kwargs
 from hierarchos.models.rwkv_cell import RWKVCell
+from hierarchos.utils.rosa import precompute_rosa_ids_for_chunks
 
 
 def _tiny_config():
@@ -172,6 +173,75 @@ class RWKVV8IntegrityTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(out["loss"]))
         out["loss"].backward()
         self.assertTrue(torch.isfinite(model.tok_emb.weight.grad).all())
+
+    def test_cached_rosa_chunked_forward_matches_live_rosa_forward(self):
+        torch.manual_seed(23)
+        cfg = _tiny_config()
+        cfg.rosa_max_context = 7
+        model = HierarchosCore(cfg)
+        model.eval()
+
+        input_ids = torch.tensor([[1, 2, 1, 2, 3, 1, 2, 4, 1]], dtype=torch.long)
+        labels = input_ids.clone()
+        labels[:, 0] = -100
+        chunk_size = 4
+        cached_rosa = torch.tensor(
+            [
+                precompute_rosa_ids_for_chunks(
+                    input_ids[0].tolist(),
+                    vocab_size=cfg.vocab_size,
+                    chunk_size=chunk_size,
+                    rosa_max_ctx=cfg.rosa_max_context,
+                )
+            ],
+            dtype=torch.long,
+        )
+
+        live_states = dict(
+            h_state=None,
+            l_state=None,
+            prev_context=None,
+            target_context=None,
+            drift_state=None,
+            ltm_memory_state=None,
+        )
+        cached_states = dict(live_states)
+
+        with torch.no_grad():
+            for start in range(0, input_ids.shape[1], chunk_size):
+                end = min(start + chunk_size, input_ids.shape[1])
+                common_kwargs = dict(
+                    input_ids=input_ids[:, start:end],
+                    labels=labels[:, start:end],
+                    global_pos_offset=start,
+                    return_topk_values=False,
+                )
+                live = model(**common_kwargs, **live_states)
+                cached = model(
+                    **common_kwargs,
+                    **cached_states,
+                    rosa_ids=cached_rosa[:, start:end],
+                )
+
+                torch.testing.assert_close(cached["logits"], live["logits"], rtol=0, atol=0)
+                torch.testing.assert_close(cached["loss"], live["loss"], rtol=0, atol=0)
+
+                live_states = {
+                    "h_state": live["h_state"],
+                    "l_state": live["l_state"],
+                    "prev_context": live["prev_context"],
+                    "target_context": live["target_context"],
+                    "drift_state": live["drift_state"],
+                    "ltm_memory_state": live["ltm_memory_state"],
+                }
+                cached_states = {
+                    "h_state": cached["h_state"],
+                    "l_state": cached["l_state"],
+                    "prev_context": cached["prev_context"],
+                    "target_context": cached["target_context"],
+                    "drift_state": cached["drift_state"],
+                    "ltm_memory_state": cached["ltm_memory_state"],
+                }
 
     def test_time_mix_uses_matrix_state_recurrence(self):
         torch.manual_seed(7)

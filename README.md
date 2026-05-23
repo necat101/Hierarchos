@@ -339,10 +339,10 @@ python hierarchos_cli.py train \
 
 -----
 
-💡 **CUDA Auto-Optimization:** On NVIDIA GPUs, AMP, TF32, cuDNN benchmark, and torch.compile are **auto-enabled**. Long CUDA runs default to `--compile-mode max-autotune`, static RWKV worker-loop capture, H-RNN cell compilation, and CUDA graphs. Use `--no-amp` to disable AMP.
+💡 **CUDA Auto-Optimization:** On NVIDIA GPUs, AMP, TF32, cuDNN benchmark, and torch.compile are **auto-enabled**. Long CUDA runs default to `--compile-mode max-autotune-no-cudagraphs`, static RWKV worker-loop capture, and H-RNN cell compilation. This keeps autotuned CUDA kernels while avoiding CUDA graph fast-path warnings from TBPTT submodule calls. Use `--compile-mode max-autotune --compile-cudagraphs` only when benchmarking CUDA graphs explicitly.
 💾 **Training on Low Memory:** Use `--gradient-checkpointing` to significantly reduce VRAM usage at the cost of some extra computation.
 🎮 **AMD GPU Training:** Use `--device dml` to train on AMD Radeon GPUs via DirectML. AMP is automatically disabled for stability.
-🚀 **Datacenter Training:** the default CUDA profile targets the 232M `448/448/448` run on a 96GB Blackwell-class NVIDIA card: `--batch_size 64`, `--training-chunk-size 256`, HF token cache, length bucketing, auto CUDA workers up to 8, BF16 AMP, TF32, and `torch.compile --compile-mode max-autotune`.
+🚀 **Datacenter Training:** the default CUDA profile targets the 232M `448/448/448` run on a 96GB Blackwell-class NVIDIA card: `--batch_size 64`, `--training-chunk-size 256`, HF token cache, length bucketing, auto CUDA workers up to 8, BF16 AMP, TF32, and `torch.compile --compile-mode max-autotune-no-cudagraphs`.
 
 ## ⚠️ **HRM Convergence & Training Speed:** Higher `--max_h_steps` and `--max_l_steps` allow deeper reasoning but **significantly increase training time** per batch due to the iterative HRM process. Adjust based on your task and compute resources.
 
@@ -624,8 +624,8 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.5 --top-
 | `--ltm_lr`                     | `train`, `finetune`, `chat`         | Learning Rate for LTM "surprise" updates (or max LR for LTM schedule in chat).                                                         | `0.01`                  |
 | `--compile`                    | `train`, `finetune`                 | **Enable torch.compile (auto-enabled on CUDA).**                                                                              | `False`                 |
 | `--force-compile`              | `train`, `finetune`                 | Force torch.compile even on Windows CPU (overrides safety check).                                                                         | `False`                 |
-| `--compile-mode`               | `train`, `finetune`                 | torch.compile mode for the RWKV hot path. `max-autotune` has longer startup but best amortized CUDA throughput for long runs. | `max-autotune`          |
-| `--no-compile-cudagraphs`      | `train`, `finetune`                 | Disable CUDA graph capture inside torch.compile.                                                                                         | `False`                 |
+| `--compile-mode`               | `train`, `finetune`                 | torch.compile mode for the RWKV hot path. `max-autotune-no-cudagraphs` has longer startup than eager/reduce-overhead but keeps autotuned kernels without CUDA graph recapture warnings. | `max-autotune-no-cudagraphs` |
+| `--compile-cudagraphs`         | `train`, `finetune`                 | Enable CUDA graph capture inside torch.compile for explicit benchmarking.                                                                 | `False`                 |
 | `--no-compile-pad-to-chunk-size` | `train`, `finetune`               | Disable CUDA compile padding to `training_chunk_size` multiples; leaving it enabled reduces shape recompiles.                            | `False`                 |
 | `--no-compile-static-worker-loop` | `train`, `finetune`              | Disable the compile-friendly fixed WorkerLoop used by CUDA compile.                                                                       | `False`                 |
 | `--amp`                        | `train`, `finetune`, `chat`         | **Enable Automatic Mixed Precision (auto-enabled on CUDA).**                                                                                     | `False`                 |

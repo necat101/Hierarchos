@@ -769,21 +769,24 @@ def main():
     parser.add_argument(
         "--compile-mode",
         choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"],
-        default="max-autotune",
-        help="torch.compile mode for the RWKV hot path. max-autotune has longer startup but best amortized CUDA throughput for long runs.",
+        default="max-autotune-no-cudagraphs",
+        help="torch.compile mode for the RWKV hot path. max-autotune-no-cudagraphs keeps autotuned kernels without cudagraph warnings from TBPTT submodule calls.",
     )
     parser.add_argument("--compile-dynamic", action="store_true", help="Compile with dynamic shapes. Slower, but useful if batch/sequence geometry changes often.")
     parser.add_argument("--compile-backend", default=None, help="Optional torch.compile backend override, e.g. eager for diagnostics or inductor for production.")
     parser.add_argument("--compile-fullgraph-worker", action="store_true", help="Require the worker loop to compile as one full graph. Useful for diagnostics; falls back on failure.")
+    parser.add_argument("--compile-cudagraphs", dest="compile_cudagraphs", action="store_true", help="Opt into CUDA graph capture inside torch.compile. Pair with --compile-mode max-autotune to test it; it can warn with TBPTT submodule compilation.")
     parser.add_argument("--no-compile-cudagraphs", dest="compile_cudagraphs", action="store_false", help="Disable CUDA graph capture inside torch.compile.")
     parser.add_argument("--no-compile-pad-to-chunk-size", dest="compile_pad_to_chunk_size", action="store_false", help="Disable CUDA compile padding to training_chunk_size multiples.")
     parser.add_argument("--compile-static-worker-loop", dest="compile_static_worker_loop", action="store_true", default=None, help="Force the compile-friendly fixed WorkerLoop even outside CUDA auto-compile.")
     parser.add_argument("--no-compile-static-worker-loop", dest="compile_static_worker_loop", action="store_false", help="Keep the old data-dependent WorkerLoop early break under torch.compile.")
     parser.add_argument("--no-compile-h-rnn", dest="compile_h_rnn", action="store_false", help="Compile only the L/worker hot loop, leaving the H RWKV cell eager.")
+    parser.add_argument("--verbose-compile", dest="compile_quiet", action="store_false", help="Let torch.compile/Triton emit verbose autotune logs.")
     parser.set_defaults(
-        compile_cudagraphs=True,
+        compile_cudagraphs=False,
         compile_pad_to_chunk_size=True,
         compile_h_rnn=True,
+        compile_quiet=True,
     )
 
     # --- Evaluation Arguments (lm-evaluation-harness) ---

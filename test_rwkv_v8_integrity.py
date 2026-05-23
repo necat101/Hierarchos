@@ -61,6 +61,20 @@ class RWKVV8IntegrityTests(unittest.TestCase):
         self.assertEqual(kwargs["mode"], "max-autotune-no-cudagraphs")
         self.assertNotIn("options", kwargs)
 
+    def test_cuda_compile_defaults_keep_autotune_without_cudagraphs(self):
+        cfg = AttrDict(
+            compile_mode="max-autotune-no-cudagraphs",
+            compile_dynamic=False,
+            compile_backend=None,
+        )
+
+        kwargs, mode, cudagraphs = _resolve_compile_kwargs(cfg, "cuda")
+
+        self.assertEqual(mode, "max-autotune-no-cudagraphs")
+        self.assertFalse(cudagraphs)
+        self.assertEqual(kwargs["mode"], "max-autotune-no-cudagraphs")
+        self.assertNotIn("options", kwargs)
+
     def test_conservative_448_default_stays_near_233m_with_real_rwkv_heads(self):
         cfg = AttrDict(
             vocab_size=50257,

@@ -29,7 +29,12 @@ from hierarchos import (
     process_text_sample,
     create_dataloader_for_chunked,
     create_dataloader_pt_chunked,
-    create_dataloader_for_tokenized_cache
+    create_dataloader_for_tokenized_cache,
+    format_results,
+    format_benchmark_catalog,
+    resolve_task_names,
+    run_post_training_benchmarks,
+    write_benchmark_artifacts,
 )
 from hierarchos.utils.rosa import precompute_rosa_ids_for_chunks
 
@@ -887,7 +892,7 @@ def resolve_num_workers(requested_workers, device, batch_size):
 
 def main():
     parser = argparse.ArgumentParser(description="hierarchos: A Hybrid Memory-Reasoning Architecture")
-    parser.add_argument("mode", type=str, choices=["train", "finetune", "chat", "quantize", "merge-lora", "ckpt-2-inf"], help="Operation mode.")
+    parser.add_argument("mode", type=str, choices=["train", "finetune", "chat", "benchmark", "quantize", "merge-lora", "ckpt-2-inf"], help="Operation mode.")
 
     # --- Data and Path Arguments ---
     path_group = parser.add_argument_group('Paths and Data')
@@ -1050,6 +1055,26 @@ def main():
         help="Limit samples per task for fast evaluation runs (e.g., 10 for quick tests).")
     eval_group.add_argument("--eval-steps", type=int, default=None,
         help="Run evaluation every N training steps (for quick testing). Triggers periodically.")
+    eval_group.add_argument("--benchmark-suite", type=str, nargs='+', default=None,
+        help="Post-training benchmark suite(s) for benchmark mode. Examples: frontier-text, frontier, math, coding, arc-agi-family.")
+    eval_group.add_argument("--benchmark", type=str, nargs='+', default=None,
+        help="Individual post-training benchmarks or raw lm-eval task ids. Examples: gpqa-diamond aime25 arc-agi mmlu_pro.")
+    eval_group.add_argument("--benchmark-out-dir", type=str, default="./benchmark_results",
+        help="Directory for post-training benchmark reports.")
+    eval_group.add_argument("--benchmark-run-name", type=str, default=None,
+        help="Optional report folder name inside --benchmark-out-dir.")
+    eval_group.add_argument("--list-benchmarks", action="store_true",
+        help="List supported benchmark suites and benchmark aliases, then exit.")
+    eval_group.add_argument("--strict-benchmarks", action="store_true",
+        help="Validate lm-eval task ids before running and fail if any are missing.")
+    eval_group.add_argument("--arc-agi-path", type=str, default=None,
+        help="Local ARC-AGI JSON file or directory. Enables runnable ARC-AGI/ARC-AGI-2 benchmark entries.")
+    eval_group.add_argument("--arc-agi-max-tasks", type=int, default=None,
+        help="Limit local ARC-AGI tasks for quick runs.")
+    eval_group.add_argument("--arc-agi-max-test-items", type=int, default=None,
+        help="Limit total ARC-AGI test items across loaded tasks.")
+    eval_group.add_argument("--arc-agi-keep-samples", action="store_true",
+        help="Store ARC-AGI raw generations and parsed grids in results.json.")
 
     # --- Inference & Sampling ---
     infer_group = parser.add_argument_group('Inference')
@@ -1090,6 +1115,25 @@ def main():
     util_group.add_argument("--ckpt-tok-path", type=str, default=None, help="HuggingFace tokenizer name/path to embed in the inference model (e.g., 'gpt2', 'openai-community/gpt2').")
     
     args = parser.parse_args()
+
+    if args.mode == "benchmark" and args.list_benchmarks:
+        if format_benchmark_catalog is None:
+            print("ERROR: Benchmark registry is unavailable.")
+            sys.exit(1)
+        print(format_benchmark_catalog(include_external=True))
+        return
+
+    if args.mode == "benchmark" and not args.model_path:
+        print("ERROR: benchmark mode requires --model-path.")
+        print("       Use --list-benchmarks to inspect available benchmark suites without loading a model.")
+        sys.exit(1)
+
+    if args.mode in ("train", "finetune") and args.eval_tasks and resolve_task_names is not None:
+        resolved_eval_tasks, skipped_eval_specs, _ = resolve_task_names(args.eval_tasks)
+        args.eval_tasks = resolved_eval_tasks
+        if skipped_eval_specs:
+            skipped_names = ", ".join(spec.display_name for spec in skipped_eval_specs)
+            print(f"INFO: Skipping non-lm-eval benchmark entries in --eval-tasks: {skipped_names}")
 
     # Parity: hidden size auto-sync
     if args.mode == 'train' and not args.resume_from_ckpt:
@@ -1212,6 +1256,57 @@ def main():
         train(args, pt_device, tokenizer, dataloader, dataloader_len)
     elif args.mode == "chat":
         chat(args, pt_device, tokenizer)
+    elif args.mode == "benchmark":
+        if run_post_training_benchmarks is None or write_benchmark_artifacts is None:
+            print("ERROR: Post-training benchmark support is unavailable.")
+            sys.exit(1)
+
+        print(f"Loading model for post-training benchmarks: {args.model_path}")
+        try:
+            model, _ = load_full_model_with_config(args.model_path, pt_device)
+        except Exception as e:
+            print(f"ERROR: Failed to load model for benchmark mode: {e}")
+            sys.exit(1)
+
+        try:
+            results, manifest, skipped = run_post_training_benchmarks(
+                model=model,
+                tokenizer=tokenizer,
+                device=pt_device,
+                benchmark_names=args.benchmark,
+                suite_names=args.benchmark_suite,
+                raw_tasks=args.eval_tasks,
+                batch_size=args.eval_batch_size,
+                limit=args.eval_limit,
+                verbosity="WARNING",
+                strict=args.strict_benchmarks,
+                arc_agi_path=args.arc_agi_path,
+                arc_agi_max_tasks=args.arc_agi_max_tasks,
+                arc_agi_max_test_items=args.arc_agi_max_test_items,
+                arc_agi_keep_samples=args.arc_agi_keep_samples,
+                max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+            )
+        except Exception as e:
+            print(f"ERROR: Benchmark run failed: {e}")
+            traceback.print_exc()
+            sys.exit(1)
+
+        print(format_results(results))
+        if skipped:
+            print("\nSkipped external benchmarks:")
+            for spec in skipped:
+                detail = spec.notes or spec.description
+                print(f"  - {spec.display_name} ({spec.key}): {detail}")
+
+        run_dir = write_benchmark_artifacts(
+            output_dir=args.benchmark_out_dir,
+            run_name=args.benchmark_run_name,
+            results=results,
+            manifest=manifest,
+            skipped=skipped,
+        )
+        print(f"\nBenchmark artifacts saved to: {run_dir}")
     elif args.mode == "finetune":
         # Build dataloader for finetune
         dataloader = None

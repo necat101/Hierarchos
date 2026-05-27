@@ -504,14 +504,51 @@ a local model directory containing `hierarchos.pt` or `model.pt`, or a direct
 
 ### Workflow 10: Benchmark Evaluation (lm-eval)
 
-Run standardized LLM benchmarks on your model. Requires `pip install lm-eval` (automatically installed through the setup script if you used it).
+Run standardized LLM benchmarks on your model. Requires `pip install lm-eval` (automatically installed through the setup script if you used it). Hierarchos now has named benchmark suites for post-training reporting, including common frontier-model benchmarks such as MMLU-Pro, GPQA Diamond, AIME 2025, BBH, IFEval, coding tasks, and ARC-AGI.
+
+**List supported suites and benchmarks:**
+```bash
+python hierarchos_cli.py benchmark --list-benchmarks
+```
+
+**Post-training frontier text suite:**
+```bash
+python hierarchos_cli.py benchmark \
+    --model-path ./hierarchos_model \
+    --benchmark-suite frontier-text \
+    --eval-batch-size 1 \
+    --eval-limit 100
+```
+
+Results are written to `benchmark_results/<run>/results.json`, with a reproducibility manifest and Markdown summary beside it.
+
+**ARC-AGI local JSON run:**
+```bash
+python hierarchos_cli.py benchmark \
+    --model-path ./hierarchos_model \
+    --benchmark arc-agi \
+    --arc-agi-path ./ARC-AGI/data/evaluation \
+    --arc-agi-max-tasks 20
+```
+
+`--arc-agi-path` accepts a single ARC-style JSON file or a directory tree of JSON tasks with `train` and `test` pairs. This is a local public-data runner; use the official ARC Prize path for private leaderboard-comparable numbers.
+
+**Official ARC Prize path:**
+
+- ARC-AGI-1/2 technical guide and data format: https://arcprize.org/guide/1
+- ARC-AGI-1 public data source: https://github.com/fchollet/ARC-AGI
+- ARC-AGI-2 public data source: https://github.com/arcprize/ARC-AGI-2
+- ARC-AGI-2 official Kaggle/private evaluation route: https://www.kaggle.com/competitions/arc-prize-2026-arc-agi-2
+- ARC-AGI-3 docs and API/toolkit route: https://docs.arcprize.org/
+- ARC-AGI-3 official Kaggle route: https://www.kaggle.com/competitions/arc-prize-2026-arc-agi-3
+- ARC Prize community leaderboard submission repo: https://github.com/arcprize/ARC-AGI-Community-Leaderboard
 
 **During Training (End of Epoch):**
 ```bash
 python hierarchos_cli.py train \
     --hf_dataset "tatsu-lab/alpaca" \
     --alpaca \
-    --eval-tasks hellaswag arc_easy \
+    --eval-tasks smoke \
     --eval-every-epoch 1 \
     --eval-limit 100 # Optional: test on only 100 samples for speed
 ```
@@ -521,7 +558,7 @@ python hierarchos_cli.py train \
 python hierarchos_cli.py train \
     --hf_dataset "tatsu-lab/alpaca" \
     --alpaca \
-    --eval-tasks arc_easy \
+    --eval-tasks arc_easy gpqa-diamond \
     --eval-steps 500 # Runs every 500 steps
     --eval-limit 10
 ```

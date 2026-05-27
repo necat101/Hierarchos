@@ -83,6 +83,29 @@ class LengthGroupedBatchSampler(Sampler):
             for batch in batches:
                 yield batch
 
+class EpochShuffleSampler(Sampler):
+    """Deterministic map-style sampler with an epoch hook for resume parity."""
+    def __init__(self, data_source, shuffle: bool = True, seed: Optional[int] = None):
+        self.data_source = data_source
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed if seed is not None else torch.initial_seed()) % (2**63 - 1)
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int):
+        self.epoch = int(epoch)
+
+    def __len__(self):
+        return len(self.data_source)
+
+    def __iter__(self):
+        length = len(self.data_source)
+        if self.shuffle and length > 1:
+            generator = torch.Generator()
+            generator.manual_seed((self.seed + self.epoch) % (2**63 - 1))
+            yield from torch.randperm(length, generator=generator).tolist()
+        else:
+            yield from range(length)
+
 def _normalize_sample_lengths(dataset, lengths):
     if lengths is None:
         return None
@@ -135,7 +158,7 @@ def _resolve_prefetch_factor(num_workers: int, prefetch_factor=None, pin_memory:
 
 def _create_dataloader(dataset, *, batch_size=None, collate_fn=None, num_workers=0,
                        pin_memory=False, shuffle=None, drop_last=False,
-                       batch_sampler=None, prefetch_factor=None):
+                       batch_sampler=None, sampler=None, prefetch_factor=None):
     resolved_num_workers = int(num_workers or 0)
     if resolved_num_workers < 0:
         resolved_num_workers = 0
@@ -150,7 +173,9 @@ def _create_dataloader(dataset, *, batch_size=None, collate_fn=None, num_workers
         kwargs["batch_sampler"] = batch_sampler
     else:
         kwargs["batch_size"] = batch_size
-        if shuffle is not None:
+        if sampler is not None:
+            kwargs["sampler"] = sampler
+        elif shuffle is not None:
             kwargs["shuffle"] = shuffle
         kwargs["drop_last"] = drop_last
 
@@ -386,6 +411,7 @@ class IterableChunkedJSONLDataset(IterableDataset):
         self.bucket_size = max(0, int(bucket_size or 0))
         self.batch_size = max(1, int(batch_size))
         self.shuffle_buckets = bool(shuffle_buckets)
+        self.seed = int(torch.initial_seed()) % (2**63 - 1)
         self.epoch = 0
 
     def set_epoch(self, epoch: int):
@@ -401,7 +427,7 @@ class IterableChunkedJSONLDataset(IterableDataset):
         processed_count = 0
         bucket = []
         generator = torch.Generator()
-        generator.manual_seed((torch.initial_seed() + self.epoch + worker_id) % (2**63 - 1))
+        generator.manual_seed((self.seed + self.epoch + worker_id) % (2**63 - 1))
 
         try:
             for _line_num, line in _iter_jsonl_shards_for_worker(self.paths, worker_id, num_workers):
@@ -573,11 +599,12 @@ def create_dataloader_pt_chunked(directory_path, max_length, batch_size, num_wor
             prefetch_factor=prefetch_factor,
         )
 
+    sampler = EpochShuffleSampler(dataset, shuffle=True)
     return _create_dataloader(
         dataset,
         batch_size=batch_size,
         collate_fn=collate_fn_pt,
-        shuffle=True,
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=use_cuda,
         prefetch_factor=prefetch_factor,
@@ -912,6 +939,7 @@ class StreamingJSONLDataset(IterableDataset):
         self.bucket_size = max(0, int(bucket_size or 0))
         self.batch_size = max(1, int(batch_size))
         self.shuffle_buckets = bool(shuffle_buckets)
+        self.seed = int(torch.initial_seed()) % (2**63 - 1)
         self.epoch = 0
 
     def set_epoch(self, epoch: int):
@@ -924,7 +952,7 @@ class StreamingJSONLDataset(IterableDataset):
 
         bucket = []
         generator = torch.Generator()
-        generator.manual_seed((torch.initial_seed() + self.epoch + worker_id) % (2**63 - 1))
+        generator.manual_seed((self.seed + self.epoch + worker_id) % (2**63 - 1))
 
         for _line_num, line in _iter_jsonl_shards_for_worker(self.paths, worker_id, num_workers):
             line = line.strip()
@@ -1022,6 +1050,7 @@ class HuggingFaceStreamingDataset(IterableDataset):
         self.batch_size = max(1, int(batch_size))
         self.shuffle = bool(shuffle)
         self.shuffle_buffer_size = max(0, int(shuffle_buffer_size or 0))
+        self.seed = int(torch.initial_seed()) % (2**32 - 1)
         self.epoch = 0
 
     def set_epoch(self, epoch: int):
@@ -1031,7 +1060,7 @@ class HuggingFaceStreamingDataset(IterableDataset):
         worker_info = torch.utils.data.get_worker_info()
         worker_id = worker_info.id if worker_info is not None else 0
         num_workers = worker_info.num_workers if worker_info is not None else 1
-        seed = int((torch.initial_seed() + (self.epoch * 100003) + worker_id) % (2**32 - 1))
+        seed = int((self.seed + (self.epoch * 100003) + worker_id) % (2**32 - 1))
         dataset = _maybe_shuffle_hf_dataset(
             self.hf_dataset,
             shuffle=self.shuffle,
@@ -1237,11 +1266,12 @@ def create_map_style_dataloader(dataset, batch_size, pad_token_id, num_workers=0
             prefetch_factor=prefetch_factor,
         )
 
+    sampler = EpochShuffleSampler(dataset, shuffle=shuffle)
     return _create_dataloader(
         dataset,
         batch_size=batch_size,
         collate_fn=collate,
-        shuffle=shuffle,
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=use_cuda,
         drop_last=drop_last,

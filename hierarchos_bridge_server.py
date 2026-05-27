@@ -12,6 +12,7 @@ import json
 import threading
 import traceback
 import time
+import copy
 
 # Ensure stdout is line-buffered for real-time streaming to the Rust GUI
 sys.stdout.reconfigure(line_buffering=True)
@@ -316,7 +317,19 @@ def _rosa_past_tokens_from_ltm_state(ltm_state):
     return _tensor_to_cpu(ltm_state[2])
 
 
-def _ltm_state_from_rosa_past(rosa_past_tokens):
+def _rosa_states_from_ltm_state(ltm_state):
+    if ltm_state is None or not isinstance(ltm_state, (tuple, list)) or len(ltm_state) < 4:
+        return None
+    rosa_states = ltm_state[3]
+    if rosa_states is None:
+        return None
+    try:
+        return copy.deepcopy(rosa_states)
+    except Exception:
+        return rosa_states
+
+
+def _ltm_state_from_rosa_context(rosa_past_tokens, rosa_states=None):
     """Resume ROSA context without putting per-chat LTM values in state files."""
     if _model is None or not hasattr(_model, "ltm"):
         return None
@@ -334,12 +347,16 @@ def _ltm_state_from_rosa_past(rosa_past_tokens):
             fast_vals,
             torch.zeros_like(mom_vals),
             rosa_past_tokens.detach().cpu().clone(),
-            None,
+            copy.deepcopy(rosa_states) if rosa_states is not None else None,
             getattr(ltm, "timestamps", None),
             getattr(ltm, "sources", None),
         )
     except Exception:
         return None
+
+
+def _ltm_state_from_rosa_past(rosa_past_tokens):
+    return _ltm_state_from_rosa_context(rosa_past_tokens, None)
 
 
 def _normalize_chat_state_path(path: str) -> str:
@@ -357,7 +374,7 @@ def _write_chat_runtime_state(path: str):
     import torch
 
     payload = {
-        "version": 2,
+        "version": 3,
         "kind": "hierarchos_chat_runtime_state",
         "saved_at": time.time(),
         "model_dir": _model_dir,
@@ -369,6 +386,7 @@ def _write_chat_runtime_state(path: str):
         "target_context": _tensor_to_cpu(_target_context),
         "drift_state": _tensor_to_cpu(_drift_state),
         "rosa_past_tokens": _rosa_past_tokens_from_ltm_state(_ltm_state),
+        "rosa_states": _rosa_states_from_ltm_state(_ltm_state),
     }
     from hierarchos.inference.chat_state import recurrent_state_metadata
 
@@ -429,8 +447,11 @@ def _load_chat_runtime_state(path: str):
     _total_tokens_generated = int(payload.get("total_tokens_generated") or 0)
 
     # LTM fast/momentum state is deliberately not per-chat. The model/LTM sidecar
-    # owns persistent memory; chat files only keep capped ROSA token context.
-    _ltm_state = _ltm_state_from_rosa_past(payload.get("rosa_past_tokens"))
+    # owns persistent memory; chat files keep full ROSA token history/state.
+    _ltm_state = _ltm_state_from_rosa_context(
+        payload.get("rosa_past_tokens"),
+        payload.get("rosa_states"),
+    )
     return path
 
 

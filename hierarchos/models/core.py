@@ -521,13 +521,22 @@ class HierarchosCore(nn.Module):
         if self.use_rosa:
             if cached_rosa_ids is None:
                 # Finalize: wait for CPU work, async H2D transfer
-                rosa_batch_tensor, rosa_input, new_rosa_states = rosa_finalize()
-                # Store past_tokens for cross-chunk continuity (capped by rosa_max_ctx)
+                rosa_batch_tensor, rosa_past_tokens, new_rosa_states = rosa_finalize()
+                # Store complete past_tokens for cross-chunk/chat continuity.
                 # Detach and move to CPU immediately to prevent GPU memory leak across chunks
-                new_past_tokens = rosa_input.detach().cpu()
+                new_past_tokens = rosa_past_tokens.detach().cpu()
             else:
                 rosa_batch_tensor = cached_rosa_ids
-                new_past_tokens = past_tokens
+                input_ids_cpu = input_ids.detach().to(device="cpu", dtype=torch.long)
+                if torch.is_tensor(past_tokens):
+                    past_tokens_cpu = past_tokens.detach().to(device="cpu", dtype=torch.long)
+                    if past_tokens_cpu.dim() == 1:
+                        past_tokens_cpu = past_tokens_cpu.unsqueeze(0)
+                    if past_tokens_cpu.shape[0] == 1 and input_ids_cpu.shape[0] > 1:
+                        past_tokens_cpu = past_tokens_cpu.expand(input_ids_cpu.shape[0], -1)
+                    new_past_tokens = torch.cat([past_tokens_cpu, input_ids_cpu], dim=1)
+                else:
+                    new_past_tokens = input_ids_cpu
                 new_rosa_states = rosa_states
 
             rosa_embs = self.rosa_emb(rosa_batch_tensor)

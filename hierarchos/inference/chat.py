@@ -18,6 +18,7 @@ import signal
 import traceback
 import math
 import time
+import copy
 from datetime import datetime
 import torch
 import torch.nn as nn
@@ -205,6 +206,7 @@ def save_hierarchical_chat_state(
         raise ValueError("No chat state path provided.")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     rosa_past_tokens = _rosa_past_tokens_from_ltm_state(ltm_state)
+    rosa_states = _rosa_states_from_ltm_state(ltm_state)
     payload = {
         "version": CHAT_STATE_VERSION,
         "kind": CHAT_STATE_KIND,
@@ -218,6 +220,7 @@ def save_hierarchical_chat_state(
         "target_context": _tensor_to_cpu(target_context),
         "drift_state": _tensor_to_cpu(drift_state),
         "rosa_past_tokens": rosa_past_tokens,
+        "rosa_states": rosa_states,
     }
     payload.update(
         recurrent_state_metadata(
@@ -277,19 +280,35 @@ def load_hierarchical_chat_state(path, *, config, device, model=None):
         "rosa_past_tokens": payload.get("rosa_past_tokens").cpu()
         if torch.is_tensor(payload.get("rosa_past_tokens"))
         else None,
+        "rosa_states": copy.deepcopy(payload.get("rosa_states"))
+        if payload.get("rosa_states") is not None
+        else None,
         "total_tokens_generated": int(payload.get("total_tokens_generated") or 0),
     }
 
 
 def _rosa_past_tokens_from_ltm_state(ltm_state):
-    """Extract only capped ROSA token context from an LTM state tuple."""
+    """Extract full ROSA token history from an LTM state tuple."""
     if ltm_state is None or not isinstance(ltm_state, (tuple, list)) or len(ltm_state) < 3:
         return None
     return _tensor_to_cpu(ltm_state[2])
 
 
-def _chat_ltm_state_from_rosa_past(model, rosa_past_tokens):
-    """Rehydrate ROSA continuation without restoring per-chat LTM fast buffers."""
+def _rosa_states_from_ltm_state(ltm_state):
+    """Extract V8 ROSA automaton state from an LTM state tuple."""
+    if ltm_state is None or not isinstance(ltm_state, (tuple, list)) or len(ltm_state) < 4:
+        return None
+    rosa_states = ltm_state[3]
+    if rosa_states is None:
+        return None
+    try:
+        return copy.deepcopy(rosa_states)
+    except Exception:
+        return rosa_states
+
+
+def _chat_ltm_state_from_rosa_context(model, rosa_past_tokens, rosa_states=None):
+    """Rehydrate V8 ROSA continuation without restoring per-chat LTM fast buffers."""
     if not torch.is_tensor(rosa_past_tokens) or not hasattr(model, "ltm"):
         return None
 
@@ -305,10 +324,14 @@ def _chat_ltm_state_from_rosa_past(model, rosa_past_tokens):
         fast_vals,
         torch.zeros_like(mom_vals),
         rosa_past_tokens.detach().cpu().clone(),
-        None,
+        copy.deepcopy(rosa_states) if rosa_states is not None else None,
         timestamps,
         sources,
     )
+
+
+def _chat_ltm_state_from_rosa_past(model, rosa_past_tokens):
+    return _chat_ltm_state_from_rosa_context(model, rosa_past_tokens, None)
 
 
 def _setting_value(settings, name, default):
@@ -366,21 +389,34 @@ def generate_sample(model, tokenizer, prompt, device, max_new_tokens=100, temper
     model.suppress_hebbian = True
     tokens = tokenizer.encode(prompt, return_tensors="pt").to(device)
     h_state, l_state, p_ctx, t_ctx = None, None, None, None
+    drift_state = None
     ltm_state = None
+    total_tokens_generated = 0
 
     try:
         generated = tokens
         for _ in range(max_new_tokens):
             with torch.no_grad():
-                outputs = model(input_ids=tokens, h_state=h_state, l_state=l_state,
-                                prev_context=p_ctx, target_context=t_ctx, ltm_memory_state=ltm_state)
+                outputs = model(
+                    input_ids=tokens,
+                    h_state=h_state,
+                    l_state=l_state,
+                    prev_context=p_ctx,
+                    target_context=t_ctx,
+                    drift_state=drift_state,
+                    ltm_memory_state=ltm_state,
+                    global_pos_offset=total_tokens_generated,
+                    suppress_hebbian=True,
+                )
                 logits = outputs['logits'][:, -1, :] / max(temperature, 1e-6)
                 next_token = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
                 generated = torch.cat([generated, next_token], dim=1)
-                tokens = next_token
+                total_tokens_generated += int(tokens.shape[1])
                 h_state, l_state = outputs['h_state'], outputs['l_state']
                 p_ctx, t_ctx = outputs['prev_context'], outputs['target_context']
+                drift_state = outputs.get('drift_state', drift_state)
                 ltm_state = outputs.get('ltm_memory_state')
+                tokens = next_token
                 if next_token.item() == tokenizer.eos_token_id:
                     break
     finally:
@@ -938,9 +974,10 @@ def chat(args, device, tokenizer):
                 if restored["drift_state"] is not None:
                     drift_state = restored["drift_state"]
                 total_tokens_generated = restored["total_tokens_generated"]
-                ltm_state = _chat_ltm_state_from_rosa_past(
+                ltm_state = _chat_ltm_state_from_rosa_context(
                     model,
                     restored.get("rosa_past_tokens"),
+                    restored.get("rosa_states"),
                 )
                 print(f"Resumed hierarchical chat state from {chat_state_path}")
             except FileNotFoundError:

@@ -289,6 +289,8 @@ class QuantizedHierarchos:
             suppress_hebbian = False
         memory_timestamps = None
         memory_sources = None
+        past_tokens = None
+        rosa_states = None
         if ltm_memory_state is None:
             isolate_batch_ltm = getattr(self.config, 'isolate_batch_ltm', True) and B > 1
             if isolate_batch_ltm:
@@ -303,7 +305,9 @@ class QuantizedHierarchos:
                 memory_sources = self.ltm.sources
         else:
             if len(ltm_memory_state) >= 6:
-                curr_fast_vals, curr_mom_vals, _, _, memory_timestamps, memory_sources = ltm_memory_state[:6]
+                curr_fast_vals, curr_mom_vals, past_tokens, rosa_states, memory_timestamps, memory_sources = ltm_memory_state[:6]
+            elif len(ltm_memory_state) >= 4:
+                curr_fast_vals, curr_mom_vals, past_tokens, rosa_states = ltm_memory_state[:4]
             elif len(ltm_memory_state) >= 2:
                 curr_fast_vals, curr_mom_vals = ltm_memory_state[:2]
             else:
@@ -461,8 +465,8 @@ class QuantizedHierarchos:
             "ltm_memory_state": (
                 curr_fast_vals.cpu(),
                 curr_mom_vals.cpu(),
-                None,
-                None,
+                past_tokens.detach().cpu() if isinstance(past_tokens, torch.Tensor) else past_tokens,
+                rosa_states,
                 memory_timestamps.cpu() if isinstance(memory_timestamps, torch.Tensor) else memory_timestamps,
                 memory_sources.cpu() if isinstance(memory_sources, torch.Tensor) else memory_sources,
             )

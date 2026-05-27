@@ -13,7 +13,7 @@ import torch
 
 
 CHAT_STATE_KIND = "hierarchos_chat_runtime_state"
-CHAT_STATE_VERSION = 2
+CHAT_STATE_VERSION = 3
 RWKV_V8_LAYOUT = "rwkv_v8_matrix_packed"
 LEGACY_SCALAR_LAYOUT = "legacy_scalar_wkv"
 

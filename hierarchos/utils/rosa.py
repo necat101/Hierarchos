@@ -491,8 +491,8 @@ def precompute_rosa_ids_for_chunks(
     """
     Precompute the exact ROSA ids produced by the training forward path.
 
-    The live path caps ROSA context at the TBPTT chunk boundary, not separately
-    for each token, so this mirrors rosa_async_pipeline chunk-by-chunk.
+    The live path now carries full ROSA history across chunks, so this mirrors
+    rosa_async_pipeline chunk-by-chunk with persistent automaton state.
     """
     tokens = [int(token) for token in tokens]
     total = len(tokens)
@@ -501,24 +501,12 @@ def precompute_rosa_ids_for_chunks(
 
     no_prediction = int(vocab_size)
     chunk_size = max(1, int(chunk_size or total))
-    rosa_max_ctx = max(1, int(rosa_max_ctx or total))
     cached = [no_prediction] * total
+    state = None
 
     for start in range(0, total, chunk_size):
         end = min(start + chunk_size, total)
-        window_start = max(0, end - rosa_max_ctx)
-        window = tokens[window_start:end]
-        overlap_start = max(window_start, start)
-        overlap_len = max(0, end - overlap_start)
-        current_len = end - start
-        current_pad_len = max(0, current_len - overlap_len)
-
-        if overlap_len > 0:
-            window_preds = _rosa_jit(window) if _NUMBA_OK and _rosa_jit is not None else ROSA(window)
-            preds = window_preds[-overlap_len:]
-        else:
-            preds = []
-        rosa_chunk = ([-1] * current_pad_len) + preds
+        rosa_chunk, state = rosa_single(tokens[start:end], state)
         cached[start:end] = [
             no_prediction if int(pred) == -1 else int(pred)
             for pred in rosa_chunk
@@ -556,45 +544,41 @@ def rosa_async_pipeline(
     is_cuda = (device.type == 'cuda')
     no_prediction = vocab_size
 
-    # Build full context
+    # Keep full ROSA history for continuation. rosa_max_ctx is retained for
+    # API compatibility with older callers, but past_tokens is no longer capped.
     if past_tokens is not None:
-        # past_tokens is stored on CPU between chunks to save GPU memory (see core.py).
-        # Move it to the same device as input_ids before concatenation.
-        if past_tokens.device != input_ids.device:
-            past_tokens = past_tokens.to(input_ids.device, non_blocking=is_cuda)
-        full_input_ids = torch.cat([past_tokens, input_ids], dim=1)
+        past_cpu = past_tokens.detach()
+        if past_cpu.device.type != "cpu" or past_cpu.dtype != torch.int64:
+            past_cpu = past_cpu.to(device="cpu", dtype=torch.int64)
+        else:
+            past_cpu = past_cpu.clone()
+        if past_cpu.dim() == 1:
+            past_cpu = past_cpu.unsqueeze(0)
+        if past_cpu.shape[0] == 1 and B > 1:
+            past_cpu = past_cpu.expand(B, -1)
+        elif past_cpu.shape[0] != B:
+            raise ValueError(
+                f"ROSA past_tokens batch {past_cpu.shape[0]} does not match input batch {B}"
+            )
     else:
-        full_input_ids = input_ids
+        past_cpu = None
 
-    # Cap context window
-    if full_input_ids.shape[1] > rosa_max_ctx:
-        rosa_input = full_input_ids[:, -rosa_max_ctx:]
-    else:
-        rosa_input = full_input_ids
-
-    total_len = full_input_ids.shape[1]
-    window_start = total_len - rosa_input.shape[1]
-    current_start = total_len - T
-    overlap_start = max(window_start, current_start)
-    overlap_len = max(0, total_len - overlap_start)
-    current_pad_len = max(0, T - overlap_len)
-    start_in_window = max(0, overlap_start - window_start)
-
-    # Transfer to CPU (async if CUDA)
+    # Transfer only the current model tokens to CPU (async if CUDA). The
+    # previous history already lives on CPU between chunks in core.py.
     if is_cuda:
         # Use pinned buffer for async D2H copy
-        host_buf = _PINNED.get("rosa_input", (B, rosa_input.shape[1]), dtype=torch.int64)
-        if host_buf.shape != rosa_input.shape:
-            host_buf = _PINNED.get("rosa_input", tuple(rosa_input.shape), dtype=torch.int64)
+        host_buf = _PINNED.get("rosa_current", (B, T), dtype=torch.int64)
+        if host_buf.shape != input_ids.shape:
+            host_buf = _PINNED.get("rosa_current", tuple(input_ids.shape), dtype=torch.int64)
 
         copy_stream = _get_rosa_stream(device)
         copy_stream.wait_stream(torch.cuda.current_stream(device))
         with torch.cuda.stream(copy_stream):
-            host_buf.copy_(rosa_input.to(torch.int64), non_blocking=True)
+            host_buf.copy_(input_ids.to(torch.int64), non_blocking=True)
             ev_copy = torch.cuda.Event()
             ev_copy.record(copy_stream)
     else:
-        host_buf = rosa_input.to(torch.int64)
+        host_buf = input_ids.to(torch.int64)
         ev_copy = None
 
     # Build the states list
@@ -609,48 +593,45 @@ def rosa_async_pipeline(
         if ev_copy is not None:
             ev_copy.synchronize()
 
-        full_input_lists = host_buf.tolist()
+        current_tokens_cpu = host_buf.detach().cpu().clone()
+        current_input_lists = current_tokens_cpu.tolist()
+        if past_cpu is not None:
+            next_past_tokens = torch.cat([past_cpu, current_tokens_cpu], dim=1)
+            past_input_lists = past_cpu.tolist()
+        else:
+            next_past_tokens = current_tokens_cpu.clone()
+            past_input_lists = [[] for _ in range(B)]
+
         state_inputs = []
         state_seeds = []
         rebuild_flags = []
 
-        for row, state in zip(full_input_lists, rosa_states):
-            current_overlap = row[start_in_window:] if overlap_len > 0 else []
-            expected_prefix = row[:start_in_window]
+        for past_row, current_row, state in zip(past_input_lists, current_input_lists, rosa_states):
             state_tokens = getattr(state, "tokens", None) if state is not None else None
-            if state is not None and state_tokens == expected_prefix:
-                # Incremental ROSA state already represents the cached prefix;
-                # extend it with only the new chunk. Feeding the full window here
-                # duplicates history and corrupts future ROSA predictions.
-                state_inputs.append(current_overlap)
+            if state is not None and state_tokens == past_row:
+                # Incremental ROSA state already represents the complete saved
+                # history; extend it with only the current chunk.
+                state_inputs.append(current_row)
                 state_seeds.append(state)
                 rebuild_flags.append(False)
             else:
-                # Rebuild from the capped canonical window when state is missing,
-                # stale, resumed only from tokens, or the max context has slid.
-                state_inputs.append(row)
+                # Rebuild from the complete history when state is missing,
+                # stale, or loaded from token history without automaton state.
+                state_inputs.append(past_row + current_row)
                 state_seeds.append(None)
                 rebuild_flags.append(True)
 
         # Parallel ROSA batch computation
         rosa_preds, new_states = rosa_batch_parallel(state_inputs, state_seeds)
 
-        # Return exactly one ROSA token per model token. If a forward chunk is
-        # longer than rosa_max_ctx, only the current tokens inside the capped
-        # window have valid ROSA predictions; earlier current tokens get the
-        # no-prediction sentinel.
+        # Return exactly one ROSA token per model token.
         rosa_raw = []
         for preds, rebuilt in zip(rosa_preds, rebuild_flags):
-            if overlap_len <= 0:
-                overlap_preds = []
-            elif rebuilt:
-                overlap_preds = preds[-overlap_len:]
-            else:
-                overlap_preds = preds
-            if len(overlap_preds) != overlap_len:
-                overlap_preds = overlap_preds[-overlap_len:] if overlap_len > 0 else []
-                overlap_preds = [-1] * (overlap_len - len(overlap_preds)) + overlap_preds
-            rosa_raw.append(([-1] * current_pad_len) + overlap_preds)
+            current_preds = preds[-T:] if rebuilt else preds
+            if len(current_preds) != T:
+                current_preds = current_preds[-T:] if T > 0 else []
+                current_preds = [-1] * (T - len(current_preds)) + current_preds
+            rosa_raw.append(current_preds)
 
         # Vectorized post-processing via numpy
         rosa_np = np.array(rosa_raw, dtype=np.int64)
@@ -660,7 +641,7 @@ def rosa_async_pipeline(
         result_buf = _PINNED.get("rosa_result", (B, T), dtype=torch.int64)
         np.copyto(np.asarray(result_buf), rosa_np, casting="unsafe")
 
-        return result_buf, rosa_input, new_states
+        return result_buf, next_past_tokens, new_states
 
     if pool is not None and B > 1:
         future = pool.submit(_cpu_work)

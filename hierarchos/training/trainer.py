@@ -4,6 +4,7 @@ import torch.nn as nn
 from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import time
+import random
 from tqdm import tqdm
 import sys
 import traceback
@@ -94,10 +95,14 @@ def compute_remaining_update_steps(dataloader_len: int, accumulation_steps: int,
                                    total_epochs: int, start_step: int = 0) -> int:
     """Count optimizer updates that will actually run after an epoch/mid-epoch resume."""
     accumulation_steps = max(1, int(accumulation_steps))
+    dataloader_len = max(0, int(dataloader_len))
+    start_step = max(0, min(int(start_step), dataloader_len))
     remaining_epochs_after_current = max(0, int(total_epochs) - int(start_epoch) - 1)
-    remaining_batches = max(0, int(dataloader_len) - int(start_step))
-    remaining_batches += remaining_epochs_after_current * int(dataloader_len)
-    return max(1, remaining_batches // accumulation_steps)
+    updates_per_full_epoch = dataloader_len // accumulation_steps
+    updates_already_done_this_epoch = start_step // accumulation_steps
+    updates_left_this_epoch = max(0, updates_per_full_epoch - updates_already_done_this_epoch)
+    remaining_updates = updates_left_this_epoch + (remaining_epochs_after_current * updates_per_full_epoch)
+    return max(1, remaining_updates)
 
 def build_hierarchos_optimizer(model, args, device):
     """RWKV-style AdamW grouping: decay matrices/embeddings, never norms or scalars."""
@@ -267,8 +272,170 @@ def should_update_progress(step: int, args, total_steps: int = None, first_step:
         or (total_steps is not None and (step + 1) >= int(total_steps))
     )
 
+def _state_to_cpu(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().clone()
+    if isinstance(value, tuple):
+        return tuple(_state_to_cpu(item) for item in value)
+    if isinstance(value, list):
+        return [_state_to_cpu(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _state_to_cpu(item) for key, item in value.items()}
+    return value
+
+def _state_to_device(value, device):
+    if isinstance(value, torch.Tensor):
+        return value.to(device)
+    if isinstance(value, tuple):
+        return tuple(_state_to_device(item, device) for item in value)
+    if isinstance(value, list):
+        return [_state_to_device(item, device) for item in value]
+    if isinstance(value, dict):
+        return {key: _state_to_device(item, device) for key, item in value.items()}
+    return value
+
+def capture_model_grad_state(model):
+    grad_state = {}
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            grad_state[name.replace("_orig_mod.", "")] = param.grad.detach().cpu().clone()
+    return grad_state or None
+
+def restore_model_grad_state(model, grad_state, device):
+    if not grad_state:
+        return False
+    restored = 0
+    clean_grad_state = {str(k).replace("_orig_mod.", ""): v for k, v in grad_state.items()}
+    for name, param in model.named_parameters():
+        clean_name = name.replace("_orig_mod.", "")
+        grad = clean_grad_state.get(clean_name)
+        if grad is None:
+            continue
+        param.grad = grad.to(device=device, dtype=param.dtype)
+        restored += 1
+    if restored:
+        print(f"INFO: Restored {restored} pending gradient tensor(s) for accumulation parity.")
+    return restored > 0
+
+def capture_rng_state():
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.random.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        try:
+            state["cuda_all"] = torch.cuda.get_rng_state_all()
+        except Exception:
+            pass
+    return state
+
+def restore_rng_state(state):
+    if not state:
+        return
+    try:
+        if "python" in state:
+            random.setstate(state["python"])
+        if "numpy" in state:
+            np.random.set_state(state["numpy"])
+        if "torch" in state:
+            torch.random.set_rng_state(state["torch"])
+        if torch.cuda.is_available() and "cuda_all" in state:
+            torch.cuda.set_rng_state_all(state["cuda_all"])
+        print("INFO: Restored RNG state from checkpoint.")
+    except Exception as exc:
+        print(f"Warning: Could not restore RNG state: {exc}")
+
+def _capture_loader_component_state(component):
+    if component is None:
+        return None
+    state = {"class": component.__class__.__name__}
+    found = False
+    for attr in ("seed", "epoch"):
+        if hasattr(component, attr):
+            try:
+                state[attr] = int(getattr(component, attr))
+                found = True
+            except Exception:
+                pass
+    generator = getattr(component, "generator", None)
+    if isinstance(generator, torch.Generator):
+        try:
+            state["generator_state"] = generator.get_state()
+            found = True
+        except Exception:
+            pass
+    return state if found else None
+
+def capture_dataloader_state(dataloader):
+    if dataloader is None:
+        return None
+    state = {}
+    for name in ("batch_sampler", "sampler", "dataset"):
+        component_state = _capture_loader_component_state(getattr(dataloader, name, None))
+        if component_state:
+            state[name] = component_state
+    return state or None
+
+def _restore_loader_component_state(component, state):
+    if component is None or not state:
+        return
+    for attr in ("seed", "epoch"):
+        if attr in state and hasattr(component, attr):
+            try:
+                setattr(component, attr, int(state[attr]))
+            except Exception:
+                pass
+    generator = getattr(component, "generator", None)
+    if isinstance(generator, torch.Generator) and "generator_state" in state:
+        try:
+            generator.set_state(state["generator_state"])
+        except Exception:
+            pass
+
+def restore_dataloader_state(dataloader, state):
+    if dataloader is None or not state:
+        return
+    for name in ("batch_sampler", "sampler", "dataset"):
+        _restore_loader_component_state(getattr(dataloader, name, None), state.get(name))
+    print("INFO: Restored dataloader sampler state from checkpoint.")
+
+def build_training_checkpoint(
+    model,
+    optimizer,
+    scheduler,
+    scaler,
+    args,
+    dataloader,
+    completed_epoch: int,
+    mid_epoch_step: int = 0,
+    running_states=None,
+):
+    grad_state = capture_model_grad_state(model)
+    checkpoint = {
+        "checkpoint_version": 2,
+        "checkpoint_kind": "training",
+        "completed_epoch": int(completed_epoch),
+        "mid_epoch_step": int(mid_epoch_step or 0),
+        "model_state_dict": sanitize_model_state_dict(model, reset_transient_ltm=False),
+        "optimizer_state_dict": optimizer.state_dict() if optimizer else None,
+        "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
+        "scaler_state_dict": scaler.state_dict() if scaler else None,
+        "config": dict(model.config),
+        "rng_state": capture_rng_state(),
+        "data_state": capture_dataloader_state(dataloader),
+        "grad_state_dict": grad_state,
+        "grad_accumulation_active": bool(grad_state),
+        "training_complete": False,
+    }
+    if running_states is not None:
+        checkpoint["running_states"] = _state_to_cpu(running_states)
+    return checkpoint
+
 def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, running_states, collect_metrics=True):
     """Training step with temporal chunking to match original hierarchos.py."""
+    args._optimizer_step_was_taken = False
+    args._train_step_had_backward = False
     device = next(model.parameters()).device
     set_model_training_step(model, getattr(args, '_current_global_step', step))
     _nb = (device.type == 'cuda')  # non_blocking for async CUDA transfer
@@ -474,6 +641,7 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
 
             if scaler is not None: scaler.scale(chunk_loss).backward()
             else: chunk_loss.backward()
+            args._train_step_had_backward = True
             
             # --- GRADIENT-BASED LTM UPDATE (Titans Parity) ---
             if outputs.get("raw_topk_vals") is not None:
@@ -591,6 +759,7 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                 nn.utils.clip_grad_norm_(model.parameters(), getattr(args, 'grad_clip', 1.0))
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+            args._optimizer_step_was_taken = True
         
         if chunks_processed == 0:
             return None, running_states
@@ -708,6 +877,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     model = None
     optimizer = None
     start_epoch = 0
+    start_step = 0
     scaler = None
     scheduler = None
     checkpoint = None
@@ -815,9 +985,16 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
             try: optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             except: print("Warning: Could not load optimizer state.")
         
-        # Original script uses 'completed_epoch', modular uses 'epoch', check both for compatibility
-        start_epoch = checkpoint.get('completed_epoch', checkpoint.get('epoch', 0))
-        print(f"Successfully loaded model state. Resuming from epoch {start_epoch + 1}.")
+        # Original script uses 'completed_epoch', modular uses 'epoch', check both for compatibility.
+        start_epoch = int(checkpoint.get('completed_epoch', checkpoint.get('epoch', 0)) or 0)
+        start_step = int(checkpoint.get('mid_epoch_step', 0) or 0)
+        if start_step >= dataloader_len:
+            start_epoch += 1
+            start_step = 0
+        if start_step > 0:
+            print(f"Successfully loaded model state. Resuming from epoch {start_epoch + 1}, step {start_step}.")
+        else:
+            print(f"Successfully loaded model state. Resuming from epoch {start_epoch + 1}.")
         # BFloat16 does NOT use GradScaler — its dynamic range makes scaling unnecessary.
         # Only create scaler for float16 AMP.
         if use_amp and getattr(config, 'amp_dtype', 'float16') == 'float16':
@@ -881,8 +1058,6 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         chunk_size=getattr(args, 'training_chunk_size', 128),
     )
 
-    start_step = checkpoint.get('mid_epoch_step', 0) if checkpoint else 0
-
     # Scheduler
     # When override_scheduling is used during resume, calculate T_max based on REMAINING epochs
     # so that the LR decays properly to min_lr by the final epoch.
@@ -903,6 +1078,17 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         if args.resume_from_ckpt and not getattr(args, 'override_scheduling', False) and 'scheduler_state_dict' in checkpoint:
             try: scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             except: pass
+    if checkpoint:
+        restore_dataloader_state(dataloader, checkpoint.get('data_state'))
+        restore_rng_state(checkpoint.get('rng_state'))
+        restore_model_grad_state(model, checkpoint.get('grad_state_dict'), device)
+        if start_step > 0:
+            if checkpoint.get('data_state') is None:
+                print("Warning: Mid-epoch checkpoint has no dataloader state; resume will skip to the saved step but exact batch order may differ.")
+            if checkpoint.get('rng_state') is None:
+                print("Warning: Mid-epoch checkpoint has no RNG state; stochastic components may not be exactly replayed.")
+            if getattr(args, 'persist_state', False) and 'running_states' not in checkpoint:
+                print("Warning: Mid-epoch checkpoint has no running RWKV/LTM states while --persist-state is enabled; continuing with reset states.")
     # --- Evaluation Confirmation ---
     eval_tasks = getattr(args, 'eval_tasks', None)
     if eval_tasks:
@@ -915,19 +1101,9 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         set_dataloader_epoch(dataloader, epoch)
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}", total=dataloader_len)
         
-        # [NEW] Restore running_states if resuming mid-epoch
-        if epoch == start_epoch and checkpoint and 'running_states' in checkpoint:
-            _raw_states = checkpoint['running_states']
-            # Ensure tensors are on the correct device
-            running_states = []
-            for s in _raw_states:
-                if isinstance(s, torch.Tensor):
-                    running_states.append(s.to(device))
-                elif isinstance(s, tuple):
-                    running_states.append(tuple(ss.to(device) if isinstance(ss, torch.Tensor) else ss for ss in s))
-                else:
-                    running_states.append(s)
-            running_states = tuple(running_states)
+        # Restore recurrent/LTM states only for true mid-epoch checkpoints.
+        if epoch == start_epoch and start_step > 0 and checkpoint and 'running_states' in checkpoint:
+            running_states = _state_to_device(checkpoint['running_states'], device)
             print(f"INFO: Restored RNN/LTM running states from checkpoint on {device}.")
         else:
             running_states = (None, None, None, None, None, None)
@@ -975,22 +1151,26 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                     postfix["lr"] = f"{scheduler.get_last_lr()[0]:.2e}"
                 pbar.set_postfix(postfix)
 
-            if scheduler and (step + 1) % args.accumulation_steps == 0:
+            if scheduler and getattr(args, '_optimizer_step_was_taken', False):
                 scheduler.step()
 
             # Periodic Checkpointing (Progress Protection)
             if args.save_steps > 0 and (step + 1) % args.save_steps == 0:
                 print(f"\n[Step {step+1}] Periodic Checkpoint: Saving to {args.out_dir}...")
-                save_checkpoint_safely({
-                    'completed_epoch': epoch, # Not yet completed
-                    'mid_epoch_step': step + 1,
-                    'model_state_dict': sanitize_model_state_dict(model),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-                    'scaler_state_dict': scaler.state_dict() if scaler else None,
-                    'config': dict(model.config),
-                    'running_states': running_states, # [NEW] Persist states for graceful resumption
-                }, os.path.join(args.out_dir, f"hierarchos_epoch_{epoch+1}_step_{step+1}.pt"))
+                save_checkpoint_safely(
+                    build_training_checkpoint(
+                        model,
+                        optimizer,
+                        scheduler,
+                        scaler,
+                        args,
+                        dataloader,
+                        completed_epoch=epoch,
+                        mid_epoch_step=step + 1,
+                        running_states=running_states,
+                    ),
+                    os.path.join(args.out_dir, f"hierarchos_epoch_{epoch+1}_step_{step+1}.pt"),
+                )
             
             # --- STEP-BASED EVALUATION (runs every N steps) ---
             eval_steps = getattr(args, 'eval_steps', None)
@@ -1026,14 +1206,19 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                     print(f"WARNING: Step-based evaluation failed: {e}")
                     model.train()
         
-        save_checkpoint_safely({
-            'completed_epoch': epoch + 1,
-            'model_state_dict': sanitize_model_state_dict(model),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-            'scaler_state_dict': scaler.state_dict() if scaler else None,
-            'config': dict(model.config),
-        }, os.path.join(args.out_dir, f"hierarchos_epoch_{epoch+1}.pt"))
+        save_checkpoint_safely(
+            build_training_checkpoint(
+                model,
+                optimizer,
+                scheduler,
+                scaler,
+                args,
+                dataloader,
+                completed_epoch=epoch + 1,
+                mid_epoch_step=0,
+            ),
+            os.path.join(args.out_dir, f"hierarchos_epoch_{epoch+1}.pt"),
+        )
         
         # --- OPTIONAL EVALUATION (lm-evaluation-harness) ---
         eval_tasks = getattr(args, 'eval_tasks', None)

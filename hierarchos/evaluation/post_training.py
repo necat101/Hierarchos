@@ -101,6 +101,7 @@ def run_post_training_benchmarks(
     arc_agi_keep_samples: bool = False,
     max_new_tokens: int = 512,
     temperature: float = 0.0,
+    sequential: bool = False,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], List[BenchmarkSpec]]:
     requested = list(benchmark_names or [])
     if suite_names:
@@ -123,21 +124,30 @@ def run_post_training_benchmarks(
     results_parts: List[Optional[Dict[str, Any]]] = []
     skipped: List[BenchmarkSpec] = list(external_specs)
 
+    failed_tasks: List[str] = []
+
     if task_names:
         if not is_lm_eval_available():
             raise ImportError("lm-evaluation-harness is not installed. Install with: pip install lm-eval")
-        results_parts.append(
-            run_eval(
+        task_batches = [[task] for task in task_names] if sequential else [task_names]
+        for index, task_batch in enumerate(task_batches, 1):
+            if sequential:
+                task_label = task_batch[0]
+                print(f"\n[{index}/{len(task_batches)}] Running benchmark: {task_label}")
+            task_results = run_eval(
                 model=model,
                 tokenizer=tokenizer,
                 device=device,
-                tasks=task_names,
+                tasks=task_batch,
                 batch_size=batch_size,
                 limit=limit,
                 num_fewshot=num_fewshot,
                 verbosity=verbosity,
             )
-        )
+            if task_results is None:
+                failed_tasks.extend(task_batch)
+                continue
+            results_parts.append(task_results)
 
     if arc_agi_path:
         from .arc_agi import run_arc_agi_eval
@@ -170,4 +180,6 @@ def run_post_training_benchmarks(
     manifest["resolved_lm_eval_tasks"] = task_names
     manifest["unknown_raw_tasks"] = unknown
     manifest["runnable_benchmarks"] = [spec.to_dict() for spec in specs_for_tasks(task_names)]
+    manifest["sequential"] = sequential
+    manifest["failed_lm_eval_tasks"] = failed_tasks
     return results, manifest, skipped

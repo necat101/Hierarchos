@@ -9,12 +9,14 @@ from hierarchos.inference.chat import (
     load_hierarchical_chat_state,
     save_hierarchical_chat_state,
 )
+from hierarchos.inference.chat_state import clear_ltm_working_memory
 from hierarchos.utils.rosa import ROSA, ROSAState, precompute_rosa_ids_for_chunks, rosa_async_pipeline, rosa_single
 
 
 class _FakeLTM(nn.Module):
     def __init__(self):
         super().__init__()
+        self.vals = nn.Parameter(torch.ones(4, 3))
         self.register_buffer("fast_vals", torch.ones(4, 3))
         self.register_buffer("_mom_vals", torch.full((4, 3), 2.0))
         self.register_buffer("timestamps", torch.arange(4, dtype=torch.float32))
@@ -85,6 +87,21 @@ def test_chat_state_preserves_full_rosa_history_and_v8_state():
     assert len(rehydrated) == 6
     assert torch.equal(rehydrated[2], past_tokens)
     assert rehydrated[3][0].tokens == list(range(2048))
+
+
+def test_clear_ltm_working_memory_zeros_transient_inference_buffers():
+    model = _FakeModel()
+    model.ltm.fast_vals.fill_(3.0)
+    model.ltm._mom_vals.fill_(4.0)
+    model.ltm.timestamps.fill_(5.0)
+    model.ltm.sources.fill_(2)
+
+    assert clear_ltm_working_memory(model) is True
+    assert torch.count_nonzero(model.ltm.fast_vals).item() == 0
+    assert torch.count_nonzero(model.ltm._mom_vals).item() == 0
+    assert torch.count_nonzero(model.ltm.timestamps).item() == 0
+    assert torch.equal(model.ltm.sources, torch.zeros_like(model.ltm.sources))
+    assert torch.count_nonzero(model.ltm.vals).item() > 0
 
 
 def test_rosa_async_pipeline_returns_uncapped_past_tokens():

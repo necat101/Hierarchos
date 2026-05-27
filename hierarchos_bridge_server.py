@@ -256,7 +256,7 @@ def _sync_runtime_ltm_to_module():
 
 
 def _apply_saved_ltm_updates():
-    """Load saved runtime LTM sidecar data, if present."""
+    """Load durable LTM sidecar data, if present, without restoring working memory."""
     global _ltm_state
     if _model is None or not hasattr(_model, "ltm") or not _model_dir:
         return
@@ -266,22 +266,27 @@ def _apply_saved_ltm_updates():
         return
 
     import torch
+    from hierarchos.inference.chat_state import clear_ltm_working_memory
+
     payload = torch.load(path, map_location="cpu", weights_only=False)
     ltm = _model.ltm
     applied = []
 
-    for attr, key in (
-        ("fast_vals", "fast_vals"),
-        ("_mom_vals", "mom_vals"),
-        ("timestamps", "timestamps"),
-        ("sources", "sources"),
-    ):
-        if key in payload and _copy_ltm_tensor(ltm, attr, payload[key]):
-            applied.append(key)
+    deltas = payload.get("ltm_deltas")
+    target_vals = getattr(ltm, "vals", None)
+    if torch.is_tensor(deltas) and torch.is_tensor(target_vals) and tuple(deltas.shape) == tuple(target_vals.shape):
+        with torch.no_grad():
+            target_vals.add_(deltas.to(device=target_vals.device, dtype=target_vals.dtype))
+        applied.append("ltm_deltas")
+
+    transient_keys = [key for key in ("fast_vals", "mom_vals", "timestamps", "sources") if key in payload]
+    clear_ltm_working_memory(_model)
 
     if applied:
         _ltm_state = None
         emit_status(f"Loaded saved LTM updates from {path}.")
+    elif transient_keys:
+        emit_status(f"Ignored transient LTM working memory in {path}; fresh inference starts cleared.")
 
 
 def _reset_runtime_state():
@@ -574,6 +579,9 @@ def handle_load_model(params: dict):
         emit_status(f"Loading model on {device_label} from {resolved_model_path}")
         model, cfg = load_full_model_with_config(resolved_model_path, _device)
         emit_load_progress(0.72, "Weights loaded")
+        from hierarchos.inference.chat_state import clear_ltm_working_memory
+
+        clear_ltm_working_memory(model)
         _model = model
         _model.eval()
         _model.suppress_hebbian = False

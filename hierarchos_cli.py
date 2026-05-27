@@ -1059,6 +1059,10 @@ def main():
         help="Post-training benchmark suite(s) for benchmark mode. Examples: frontier-text, frontier, math, coding, arc-agi-family.")
     eval_group.add_argument("--benchmark", type=str, nargs='+', default=None,
         help="Individual post-training benchmarks or raw lm-eval task ids. Examples: gpqa-diamond aime25 arc-agi mmlu_pro.")
+    eval_group.add_argument("--benchmark-all", action="store_true",
+        help="Run every registered benchmark sequentially. Runnable lm-eval tasks are chained one at a time; external benchmarks are reported or run when their local path is provided.")
+    eval_group.add_argument("--benchmark-sequential", action="store_true",
+        help="Run selected lm-eval benchmarks one at a time and merge the scores into one final terminal report.")
     eval_group.add_argument("--benchmark-out-dir", type=str, default="./benchmark_results",
         help="Directory for post-training benchmark reports.")
     eval_group.add_argument("--benchmark-run-name", type=str, default=None,
@@ -1269,13 +1273,21 @@ def main():
             sys.exit(1)
 
         try:
+            benchmark_suites = list(args.benchmark_suite or [])
+            if args.benchmark_all:
+                benchmark_suites.insert(0, "all-common")
+            raw_benchmark_tasks = (
+                args.eval_tasks
+                if args.eval_tasks and not args.benchmark_all and not benchmark_suites and not args.benchmark
+                else None
+            )
             results, manifest, skipped = run_post_training_benchmarks(
                 model=model,
                 tokenizer=tokenizer,
                 device=pt_device,
                 benchmark_names=args.benchmark,
-                suite_names=args.benchmark_suite,
-                raw_tasks=args.eval_tasks,
+                suite_names=benchmark_suites,
+                raw_tasks=raw_benchmark_tasks,
                 batch_size=args.eval_batch_size,
                 limit=args.eval_limit,
                 verbosity="WARNING",
@@ -1286,12 +1298,16 @@ def main():
                 arc_agi_keep_samples=args.arc_agi_keep_samples,
                 max_new_tokens=args.max_new_tokens,
                 temperature=args.temperature,
+                sequential=args.benchmark_all or args.benchmark_sequential,
             )
         except Exception as e:
             print(f"ERROR: Benchmark run failed: {e}")
             traceback.print_exc()
             sys.exit(1)
 
+        print("\n" + "="*60)
+        print("Combined Benchmark Results")
+        print("="*60)
         print(format_results(results))
         if skipped:
             print("\nSkipped external benchmarks:")

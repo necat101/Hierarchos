@@ -1,8 +1,10 @@
 import json
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
+from hierarchos.evaluation import post_training
 from hierarchos.evaluation.arc_agi import extract_json_grid, load_arc_agi_tasks
 from hierarchos.evaluation.benchmarks import get_benchmark, resolve_task_names
 
@@ -44,6 +46,31 @@ class BenchmarkRegistryTests(unittest.TestCase):
         self.assertEqual(tasks, ["new_custom_task"])
         self.assertEqual(external, [])
         self.assertEqual(unknown, ["new_custom_task"])
+
+    def test_sequential_benchmark_chain_merges_scores(self):
+        def fake_run_eval(**kwargs):
+            task = kwargs["tasks"][0]
+            return {
+                "results": {task: {"acc,none": 0.5}},
+                "versions": {task: "test"},
+            }
+
+        with mock.patch.object(post_training, "is_lm_eval_available", return_value=True), \
+                mock.patch.object(post_training, "run_eval", side_effect=fake_run_eval) as run_eval, \
+                mock.patch("builtins.print"):
+            results, manifest, skipped = post_training.run_post_training_benchmarks(
+                model=None,
+                tokenizer=None,
+                device=None,
+                benchmark_names=["hellaswag", "arc_easy"],
+                sequential=True,
+            )
+
+        self.assertEqual(run_eval.call_count, 2)
+        self.assertEqual(set(results["results"]), {"hellaswag", "arc_easy"})
+        self.assertTrue(manifest["sequential"])
+        self.assertEqual(manifest["failed_lm_eval_tasks"], [])
+        self.assertEqual(skipped, [])
 
     def test_arc_agi_json_helpers_parse_grid_and_task_file(self):
         self.assertEqual(extract_json_grid("answer: [[1,2],[3,4]]"), [[1, 2], [3, 4]])

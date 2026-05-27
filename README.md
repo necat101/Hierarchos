@@ -522,6 +522,16 @@ python hierarchos_cli.py benchmark \
 
 Results are written to `benchmark_results/<run>/results.json`, with a reproducibility manifest and Markdown summary beside it.
 
+**Chain every registered benchmark sequentially:**
+```bash
+python hierarchos_cli.py benchmark \
+    --model-path ./hierarchos_model \
+    --benchmark-all \
+    --eval-batch-size 1
+```
+
+`--benchmark-all` runs all runnable `lm-eval` benchmarks one after another and prints one combined scoreboard in the terminal at the end. External/official-path benchmarks such as ARC-AGI-3, SWE-bench Verified, Terminal-Bench, and MMMU are included in the manifest and skipped section unless their required external runner or local path is provided.
+
 **ARC-AGI local JSON run:**
 ```bash
 python hierarchos_cli.py benchmark \

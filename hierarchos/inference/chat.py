@@ -32,6 +32,7 @@ from .chat_state import (
     CHAT_STATE_KIND,
     CHAT_STATE_VERSION,
     chat_state_config_signature,
+    clear_ltm_working_memory,
     normalize_recurrent_state_for_model,
     recurrent_state_metadata,
     tensor_to_cpu,
@@ -485,6 +486,7 @@ def chat(args, device, tokenizer):
     if npz_files and _HAS_QUANTIZED:
         try:
             model, config = load_quantized(args.model_path, device=device)
+            clear_ltm_working_memory(model)
             if isinstance(model, QuantizedHierarchos):
                 is_quantized = True
                 print(f"Loaded quantized model with {model.qtype} weights.")
@@ -499,6 +501,7 @@ def chat(args, device, tokenizer):
     else:
         try:
             model, config = load_full_model_with_config(args.model_path, device)
+            clear_ltm_working_memory(model)
             print("Loaded full-precision model.")
         except Exception as e:
             print(f"Error loading model from {args.model_path}: {e}")
@@ -517,6 +520,7 @@ def chat(args, device, tokenizer):
         try:
             shadow_model, _ = load_full_model_with_config(shadow_model_path, device)
             shadow_model.ltm.load_state_dict(model.ltm.state_dict())
+            clear_ltm_working_memory(shadow_model)
             shadow_model.eval()
         except Exception as e:
             print(f"Error loading shadow model: {e}")

@@ -45,6 +45,32 @@ def tensor_to_cpu(value: Any) -> Optional[torch.Tensor]:
     return value.detach().cpu().clone() if torch.is_tensor(value) else None
 
 
+def clear_ltm_working_memory(model: Any) -> bool:
+    """Clear transient LTM working memory for a fresh inference session."""
+    ltm = getattr(model, "ltm", None)
+    if ltm is None:
+        return False
+
+    if hasattr(ltm, "reset_working_memory"):
+        ltm.reset_working_memory()
+        return True
+
+    cleared = False
+    with torch.no_grad():
+        for attr in ("fast_vals", "_mom_vals", "timestamps"):
+            value = getattr(ltm, attr, None)
+            if torch.is_tensor(value):
+                value.zero_()
+                cleared = True
+
+        sources = getattr(ltm, "sources", None)
+        if torch.is_tensor(sources):
+            sources.fill_(int(getattr(ltm, "SRC_UNKNOWN", 0)))
+            cleared = True
+
+    return cleared
+
+
 def chat_state_config_signature(config: Any, model: Any = None) -> Dict[str, Any]:
     """Small architecture fingerprint for model-neutral chat state files."""
     signature: Dict[str, Any] = {}

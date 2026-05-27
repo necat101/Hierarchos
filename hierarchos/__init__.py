@@ -33,10 +33,23 @@ from .inference.chat import chat
 
 # Optional evaluation support (requires: pip install lm-eval)
 try:
-    from .evaluation import run_eval, is_lm_eval_available, format_results, HierarchosLM
+    from .evaluation import (
+        run_eval,
+        is_lm_eval_available,
+        format_results,
+        HierarchosLM,
+        format_benchmark_catalog,
+        resolve_task_names,
+        run_post_training_benchmarks,
+        write_benchmark_artifacts,
+    )
 except ImportError:
     # lm-eval not installed - evaluation features not available
     run_eval = None
     is_lm_eval_available = lambda: False
     format_results = None
     HierarchosLM = None
+    format_benchmark_catalog = None
+    resolve_task_names = None
+    run_post_training_benchmarks = None
+    write_benchmark_artifacts = None

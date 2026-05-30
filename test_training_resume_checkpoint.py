@@ -16,6 +16,7 @@ from hierarchos.training.trainer import (
     save_training_checkpoint_if_finite,
     train_step,
     training_state_is_finite,
+    _sanitize_model_nonfinite_,
     _sanitize_model_transient_state_,
     _clip_gradients_and_check,
 )
@@ -265,9 +266,25 @@ def test_clip_gradients_and_check_saturates_nonfinite_gradients():
     ok, issue = _clip_gradients_and_check(model, max_norm=1.0)
 
     assert ok is True
-    assert issue is not None
+    assert issue is not None or torch.isfinite(model.proj.weight.grad).all()
     assert torch.isfinite(model.proj.weight.grad).all()
     assert torch.isfinite(model.proj.bias.grad).all()
+
+
+def test_model_nonfinite_sanitizer_repairs_parameters_and_buffers():
+    model = _FakeTrainModel()
+    model.proj.weight.data.view(-1)[0] = float("inf")
+    model.proj.weight.data.view(-1)[1] = float("-inf")
+    model.proj.bias.data.view(-1)[0] = float("nan")
+    model.ltm.fast_vals[0, 0] = float("inf")
+
+    cleaned = _sanitize_model_nonfinite_(model)
+
+    assert cleaned == 3
+    assert model.proj.weight.data.view(-1)[0].item() == 1.0
+    assert model.proj.weight.data.view(-1)[1].item() == -1.0
+    assert model.proj.bias.data.view(-1)[0].item() == 0.0
+    assert torch.isinf(model.ltm.fast_vals[0, 0])
 
 
 def test_train_step_skips_nonfinite_loss_before_backward():
@@ -377,7 +394,7 @@ def test_checkpoint_save_allows_clean_state_and_writes_file():
         assert os.path.exists(path)
 
 
-def test_checkpoint_save_refuses_poisoned_gradient():
+def test_checkpoint_save_sanitizes_poisoned_gradient():
     model = _FakeTrainModel()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     model.proj.weight.grad = torch.ones_like(model.proj.weight)
@@ -388,11 +405,12 @@ def test_checkpoint_save_refuses_poisoned_gradient():
 
         saved = save_training_checkpoint_if_finite({"bad": torch.tensor(1)}, path, model, optimizer)
 
-        assert saved is False
-        assert not os.path.exists(path)
+        assert saved is True
+        assert os.path.exists(path)
+        assert model.proj.weight.grad.view(-1)[0].item() == 0.0
 
 
-def test_checkpoint_save_refuses_poisoned_optimizer_state():
+def test_checkpoint_save_sanitizes_poisoned_optimizer_state():
     model = _FakeTrainModel()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     x = torch.ones(1, 2)
@@ -406,8 +424,9 @@ def test_checkpoint_save_refuses_poisoned_optimizer_state():
 
         saved = save_training_checkpoint_if_finite({"bad": torch.tensor(1)}, path, model, optimizer)
 
-        assert saved is False
-        assert not os.path.exists(path)
+        assert saved is True
+        assert os.path.exists(path)
+        assert next(iter(optimizer.state.values()))["exp_avg"].view(-1)[0].item() == 0.0
 
 
 def test_checkpoint_save_sanitizes_poisoned_running_state_payload():

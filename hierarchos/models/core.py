@@ -139,7 +139,8 @@ class WorkerLoop:
                     prev_l_input = l_input
 
                     l_out, candidate_shadow = self.l_rnn(l_input, shadow_l_state, timestep=None, deepemb_vec=l_deepemb_vec)
-                    candidate_shadow = torch.clamp(candidate_shadow, min=-50.0, max=50.0)
+                    l_out = torch.clamp(torch.nan_to_num(l_out, nan=0.0, posinf=100.0, neginf=-100.0), min=-100.0, max=100.0)
+                    candidate_shadow = torch.clamp(torch.nan_to_num(candidate_shadow, nan=0.0, posinf=50.0, neginf=-50.0), min=-50.0, max=50.0)
 
                     drift_delta = torch.tanh(self.context_drift_proj(l_out))
                     candidate_drift = torch.clamp(current_drift + drift_delta, min=-5.0, max=5.0)
@@ -170,7 +171,8 @@ class WorkerLoop:
         if self.l_rnn.training and not self.compile_static_worker_loop:
             for step_idx in range(self.max_l_steps):
                 l_out, shadow_l_state = self.l_rnn(l_input, shadow_l_state, timestep=None, deepemb_vec=l_deepemb_vec)
-                shadow_l_state = torch.clamp(shadow_l_state, min=-50.0, max=50.0)
+                l_out = torch.clamp(torch.nan_to_num(l_out, nan=0.0, posinf=100.0, neginf=-100.0), min=-100.0, max=100.0)
+                shadow_l_state = torch.clamp(torch.nan_to_num(shadow_l_state, nan=0.0, posinf=50.0, neginf=-50.0), min=-50.0, max=50.0)
                 
                 drift_delta = torch.tanh(self.context_drift_proj(l_out))
                 current_drift = torch.clamp(current_drift + drift_delta, min=-5.0, max=5.0)
@@ -196,9 +198,11 @@ class WorkerLoop:
         l_input = self.l_input_proj(l_input_vec)
         
         final_l_out, next_l_state = self.l_rnn(l_input, l_state, timestep=None, deepemb_vec=l_deepemb_vec)
-        next_l_state = torch.clamp(next_l_state, min=-50.0, max=50.0)
+        final_l_out = torch.clamp(torch.nan_to_num(final_l_out, nan=0.0, posinf=100.0, neginf=-100.0), min=-100.0, max=100.0)
+        next_l_state = torch.clamp(torch.nan_to_num(next_l_state, nan=0.0, posinf=50.0, neginf=-50.0), min=-50.0, max=50.0)
         
         final_enc = current_enc + self.l_to_out(final_l_out)
+        final_enc = torch.clamp(torch.nan_to_num(final_enc, nan=0.0, posinf=100.0, neginf=-100.0), min=-100.0, max=100.0)
         commitment_cost = torch.zeros(enc.shape[0], device=enc.device, dtype=enc.dtype)
         if self.l_rnn.training and self.compile_static_worker_loop and commitment_cost_static is not None:
             commitment_cost = commitment_cost_static
@@ -674,8 +678,8 @@ class HierarchosCore(nn.Module):
 
                 # Pondering on Shadow State
                 h_step_outputs = [h_out_real]
-                halt_logit = self.h_halt_proj(h_out_real).squeeze(-1)
-                h_halt_probs = [torch.sigmoid(halt_logit)]
+                halt_logit = torch.clamp(self.h_halt_proj(h_out_real).squeeze(-1), min=-50.0, max=50.0)
+                h_halt_probs = [torch.sigmoid(halt_logit).clamp(1e-6, 1.0 - 1e-6)]
                 
                 shadow_h_state = h_state.clone()
                 current_enc_h = enc_with_feedback
@@ -684,15 +688,19 @@ class HierarchosCore(nn.Module):
                     if not self.training and h_halt_probs[-1].mean() > getattr(self.config, 'h_halt_thresh', 0.9): 
                         break
                     h_out_ponder, shadow_h_state = self.h_rnn(current_enc_h, shadow_h_state, timestep=None, deepemb_vec=h_deepemb_vec)
-                    halt_logit = self.h_halt_proj(h_out_ponder).squeeze(-1)
+                    h_out_ponder = torch.clamp(torch.nan_to_num(h_out_ponder, nan=0.0, posinf=100.0, neginf=-100.0), min=-100.0, max=100.0)
+                    shadow_h_state = torch.clamp(torch.nan_to_num(shadow_h_state, nan=0.0, posinf=50.0, neginf=-50.0), min=-50.0, max=50.0)
+                    halt_logit = torch.clamp(self.h_halt_proj(h_out_ponder).squeeze(-1), min=-50.0, max=50.0)
                     h_step_outputs.append(h_out_ponder)
-                    h_halt_probs.append(torch.sigmoid(halt_logit))
+                    h_halt_probs.append(torch.sigmoid(halt_logit).clamp(1e-6, 1.0 - 1e-6))
 
                 # BUG #4 FIX: Force ACT weighting to float32 for numerical stability.
                 # BFloat16's limited precision (~7 bits) causes underflow in cumprod chains,
                 # leading to NaN weights. Mirrors the autocast(enabled=False) pattern in rwkv_cell.py.
                 h_stack = torch.stack(h_step_outputs, dim=0).float()
                 halt_stack = torch.stack(h_halt_probs, dim=0).float()
+                halt_stack = torch.nan_to_num(halt_stack, nan=0.5, posinf=1.0 - 1e-6, neginf=1e-6)
+                halt_stack = halt_stack.clamp(1e-6, 1.0 - 1e-6)
                 remain = 1.0 - halt_stack
                 remain_shifted = torch.cat([torch.ones_like(remain[:1]), remain[:-1]], dim=0)
                 cum_remain = torch.cumprod(remain_shifted, dim=0)
@@ -703,6 +711,9 @@ class HierarchosCore(nn.Module):
                 weights = weights / total.unsqueeze(0)
                 remainder = remainder / total
                 final_h_out = (weights.unsqueeze(-1) * h_stack).sum(dim=0) + remainder.unsqueeze(-1) * h_stack[-1]
+                if torch.isnan(final_h_out).any() or torch.isinf(final_h_out).any():
+                    print(f"WARNING: Non-finite manager output at token step {abs_t}; clamping for stability.")
+                    final_h_out = torch.nan_to_num(final_h_out, nan=0.0, posinf=10.0, neginf=-10.0)
                 final_h_out = final_h_out.to(enc.dtype)  # Cast back to working precision
                 
                 target_context = self.h_to_context(final_h_out)

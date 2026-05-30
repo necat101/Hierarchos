@@ -28,6 +28,110 @@ def validate_loss(loss: torch.Tensor, name: str = "loss") -> bool:
         return False
     return True
 
+def _tensor_is_nonfinite(tensor: torch.Tensor) -> bool:
+    if not torch.is_tensor(tensor) or not tensor.is_floating_point():
+        return False
+    return not bool(torch.isfinite(tensor).all().item())
+
+def _describe_tensor_issue(name: str, tensor: torch.Tensor) -> str:
+    detached = tensor.detach()
+    nan_count = int(torch.isnan(detached).sum().item())
+    inf_count = int(torch.isinf(detached).sum().item())
+    finite = detached[torch.isfinite(detached)]
+    if finite.numel() > 0:
+        finite_min = float(finite.min().item())
+        finite_max = float(finite.max().item())
+        return f"{name} has {nan_count} NaN and {inf_count} Inf values; finite range=[{finite_min:.4e}, {finite_max:.4e}]"
+    return f"{name} has {nan_count} NaN and {inf_count} Inf values; no finite values"
+
+def _find_first_nonfinite_model_tensor(model, include_grads: bool = False):
+    for name, param in model.named_parameters():
+        if _tensor_is_nonfinite(param):
+            return _describe_tensor_issue(f"parameter {name}", param)
+        if include_grads and param.grad is not None and _tensor_is_nonfinite(param.grad):
+            return _describe_tensor_issue(f"gradient {name}", param.grad)
+    for name, buffer in model.named_buffers():
+        if _tensor_is_nonfinite(buffer):
+            return _describe_tensor_issue(f"buffer {name}", buffer)
+    return None
+
+def _find_first_nonfinite_optimizer_tensor(optimizer):
+    if optimizer is None:
+        return None
+    for param_idx, state in enumerate(optimizer.state.values()):
+        for key, value in state.items():
+            if _tensor_is_nonfinite(value):
+                return _describe_tensor_issue(f"optimizer state[{param_idx}].{key}", value)
+    return None
+
+def _find_first_nonfinite_payload_tensor(value, path: str = "checkpoint"):
+    if torch.is_tensor(value):
+        if _tensor_is_nonfinite(value):
+            return _describe_tensor_issue(path, value)
+        return None
+    if isinstance(value, dict):
+        for key, item in value.items():
+            issue = _find_first_nonfinite_payload_tensor(item, f"{path}.{key}")
+            if issue:
+                return issue
+    elif isinstance(value, (list, tuple)):
+        for idx, item in enumerate(value):
+            issue = _find_first_nonfinite_payload_tensor(item, f"{path}[{idx}]")
+            if issue:
+                return issue
+    return None
+
+def training_state_is_finite(model, optimizer=None, check_optimizer: bool = True, include_grads: bool = False) -> bool:
+    issue = _find_first_nonfinite_model_tensor(model, include_grads=include_grads)
+    if issue:
+        print(f"CRITICAL: Non-finite training state detected: {issue}")
+        return False
+    if check_optimizer:
+        issue = _find_first_nonfinite_optimizer_tensor(optimizer)
+        if issue:
+            print(f"CRITICAL: Non-finite training state detected: {issue}")
+            return False
+    return True
+
+def save_training_checkpoint_if_finite(checkpoint_dict, path: str, model, optimizer=None) -> bool:
+    if not training_state_is_finite(model, optimizer, check_optimizer=True, include_grads=True):
+        print(f"WARNING: Skipping checkpoint because training state is non-finite: {path}")
+        return False
+    issue = _find_first_nonfinite_payload_tensor(checkpoint_dict)
+    if issue:
+        print(f"CRITICAL: Non-finite checkpoint payload detected: {issue}")
+        print(f"WARNING: Skipping checkpoint because checkpoint payload is non-finite: {path}")
+        return False
+    save_checkpoint_safely(checkpoint_dict, path)
+    return True
+
+def _component_is_finite(value) -> bool:
+    return value is not None and torch.is_tensor(value) and bool(torch.isfinite(value).all().item())
+
+def _reset_after_nonfinite(optimizer, model=None):
+    if optimizer is not None:
+        optimizer.zero_grad(set_to_none=True)
+    if model is not None and hasattr(model, "reset_memory"):
+        model.reset_memory()
+    return (None, None, None, None, None, None)
+
+def _clip_gradients_and_check(model, max_norm: float):
+    params = [p for p in model.parameters() if p.requires_grad and p.grad is not None]
+    if not params:
+        return True, None
+    max_norm = float(max_norm or 0.0)
+    if max_norm > 0:
+        total_norm = nn.utils.clip_grad_norm_(params, max_norm)
+    else:
+        norms = [p.grad.detach().float().norm(2) for p in params]
+        total_norm = torch.stack(norms).norm(2) if norms else torch.zeros(())
+    if torch.is_tensor(total_norm) and not bool(torch.isfinite(total_norm).all().item()):
+        return False, _describe_tensor_issue("gradient total norm", total_norm)
+    issue = _find_first_nonfinite_model_tensor(model, include_grads=True)
+    if issue:
+        return False, issue
+    return True, total_norm
+
 def set_model_training_step(model, step: int):
     setter = getattr(model, "set_training_step", None)
     if callable(setter):
@@ -436,6 +540,7 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
     """Training step with temporal chunking to match original hierarchos.py."""
     args._optimizer_step_was_taken = False
     args._train_step_had_backward = False
+    args._train_step_had_nonfinite = False
     device = next(model.parameters()).device
     set_model_training_step(model, getattr(args, '_current_global_step', step))
     _nb = (device.type == 'cuda')  # non_blocking for async CUDA transfer
@@ -635,6 +740,27 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                 # Weight it by supervised answer-token count so long masked
                 # prompts/tool traces do not dilute the actual learning signal.
                 chunk_loss = ((ce_loss * label_ratio) + (aux_loss * token_ratio)) / accumulation_steps
+
+                ce_valid = _component_is_finite(ce_loss)
+                ponder_valid = ponder_cost is None or _component_is_finite(ponder_cost)
+                commitment_valid = commitment_cost is None or _component_is_finite(commitment_cost)
+                chunk_loss_valid = _component_is_finite(chunk_loss)
+                if not (ce_valid and ponder_valid and commitment_valid and chunk_loss_valid):
+                    print(
+                        f"\nCRITICAL: Non-finite training loss at step {step+1}, "
+                        f"chunk {chunk_idx} ({start_t}:{end_t})."
+                    )
+                    if not ce_valid and ce_loss is not None:
+                        print("  " + _describe_tensor_issue("cross_entropy_loss", ce_loss))
+                    if not ponder_valid and ponder_cost is not None:
+                        print("  " + _describe_tensor_issue("ponder_cost", ponder_cost))
+                    if not commitment_valid and commitment_cost is not None:
+                        print("  " + _describe_tensor_issue("commitment_cost", commitment_cost))
+                    if not chunk_loss_valid:
+                        print("  " + _describe_tensor_issue("chunk_loss", chunk_loss))
+                    print("  Skipping this batch and clearing recurrent/LTM state before it can poison optimizer state.")
+                    args._train_step_had_nonfinite = True
+                    return None, _reset_after_nonfinite(optimizer, model)
             
             # Backprop per chunk (TBPTT)
             # retain_grad() is now handled inside autocast block above (BUG #1 fix)
@@ -752,11 +878,21 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
         if (step + 1) % accumulation_steps == 0:
             if scaler is not None:
                 scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(model.parameters(), getattr(args, 'grad_clip', 1.0))
+                grads_ok, grad_issue = _clip_gradients_and_check(model, getattr(args, 'grad_clip', 1.0))
+                if not grads_ok:
+                    print(f"\nCRITICAL: Non-finite gradient at step {step+1}. {grad_issue}")
+                    print("  Skipping optimizer step and clearing accumulated gradients.")
+                    args._train_step_had_nonfinite = True
+                    return None, _reset_after_nonfinite(optimizer, model)
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                nn.utils.clip_grad_norm_(model.parameters(), getattr(args, 'grad_clip', 1.0))
+                grads_ok, grad_issue = _clip_gradients_and_check(model, getattr(args, 'grad_clip', 1.0))
+                if not grads_ok:
+                    print(f"\nCRITICAL: Non-finite gradient at step {step+1}. {grad_issue}")
+                    print("  Skipping optimizer step and clearing accumulated gradients.")
+                    args._train_step_had_nonfinite = True
+                    return None, _reset_after_nonfinite(optimizer, model)
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             args._optimizer_step_was_taken = True
@@ -1082,6 +1218,10 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         restore_dataloader_state(dataloader, checkpoint.get('data_state'))
         restore_rng_state(checkpoint.get('rng_state'))
         restore_model_grad_state(model, checkpoint.get('grad_state_dict'), device)
+        if not training_state_is_finite(model, optimizer, check_optimizer=True, include_grads=True):
+            print("ERROR: Loaded checkpoint contains non-finite model, optimizer, or pending gradient state.")
+            print("       Stop here and resume from an earlier clean checkpoint.")
+            return
         if start_step > 0:
             if checkpoint.get('data_state') is None:
                 print("Warning: Mid-epoch checkpoint has no dataloader state; resume will skip to the saved step but exact batch order may differ.")
@@ -1157,7 +1297,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
             # Periodic Checkpointing (Progress Protection)
             if args.save_steps > 0 and (step + 1) % args.save_steps == 0:
                 print(f"\n[Step {step+1}] Periodic Checkpoint: Saving to {args.out_dir}...")
-                save_checkpoint_safely(
+                save_training_checkpoint_if_finite(
                     build_training_checkpoint(
                         model,
                         optimizer,
@@ -1170,6 +1310,8 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                         running_states=running_states,
                     ),
                     os.path.join(args.out_dir, f"hierarchos_epoch_{epoch+1}_step_{step+1}.pt"),
+                    model,
+                    optimizer,
                 )
             
             # --- STEP-BASED EVALUATION (runs every N steps) ---
@@ -1206,7 +1348,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                     print(f"WARNING: Step-based evaluation failed: {e}")
                     model.train()
         
-        save_checkpoint_safely(
+        save_training_checkpoint_if_finite(
             build_training_checkpoint(
                 model,
                 optimizer,
@@ -1218,6 +1360,8 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                 mid_epoch_step=0,
             ),
             os.path.join(args.out_dir, f"hierarchos_epoch_{epoch+1}.pt"),
+            model,
+            optimizer,
         )
         
         # --- OPTIONAL EVALUATION (lm-evaluation-harness) ---
@@ -1278,7 +1422,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         'completed_epoch': args.epochs,
         'training_complete': True,
     }
-    save_checkpoint_safely(final_checkpoint, final_model_path)
+    save_training_checkpoint_if_finite(final_checkpoint, final_model_path, model, optimizer=None)
     
     # Save tokenizer files into the directory (HuggingFace-style portability)
     try:
@@ -1468,6 +1612,11 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
         else:
             print("Warning: Cannot enable LR schedule, dataset might be too small.")
 
+    if checkpoint and not training_state_is_finite(model, optimizer, check_optimizer=True, include_grads=True):
+        print("ERROR: Loaded fine-tune checkpoint contains non-finite model, optimizer, or pending gradient state.")
+        print("       Stop here and resume from an earlier clean checkpoint.")
+        return
+
     optimizer.zero_grad(set_to_none=True)
     global_step = 0
     accumulation_steps = getattr(args, 'accumulation_steps', 1)
@@ -1550,6 +1699,16 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                 if ce_valid:
                     combined_loss = loss_accum
 
+                combined_valid = combined_loss is not None and torch.isfinite(combined_loss).all()
+                if combined_loss is not None and not bool(combined_valid.item()):
+                    print(
+                        f"\nCRITICAL: Non-finite fine-tune loss at step {i+1}; "
+                        "skipping batch and clearing gradients."
+                    )
+                    print("  " + _describe_tensor_issue("combined_loss", combined_loss))
+                    combined_loss = None
+                    optimizer.zero_grad(set_to_none=True)
+
             if combined_loss is not None:
                 loss_to_backward = combined_loss / accumulation_steps
 
@@ -1602,13 +1761,23 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                     # Optimizer step
                     if use_amp and scaler:
                         scaler.unscale_(optimizer)
-                        if grad_clip > 0:
-                            torch.nn.utils.clip_grad_norm_(filter(lambda p: p.requires_grad, model.parameters()), grad_clip)
+                        grads_ok, grad_issue = _clip_gradients_and_check(model, grad_clip)
+                        if not grads_ok:
+                            print(f"\nCRITICAL: Non-finite fine-tune gradient at step {i+1}. {grad_issue}")
+                            print("  Skipping optimizer step and clearing accumulated gradients.")
+                            _reset_after_nonfinite(optimizer, model)
+                            backward_called_in_cycle = False
+                            continue
                         scaler.step(optimizer)
                         scaler.update()
                     else:
-                        if grad_clip > 0:
-                            torch.nn.utils.clip_grad_norm_(filter(lambda p: p.requires_grad, model.parameters()), grad_clip)
+                        grads_ok, grad_issue = _clip_gradients_and_check(model, grad_clip)
+                        if not grads_ok:
+                            print(f"\nCRITICAL: Non-finite fine-tune gradient at step {i+1}. {grad_issue}")
+                            print("  Skipping optimizer step and clearing accumulated gradients.")
+                            _reset_after_nonfinite(optimizer, model)
+                            backward_called_in_cycle = False
+                            continue
                         optimizer.step()
 
                     if scheduler:
@@ -1622,7 +1791,7 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                     if getattr(args, 'save_steps', 0) > 0 and (i + 1) % args.save_steps == 0:
                         ckpt_path = os.path.join(args.out_dir, f"hierarchos_finetune_epoch_{epoch+1}_step_{i+1}.pt")
                         print(f"\n[Step {i+1}] Periodic Checkpoint: Saving to {ckpt_path}...")
-                        save_checkpoint_safely({
+                        save_training_checkpoint_if_finite({
                             'completed_epoch': epoch,
                             'mid_epoch_step': i + 1,
                             'model_state_dict': sanitize_model_state_dict(model),
@@ -1630,7 +1799,7 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                             'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
                             'scaler_state_dict': scaler.state_dict() if scaler else None,
                             'config': dict(model.config),
-                        }, ckpt_path)
+                        }, ckpt_path, model, optimizer)
                 else:
                     print(f"\nWarning: Skipping optimizer step at batch {i+1} due to invalid loss.")
                     optimizer.zero_grad(set_to_none=True)

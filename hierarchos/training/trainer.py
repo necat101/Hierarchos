@@ -199,6 +199,15 @@ def _clamp_tensor_finite_magnitude_(tensor: torch.Tensor, max_abs: float) -> int
         tensor.clamp_(min=-max_abs, max=max_abs)
     return over_count
 
+def _detach_finite_clamp(tensor: torch.Tensor, max_abs: float) -> torch.Tensor:
+    max_abs = _positive_float(max_abs, 1.0)
+    detached = tensor.detach()
+    return torch.clamp(
+        torch.nan_to_num(detached, nan=0.0, posinf=max_abs, neginf=-max_abs),
+        min=-max_abs,
+        max=max_abs,
+    )
+
 def _sanitize_optimizer_state_(optimizer) -> int:
     if optimizer is None:
         return 0
@@ -1082,16 +1091,19 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                                  curr_ltm[5].detach() if len(curr_ltm) >= 6 and isinstance(curr_ltm[5], torch.Tensor) else None)
 
             # Update states for next chunk (TBPTT - detach to limit gradient flow)
+            recurrent_state_clamp = getattr(args, 'recurrent_state_clamp', 50.0)
+            context_state_clamp = getattr(args, 'context_state_clamp', 50.0)
+            drift_state_clamp = getattr(args, 'drift_state_clamp', 5.0)
             if outputs.get('h_state') is not None:
-                h_state = torch.clamp(outputs['h_state'].detach(), min=-50.0, max=50.0)
+                h_state = _detach_finite_clamp(outputs['h_state'], recurrent_state_clamp)
             if outputs.get('l_state') is not None:
-                l_state = torch.clamp(outputs['l_state'].detach(), min=-50.0, max=50.0)
+                l_state = _detach_finite_clamp(outputs['l_state'], recurrent_state_clamp)
             if outputs.get('prev_context') is not None:
-                prev_ctx = torch.clamp(outputs['prev_context'].detach(), min=-50.0, max=50.0)
+                prev_ctx = _detach_finite_clamp(outputs['prev_context'], context_state_clamp)
             if outputs.get('target_context') is not None:
-                target_ctx = torch.clamp(outputs['target_context'].detach(), min=-50.0, max=50.0)
+                target_ctx = _detach_finite_clamp(outputs['target_context'], context_state_clamp)
             if outputs.get('drift_state') is not None:
-                drift_state = torch.clamp(outputs['drift_state'].detach(), min=-5.0, max=5.0)
+                drift_state = _detach_finite_clamp(outputs['drift_state'], drift_state_clamp)
             
             # Accumulate for display
             total_loss = total_loss + ce_loss.detach().float() * label_ratio

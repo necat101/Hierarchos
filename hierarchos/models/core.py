@@ -17,6 +17,23 @@ from .ltm import LTMModule
 from ..utils.device import setup_msvc_environment, is_directml_device
 from ..utils.rosa import ROSA, rosa_async_pipeline, ROSAState
 
+def _config_float(config, name: str, default: float) -> float:
+    try:
+        value = float(getattr(config, name, default))
+    except (TypeError, ValueError):
+        return default
+    return value if math.isfinite(value) and value > 0.0 else default
+
+def _finite_clamp(tensor: torch.Tensor, max_abs: float, *, nan: float = 0.0) -> torch.Tensor:
+    if tensor is None or not torch.is_tensor(tensor) or not tensor.is_floating_point():
+        return tensor
+    max_abs = float(max_abs)
+    return torch.clamp(
+        torch.nan_to_num(tensor, nan=nan, posinf=max_abs, neginf=-max_abs),
+        min=-max_abs,
+        max=max_abs,
+    )
+
 def _quiet_torch_compile_logs():
     """Keep useful compiler warnings while hiding routine autotune chatter."""
     try:
@@ -83,6 +100,10 @@ class WorkerLoop:
         self.max_l_steps = config.max_l_steps
         self.l_conv_atol = getattr(config, 'l_conv_atol', 0.01)
         self.commitment_threshold = getattr(config, 'commitment_threshold', 0.1)
+        self.recurrent_state_clamp = _config_float(config, 'recurrent_state_clamp', 50.0)
+        self.context_state_clamp = _config_float(config, 'context_state_clamp', 50.0)
+        self.drift_state_clamp = _config_float(config, 'drift_state_clamp', 5.0)
+        self.activation_clamp = _config_float(config, 'activation_clamp', 100.0)
         static_loop = getattr(config, 'compile_static_worker_loop', False)
         self.compile_static_worker_loop = bool(static_loop) if static_loop is not None else False
 
@@ -94,7 +115,10 @@ class WorkerLoop:
         if l_state.dim() == 4 and l_state.shape[0] == 1: l_state = l_state.squeeze(0)
         if initial_drift.dim() == 3 and initial_drift.shape[0] == 1: initial_drift = initial_drift.squeeze(0)
 
-        current_drift = initial_drift
+        enc = _finite_clamp(enc, self.activation_clamp)
+        static_context = _finite_clamp(static_context, self.context_state_clamp)
+        l_state = _finite_clamp(l_state, self.recurrent_state_clamp)
+        current_drift = _finite_clamp(initial_drift, self.drift_state_clamp)
         drift_costs = [] 
         current_enc = enc
 
@@ -106,7 +130,7 @@ class WorkerLoop:
 
         l_input_vec = torch.cat([current_enc, dynamic_context], dim=-1)
         l_input = self.l_input_proj(l_input_vec)
-        l_input = torch.clamp(l_input, min=-50.0, max=50.0)
+        l_input = _finite_clamp(l_input, self.recurrent_state_clamp)
         
         check_idx = [0, 1, 2]
 
@@ -114,13 +138,14 @@ class WorkerLoop:
             prev_shadow = shadow_l_state.clone()
             for step_idx in range(self.max_l_steps):
                 l_out, shadow_l_state = self.l_rnn(l_input, shadow_l_state, timestep=-(step_idx+1), deepemb_vec=l_deepemb_vec)
-                shadow_l_state = torch.clamp(shadow_l_state, min=-50.0, max=50.0)
+                l_out = _finite_clamp(l_out, self.activation_clamp)
+                shadow_l_state = _finite_clamp(shadow_l_state, self.recurrent_state_clamp)
                 
                 drift_delta = torch.tanh(self.context_drift_proj(l_out))
-                current_drift = torch.clamp(current_drift + drift_delta, min=-5.0, max=5.0)
+                current_drift = _finite_clamp(current_drift + drift_delta, self.drift_state_clamp)
                 dynamic_context = static_context + current_drift
                 l_input_vec = torch.cat([current_enc, dynamic_context], dim=-1)
-                l_input = self.l_input_proj(l_input_vec)
+                l_input = _finite_clamp(self.l_input_proj(l_input_vec), self.recurrent_state_clamp)
                 
                 drift_converged = torch.mean(torch.abs(drift_delta)) < self.l_conv_atol
                 state_converged = torch.allclose(shadow_l_state[..., check_idx], prev_shadow[..., check_idx], atol=self.l_conv_atol)
@@ -139,11 +164,11 @@ class WorkerLoop:
                     prev_l_input = l_input
 
                     l_out, candidate_shadow = self.l_rnn(l_input, shadow_l_state, timestep=None, deepemb_vec=l_deepemb_vec)
-                    l_out = torch.clamp(torch.nan_to_num(l_out, nan=0.0, posinf=100.0, neginf=-100.0), min=-100.0, max=100.0)
-                    candidate_shadow = torch.clamp(torch.nan_to_num(candidate_shadow, nan=0.0, posinf=50.0, neginf=-50.0), min=-50.0, max=50.0)
+                    l_out = _finite_clamp(l_out, self.activation_clamp)
+                    candidate_shadow = _finite_clamp(candidate_shadow, self.recurrent_state_clamp)
 
                     drift_delta = torch.tanh(self.context_drift_proj(l_out))
-                    candidate_drift = torch.clamp(current_drift + drift_delta, min=-5.0, max=5.0)
+                    candidate_drift = _finite_clamp(current_drift + drift_delta, self.drift_state_clamp)
                     drift_sq = torch.sum(candidate_drift ** 2, dim=-1)
                     hinge_cost = torch.relu(drift_sq - self.commitment_threshold)
                     hinge_cost = torch.clamp(hinge_cost, max=100.0)
@@ -153,7 +178,7 @@ class WorkerLoop:
 
                     candidate_dynamic = static_context + candidate_drift
                     candidate_input_vec = torch.cat([current_enc, candidate_dynamic], dim=-1)
-                    candidate_l_input = self.l_input_proj(candidate_input_vec)
+                    candidate_l_input = _finite_clamp(self.l_input_proj(candidate_input_vec), self.recurrent_state_clamp)
 
                     keep2 = active.view(1, 1)
                     keep3 = active.view(1, 1, 1)
@@ -171,11 +196,11 @@ class WorkerLoop:
         if self.l_rnn.training and not self.compile_static_worker_loop:
             for step_idx in range(self.max_l_steps):
                 l_out, shadow_l_state = self.l_rnn(l_input, shadow_l_state, timestep=None, deepemb_vec=l_deepemb_vec)
-                l_out = torch.clamp(torch.nan_to_num(l_out, nan=0.0, posinf=100.0, neginf=-100.0), min=-100.0, max=100.0)
-                shadow_l_state = torch.clamp(torch.nan_to_num(shadow_l_state, nan=0.0, posinf=50.0, neginf=-50.0), min=-50.0, max=50.0)
+                l_out = _finite_clamp(l_out, self.activation_clamp)
+                shadow_l_state = _finite_clamp(shadow_l_state, self.recurrent_state_clamp)
                 
                 drift_delta = torch.tanh(self.context_drift_proj(l_out))
-                current_drift = torch.clamp(current_drift + drift_delta, min=-5.0, max=5.0)
+                current_drift = _finite_clamp(current_drift + drift_delta, self.drift_state_clamp)
                 drift_sq = torch.sum(current_drift ** 2, dim=-1)
                 hinge_cost = torch.relu(drift_sq - self.commitment_threshold)
                 hinge_cost = torch.clamp(hinge_cost, max=100.0)
@@ -184,7 +209,7 @@ class WorkerLoop:
                 # Update dynamic_context BEFORE convergence check (matches inference path)
                 dynamic_context = static_context + current_drift
                 l_input_vec = torch.cat([current_enc, dynamic_context], dim=-1)
-                l_input = self.l_input_proj(l_input_vec)
+                l_input = _finite_clamp(self.l_input_proj(l_input_vec), self.recurrent_state_clamp)
                 
                 if torch.mean(torch.abs(drift_delta)) < self.l_conv_atol:
                    break
@@ -195,21 +220,21 @@ class WorkerLoop:
         # Recalculate l_input with final drift
         dynamic_context = static_context + current_drift
         l_input_vec = torch.cat([current_enc, dynamic_context], dim=-1)
-        l_input = self.l_input_proj(l_input_vec)
+        l_input = _finite_clamp(self.l_input_proj(l_input_vec), self.recurrent_state_clamp)
         
         final_l_out, next_l_state = self.l_rnn(l_input, l_state, timestep=None, deepemb_vec=l_deepemb_vec)
-        final_l_out = torch.clamp(torch.nan_to_num(final_l_out, nan=0.0, posinf=100.0, neginf=-100.0), min=-100.0, max=100.0)
-        next_l_state = torch.clamp(torch.nan_to_num(next_l_state, nan=0.0, posinf=50.0, neginf=-50.0), min=-50.0, max=50.0)
+        final_l_out = _finite_clamp(final_l_out, self.activation_clamp)
+        next_l_state = _finite_clamp(next_l_state, self.recurrent_state_clamp)
         
         final_enc = current_enc + self.l_to_out(final_l_out)
-        final_enc = torch.clamp(torch.nan_to_num(final_enc, nan=0.0, posinf=100.0, neginf=-100.0), min=-100.0, max=100.0)
+        final_enc = _finite_clamp(final_enc, self.activation_clamp)
         commitment_cost = torch.zeros(enc.shape[0], device=enc.device, dtype=enc.dtype)
         if self.l_rnn.training and self.compile_static_worker_loop and commitment_cost_static is not None:
             commitment_cost = commitment_cost_static
         elif len(drift_costs) > 0:
             commitment_cost = torch.stack(drift_costs, dim=0).mean(dim=0)
 
-        return final_enc, next_l_state, commitment_cost, current_drift
+        return final_enc, next_l_state, commitment_cost, _finite_clamp(current_drift, self.drift_state_clamp)
 
 
 class HierarchosCore(nn.Module):
@@ -442,6 +467,11 @@ class HierarchosCore(nn.Module):
         """
         B, T = input_ids.shape
         device = input_ids.device
+        recurrent_state_clamp = _config_float(self.config, 'recurrent_state_clamp', 50.0)
+        context_state_clamp = _config_float(self.config, 'context_state_clamp', 50.0)
+        drift_state_clamp = _config_float(self.config, 'drift_state_clamp', 5.0)
+        activation_clamp = _config_float(self.config, 'activation_clamp', 100.0)
+        halt_logit_clamp = _config_float(self.config, 'halt_logit_clamp', 30.0)
         allow_hebbian_update = kwargs.pop("allow_hebbian_update", False)
         return_logits = kwargs.pop("return_logits", True)
         return_topk_values = kwargs.pop("return_topk_values", True)
@@ -549,7 +579,7 @@ class HierarchosCore(nn.Module):
                 rosa_gate_logits = self.rosa_gate_logit + self.rosa_router(x)
             else:
                 rosa_gate_logits = self.rosa_gate_logit
-            rosa_gate = torch.sigmoid(torch.clamp(rosa_gate_logits, min=-50.0, max=50.0))
+            rosa_gate = torch.sigmoid(_finite_clamp(rosa_gate_logits, 50.0))
             rosa_gate = self._apply_memory_gate_warmup(rosa_gate)
             x = x + rosa_gate * rosa_embs  # Gated Neurosymbolic Inner Monologue Mix
         else:
@@ -573,11 +603,15 @@ class HierarchosCore(nn.Module):
                 target_context = self.h_to_context(self.h_rnn.state_hidden(h_state))
             else:
                 target_context = target_context.to(device)
+        h_state = _finite_clamp(h_state, recurrent_state_clamp)
+        prev_context = _finite_clamp(prev_context, context_state_clamp)
+        target_context = _finite_clamp(target_context, context_state_clamp)
 
         if l_state is None:
             l_state = self.l_rnn.initial_state(B, device=device)
         else:
             l_state = l_state.to(device)
+        l_state = _finite_clamp(l_state, recurrent_state_clamp)
 
         # (ltm_memory_state already unpacked above)
         if ltm_memory_state is not None:
@@ -596,6 +630,8 @@ class HierarchosCore(nn.Module):
                 drift_seed = drift_seed.expand(B, -1)
             if drift_seed.shape != (B, self.config.context_dim):
                 drift_seed = None
+            else:
+                drift_seed = _finite_clamp(drift_seed, drift_state_clamp)
 
         final_embs = []
         ponder_costs = []
@@ -623,7 +659,7 @@ class HierarchosCore(nn.Module):
             # --- LTM Retrieval ---
             p = self.persistent.unsqueeze(0).expand(B, -1)
             q_in = torch.cat([token_x, prev_context], dim=-1)
-            q = torch.clamp(self.qproj(q_in), min=-12, max=12)
+            q = _finite_clamp(self.qproj(q_in), 12.0)
             
             topk_vals, topk_idx, topk_ts = self.ltm.retrieve_topk(
                 q, self.config.ltm_topk, min_timestamp, source_filter, fast_vals=curr_fast_vals,
@@ -644,7 +680,7 @@ class HierarchosCore(nn.Module):
                 gate_input = self.ltm_gate_logit + self.ltm_router(token_x)
             else:
                 gate_input = self.ltm_gate_logit
-            gate = torch.sigmoid(torch.clamp(gate_input, min=-50.0, max=50.0))
+            gate = torch.sigmoid(_finite_clamp(gate_input, 50.0))
             gate = self._apply_memory_gate_warmup(gate)
             if gate.dim() == 2:
                 gate = gate.unsqueeze(1)
@@ -652,20 +688,21 @@ class HierarchosCore(nn.Module):
             mac_in = torch.cat([token_x, p, gated_vals.view(B, -1)], dim=-1)
             
             enc = F.gelu(self.in_proj(mac_in))
-            enc = torch.clamp(enc, min=-30.0, max=30.0)
+            enc = _finite_clamp(enc, 30.0)
 
             # ==================================================================
             # 3. HIERARCHICAL MANAGER (Continuous Watch, Strided Plan)
             # ==================================================================
             l_feedback = self.l_feedback_proj(self.l_rnn.state_hidden(l_state).to(device))
-            enc_with_feedback = enc + l_feedback
+            enc_with_feedback = _finite_clamp(enc + l_feedback, activation_clamp)
 
             detach_freq = getattr(self.config, 'detach_every_n_steps', 32)
             if self.training and detach_freq is not None and t > 0 and t % detach_freq == 0:
                 h_state = h_state.detach()
             
             h_out_real, h_state = self.h_rnn(enc_with_feedback, h_state, timestep=None, deepemb_vec=h_deepemb_vec)
-            h_out_real = torch.clamp(h_out_real, min=-100.0, max=100.0)
+            h_out_real = _finite_clamp(h_out_real, activation_clamp)
+            h_state = _finite_clamp(h_state, recurrent_state_clamp)
             
             if getattr(self.config, 'debug_numerics', False) and (torch.isnan(h_out_real).any() or torch.isinf(h_out_real).any()):
                 print(f"WARNING: NaN/Inf detected in h_out_real at step {t}")
@@ -674,23 +711,23 @@ class HierarchosCore(nn.Module):
             
             # PLANNING STEP (Strided with ACT)
             if abs_t % stride == 0:
-                prev_context = target_context
+                prev_context = _finite_clamp(target_context, context_state_clamp)
 
                 # Pondering on Shadow State
                 h_step_outputs = [h_out_real]
-                halt_logit = torch.clamp(self.h_halt_proj(h_out_real).squeeze(-1), min=-50.0, max=50.0)
+                halt_logit = _finite_clamp(self.h_halt_proj(h_out_real).squeeze(-1), halt_logit_clamp)
                 h_halt_probs = [torch.sigmoid(halt_logit).clamp(1e-6, 1.0 - 1e-6)]
                 
-                shadow_h_state = h_state.clone()
+                shadow_h_state = _finite_clamp(h_state.clone(), recurrent_state_clamp)
                 current_enc_h = enc_with_feedback
 
                 for step_idx in range(self.config.max_h_steps - 1):
                     if not self.training and h_halt_probs[-1].mean() > getattr(self.config, 'h_halt_thresh', 0.9): 
                         break
                     h_out_ponder, shadow_h_state = self.h_rnn(current_enc_h, shadow_h_state, timestep=None, deepemb_vec=h_deepemb_vec)
-                    h_out_ponder = torch.clamp(torch.nan_to_num(h_out_ponder, nan=0.0, posinf=100.0, neginf=-100.0), min=-100.0, max=100.0)
-                    shadow_h_state = torch.clamp(torch.nan_to_num(shadow_h_state, nan=0.0, posinf=50.0, neginf=-50.0), min=-50.0, max=50.0)
-                    halt_logit = torch.clamp(self.h_halt_proj(h_out_ponder).squeeze(-1), min=-50.0, max=50.0)
+                    h_out_ponder = _finite_clamp(h_out_ponder, activation_clamp)
+                    shadow_h_state = _finite_clamp(shadow_h_state, recurrent_state_clamp)
+                    halt_logit = _finite_clamp(self.h_halt_proj(h_out_ponder).squeeze(-1), halt_logit_clamp)
                     h_step_outputs.append(h_out_ponder)
                     h_halt_probs.append(torch.sigmoid(halt_logit).clamp(1e-6, 1.0 - 1e-6))
 
@@ -714,10 +751,10 @@ class HierarchosCore(nn.Module):
                 if torch.isnan(final_h_out).any() or torch.isinf(final_h_out).any():
                     print(f"WARNING: Non-finite manager output at token step {abs_t}; clamping for stability.")
                     final_h_out = torch.nan_to_num(final_h_out, nan=0.0, posinf=10.0, neginf=-10.0)
-                final_h_out = final_h_out.to(enc.dtype)  # Cast back to working precision
+                final_h_out = _finite_clamp(final_h_out, activation_clamp).to(enc.dtype)  # Cast back to working precision
                 
                 target_context = self.h_to_context(final_h_out)
-                target_context = torch.clamp(target_context, min=-50.0, max=50.0)
+                target_context = _finite_clamp(target_context, context_state_clamp)
                 
                 step_ponder_cost = cum_remain.sum(dim=0).to(enc.dtype)
                 ponder_costs.append(step_ponder_cost)
@@ -730,16 +767,17 @@ class HierarchosCore(nn.Module):
             step_in_stride = abs_t % stride
             alpha = step_in_stride / float(stride)
             sliding_context = (prev_context.float() + alpha * (target_context.float() - prev_context.float())).to(prev_context.dtype)
+            sliding_context = _finite_clamp(sliding_context, context_state_clamp)
 
             # ==================================================================
             # 4. WORKER STEP
             # ==================================================================
             if t == 0 and drift_seed is not None:
-                initial_drift = torch.clamp(drift_seed, min=-5.0, max=5.0)
+                initial_drift = _finite_clamp(drift_seed, drift_state_clamp)
             elif self.context_drift_proj is not None:
                 prev_worker_h = self.l_rnn.state_hidden(l_state).to(device)
                 initial_drift = torch.tanh(self.context_drift_proj(prev_worker_h))
-                initial_drift = torch.clamp(initial_drift, min=-5.0, max=5.0)
+                initial_drift = _finite_clamp(initial_drift, drift_state_clamp)
             else:
                 initial_drift = torch.zeros(B, self.config.context_dim, device=device)
 
@@ -755,6 +793,9 @@ class HierarchosCore(nn.Module):
                 enc, l_state, cc, final_drift = self.worker_loop_module(
                     enc, sliding_context, l_state, initial_drift, timestep=None, l_deepemb_vec=l_deepemb_vec
                 )
+            enc = _finite_clamp(enc, activation_clamp)
+            l_state = _finite_clamp(l_state, recurrent_state_clamp)
+            final_drift = _finite_clamp(final_drift, drift_state_clamp)
             
             final_embs.append(enc)
             commitment_costs.append(cc)
@@ -789,7 +830,7 @@ class HierarchosCore(nn.Module):
         # ==================================================================
         # 5. FINAL OUTPUTS
         # ==================================================================
-        final = self.out_norm(torch.stack(final_embs, dim=1))
+        final = _finite_clamp(self.out_norm(torch.stack(final_embs, dim=1)), activation_clamp)
         logits = None
 
         loss = None
@@ -809,7 +850,7 @@ class HierarchosCore(nn.Module):
                 print("WARNING: NaN/Inf detected in logits. Replacing with zeros and clamping...")
                 logits = torch.nan_to_num(logits, nan=0.0, posinf=30.0, neginf=-30.0)
             
-            logits = torch.clamp(logits, min=-30.0, max=30.0)
+            logits = _finite_clamp(logits, 30.0)
 
             if labels is not None:
                 shift_logits = logits[..., :-1, :].contiguous()
@@ -855,6 +896,12 @@ class HierarchosCore(nn.Module):
 
             ponder_cost_out = _weighted_aux_mean(ponder_costs, ponder_weights)
             commitment_cost_out = _weighted_aux_mean(commitment_costs, commitment_weights)
+
+        h_state = _finite_clamp(h_state, recurrent_state_clamp)
+        l_state = _finite_clamp(l_state, recurrent_state_clamp)
+        prev_context = _finite_clamp(prev_context, context_state_clamp)
+        target_context = _finite_clamp(target_context, context_state_clamp)
+        final_drift = _finite_clamp(final_drift, drift_state_clamp)
 
         return {
             "loss": loss, 

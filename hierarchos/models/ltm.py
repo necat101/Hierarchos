@@ -61,9 +61,8 @@ class LTMModule(nn.Module):
         self._cuda_friendly_math = True
 
     def reset_working_memory(self):
-        """Zeros out the Fast State (Working Memory) and associated momentum buffers."""
+        """Zeros out the Fast State (Working Memory) and associated slot metadata."""
         self.fast_vals.zero_()
-        self._mom_vals.zero_()
         self.timestamps.zero_()
         self.sources.fill_(self.SRC_UNKNOWN)
 

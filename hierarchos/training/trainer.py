@@ -13,7 +13,12 @@ import math
 
 from .optimizers import DirectMLAdamW
 from ..utils.device import is_directml_device, set_threads
-from ..utils.checkpoint import save_checkpoint_safely, load_full_model_with_config, sanitize_model_state_dict
+from ..utils.checkpoint import (
+    TRANSIENT_LTM_STATE_KEYS,
+    save_checkpoint_safely,
+    load_full_model_with_config,
+    sanitize_model_state_dict,
+)
 from ..models.core import HierarchosCore
 
 # Helper for AttrDict access
@@ -44,13 +49,19 @@ def _describe_tensor_issue(name: str, tensor: torch.Tensor) -> str:
         return f"{name} has {nan_count} NaN and {inf_count} Inf values; finite range=[{finite_min:.4e}, {finite_max:.4e}]"
     return f"{name} has {nan_count} NaN and {inf_count} Inf values; no finite values"
 
-def _find_first_nonfinite_model_tensor(model, include_grads: bool = False):
+def _is_transient_ltm_state_name(name: str) -> bool:
+    clean_name = str(name).replace("_orig_mod.", "")
+    return any(clean_name.endswith(suffix) for suffix in TRANSIENT_LTM_STATE_KEYS)
+
+def _find_first_nonfinite_model_tensor(model, include_grads: bool = False, include_transient_ltm: bool = False):
     for name, param in model.named_parameters():
         if _tensor_is_nonfinite(param):
             return _describe_tensor_issue(f"parameter {name}", param)
         if include_grads and param.grad is not None and _tensor_is_nonfinite(param.grad):
             return _describe_tensor_issue(f"gradient {name}", param.grad)
     for name, buffer in model.named_buffers():
+        if not include_transient_ltm and _is_transient_ltm_state_name(name):
+            continue
         if _tensor_is_nonfinite(buffer):
             return _describe_tensor_issue(f"buffer {name}", buffer)
     return None
@@ -65,6 +76,8 @@ def _find_first_nonfinite_optimizer_tensor(optimizer):
     return None
 
 def _find_first_nonfinite_payload_tensor(value, path: str = "checkpoint"):
+    if _is_transient_ltm_state_name(path):
+        return None
     if torch.is_tensor(value):
         if _tensor_is_nonfinite(value):
             return _describe_tensor_issue(path, value)
@@ -81,6 +94,22 @@ def _find_first_nonfinite_payload_tensor(value, path: str = "checkpoint"):
                 return issue
     return None
 
+def _sanitize_payload_nonfinite_(value, path: str = "checkpoint", max_abs: float = 1.0) -> int:
+    if torch.is_tensor(value):
+        if path.endswith("[0]") and "running_states[5]" in path:
+            return _sanitize_tensor_nonfinite_(value, nan=0.0, posinf=0.0, neginf=0.0)
+        if path.endswith("[1]") and "running_states[5]" in path:
+            return _sanitize_tensor_nonfinite_(value, nan=0.0, posinf=max_abs, neginf=-max_abs)
+        return _sanitize_tensor_nonfinite_(value, nan=0.0, posinf=0.0, neginf=0.0)
+    cleaned = 0
+    if isinstance(value, dict):
+        for key, item in value.items():
+            cleaned += _sanitize_payload_nonfinite_(item, f"{path}.{key}", max_abs=max_abs)
+    elif isinstance(value, (list, tuple)):
+        for idx, item in enumerate(value):
+            cleaned += _sanitize_payload_nonfinite_(item, f"{path}[{idx}]", max_abs=max_abs)
+    return cleaned
+
 def training_state_is_finite(model, optimizer=None, check_optimizer: bool = True, include_grads: bool = False) -> bool:
     issue = _find_first_nonfinite_model_tensor(model, include_grads=include_grads)
     if issue:
@@ -93,15 +122,52 @@ def training_state_is_finite(model, optimizer=None, check_optimizer: bool = True
             return False
     return True
 
+def _checkpoint_grad_clip(checkpoint_dict) -> float:
+    config = checkpoint_dict.get("config") if isinstance(checkpoint_dict, dict) else None
+    if isinstance(config, dict):
+        try:
+            return float(config.get("grad_clip", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            return 1.0
+    return 1.0
+
+def _sanitize_ltm_payload_state_(value, path: str = "checkpoint", max_abs: float = 1.0) -> int:
+    if torch.is_tensor(value):
+        clean_path = path.replace("_orig_mod.", "")
+        if clean_path.endswith("ltm.fast_vals"):
+            if value.is_floating_point():
+                changed = int(torch.count_nonzero(value).item())
+                value.zero_()
+                return changed
+            return 0
+        if clean_path.endswith("ltm._mom_vals"):
+            return _sanitize_tensor_nonfinite_(value, nan=0.0, posinf=max_abs, neginf=-max_abs)
+        if clean_path.endswith("ltm.timestamps"):
+            return _sanitize_tensor_nonfinite_(value, nan=0.0, posinf=0.0, neginf=0.0)
+        return 0
+    cleaned = 0
+    if isinstance(value, dict):
+        for key, item in value.items():
+            cleaned += _sanitize_ltm_payload_state_(item, f"{path}.{key}", max_abs=max_abs)
+    elif isinstance(value, (list, tuple)):
+        for idx, item in enumerate(value):
+            cleaned += _sanitize_ltm_payload_state_(item, f"{path}[{idx}]", max_abs=max_abs)
+    return cleaned
+
 def save_training_checkpoint_if_finite(checkpoint_dict, path: str, model, optimizer=None) -> bool:
+    max_abs = _checkpoint_grad_clip(checkpoint_dict)
+    _sanitize_model_transient_state_(model, max_abs=max_abs)
+    ltm_cleaned = _sanitize_ltm_payload_state_(checkpoint_dict, max_abs=max_abs)
+    if ltm_cleaned:
+        print(f"WARNING: Sanitized {ltm_cleaned} transient LTM checkpoint value(s) before saving.")
     if not training_state_is_finite(model, optimizer, check_optimizer=True, include_grads=True):
         print(f"WARNING: Skipping checkpoint because training state is non-finite: {path}")
         return False
     issue = _find_first_nonfinite_payload_tensor(checkpoint_dict)
     if issue:
-        print(f"CRITICAL: Non-finite checkpoint payload detected: {issue}")
-        print(f"WARNING: Skipping checkpoint because checkpoint payload is non-finite: {path}")
-        return False
+        cleaned = _sanitize_payload_nonfinite_(checkpoint_dict, max_abs=max_abs)
+        print(f"WARNING: Non-finite checkpoint payload detected: {issue}")
+        print(f"WARNING: Sanitized {cleaned} non-finite checkpoint payload value(s) before saving.")
     save_checkpoint_safely(checkpoint_dict, path)
     return True
 
@@ -115,11 +181,71 @@ def _reset_after_nonfinite(optimizer, model=None):
         model.reset_memory()
     return (None, None, None, None, None, None)
 
+def _sanitize_tensor_nonfinite_(tensor: torch.Tensor, nan: float = 0.0, posinf: float = 0.0, neginf: float = 0.0) -> int:
+    if not torch.is_tensor(tensor) or not tensor.is_floating_point():
+        return 0
+    bad_count = int((~torch.isfinite(tensor)).sum().item())
+    if bad_count:
+        tensor.nan_to_num_(nan=nan, posinf=posinf, neginf=neginf)
+    return bad_count
+
+def _sanitize_optimizer_state_(optimizer) -> int:
+    if optimizer is None:
+        return 0
+    cleaned = 0
+    for state in optimizer.state.values():
+        for value in state.values():
+            cleaned += _sanitize_tensor_nonfinite_(value, nan=0.0, posinf=0.0, neginf=0.0)
+    if cleaned:
+        print(f"WARNING: Reset {cleaned} non-finite optimizer state value(s) to 0.0 for recovery resume.")
+    return cleaned
+
+def _sanitize_model_transient_state_(model, max_abs: float = 1.0) -> int:
+    cleaned = 0
+    max_abs = float(max_abs or 0.0)
+    if max_abs <= 0.0:
+        max_abs = 1.0
+    for name, buffer in model.named_buffers():
+        clean_name = str(name).replace("_orig_mod.", "")
+        if clean_name.endswith("ltm.fast_vals"):
+            if torch.is_tensor(buffer) and buffer.is_floating_point():
+                changed = int(torch.count_nonzero(buffer).item())
+                if changed:
+                    buffer.zero_()
+                    cleaned += changed
+        elif clean_name.endswith("ltm._mom_vals"):
+            cleaned += _sanitize_tensor_nonfinite_(buffer, nan=0.0, posinf=max_abs, neginf=-max_abs)
+        elif clean_name.endswith("ltm.timestamps"):
+            cleaned += _sanitize_tensor_nonfinite_(buffer, nan=0.0, posinf=0.0, neginf=0.0)
+        elif clean_name.endswith("ltm.sources"):
+            if torch.is_tensor(buffer) and not bool(torch.isfinite(buffer.float()).all().item()):
+                buffer.fill_(0)
+                cleaned += int(buffer.numel())
+    if cleaned:
+        print(
+            f"WARNING: Sanitized transient LTM state ({cleaned} value(s)): "
+            "fast_vals reset; _mom_vals saturated; metadata reset."
+        )
+    return cleaned
+
+def _sanitize_gradient_nonfinite_(model, max_abs: float) -> int:
+    cleaned = 0
+    max_abs = float(max_abs or 0.0)
+    if max_abs <= 0.0:
+        max_abs = 1.0
+    for param in model.parameters():
+        if param.grad is not None:
+            cleaned += _sanitize_tensor_nonfinite_(param.grad, nan=0.0, posinf=max_abs, neginf=-max_abs)
+    if cleaned:
+        print(f"WARNING: Saturated {cleaned} non-finite gradient value(s) to +/-{max_abs:.4e} before clipping.")
+    return cleaned
+
 def _clip_gradients_and_check(model, max_norm: float):
     params = [p for p in model.parameters() if p.requires_grad and p.grad is not None]
     if not params:
         return True, None
     max_norm = float(max_norm or 0.0)
+    _sanitize_gradient_nonfinite_(model, max_abs=max_norm)
     if max_norm > 0:
         total_norm = nn.utils.clip_grad_norm_(params, max_norm)
     else:
@@ -886,6 +1012,7 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                     return None, _reset_after_nonfinite(optimizer, model)
                 scaler.step(optimizer)
                 scaler.update()
+                _sanitize_optimizer_state_(optimizer)
             else:
                 grads_ok, grad_issue = _clip_gradients_and_check(model, getattr(args, 'grad_clip', 1.0))
                 if not grads_ok:
@@ -894,6 +1021,7 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                     args._train_step_had_nonfinite = True
                     return None, _reset_after_nonfinite(optimizer, model)
                 optimizer.step()
+                _sanitize_optimizer_state_(optimizer)
             optimizer.zero_grad(set_to_none=True)
             args._optimizer_step_was_taken = True
         
@@ -1218,10 +1346,18 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         restore_dataloader_state(dataloader, checkpoint.get('data_state'))
         restore_rng_state(checkpoint.get('rng_state'))
         restore_model_grad_state(model, checkpoint.get('grad_state_dict'), device)
-        if not training_state_is_finite(model, optimizer, check_optimizer=True, include_grads=True):
-            print("ERROR: Loaded checkpoint contains non-finite model, optimizer, or pending gradient state.")
-            print("       Stop here and resume from an earlier clean checkpoint.")
-            return
+        _sanitize_model_transient_state_(model, max_abs=getattr(args, 'grad_clip', 1.0))
+        _sanitize_optimizer_state_(optimizer)
+        _sanitize_gradient_nonfinite_(model, max_abs=getattr(args, 'grad_clip', 1.0))
+        model_issue = _find_first_nonfinite_model_tensor(model, include_grads=False)
+        if model_issue:
+            print(f"WARNING: Loaded checkpoint still has non-finite non-transient model state: {model_issue}")
+            print("         Continuing anyway; the next non-finite loss check will skip unsafe updates.")
+        if checkpoint.get('running_states') is not None:
+            running_issue = _find_first_nonfinite_payload_tensor(checkpoint['running_states'], "running_states")
+            if running_issue:
+                print(f"WARNING: Dropping non-finite saved running state: {running_issue}")
+                checkpoint.pop('running_states', None)
         if start_step > 0:
             if checkpoint.get('data_state') is None:
                 print("Warning: Mid-epoch checkpoint has no dataloader state; resume will skip to the saved step but exact batch order may differ.")
@@ -1612,10 +1748,14 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
         else:
             print("Warning: Cannot enable LR schedule, dataset might be too small.")
 
-    if checkpoint and not training_state_is_finite(model, optimizer, check_optimizer=True, include_grads=True):
-        print("ERROR: Loaded fine-tune checkpoint contains non-finite model, optimizer, or pending gradient state.")
-        print("       Stop here and resume from an earlier clean checkpoint.")
-        return
+    if checkpoint:
+        _sanitize_model_transient_state_(model, max_abs=getattr(args, 'grad_clip', 1.0))
+        _sanitize_optimizer_state_(optimizer)
+        _sanitize_gradient_nonfinite_(model, max_abs=getattr(args, 'grad_clip', 1.0))
+        model_issue = _find_first_nonfinite_model_tensor(model, include_grads=False)
+        if model_issue:
+            print(f"WARNING: Loaded fine-tune checkpoint still has non-finite non-transient model state: {model_issue}")
+            print("         Continuing anyway; the next non-finite loss check will skip unsafe updates.")
 
     optimizer.zero_grad(set_to_none=True)
     global_step = 0
@@ -1770,6 +1910,7 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                             continue
                         scaler.step(optimizer)
                         scaler.update()
+                        _sanitize_optimizer_state_(optimizer)
                     else:
                         grads_ok, grad_issue = _clip_gradients_and_check(model, grad_clip)
                         if not grads_ok:
@@ -1779,6 +1920,7 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                             backward_called_in_cycle = False
                             continue
                         optimizer.step()
+                        _sanitize_optimizer_state_(optimizer)
 
                     if scheduler:
                         scheduler.step()

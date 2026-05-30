@@ -1,4 +1,6 @@
 from types import SimpleNamespace
+import os
+import tempfile
 
 import torch
 import torch.nn as nn
@@ -11,6 +13,10 @@ from hierarchos.training.trainer import (
     compute_remaining_update_steps,
     restore_dataloader_state,
     restore_model_grad_state,
+    save_training_checkpoint_if_finite,
+    train_step,
+    training_state_is_finite,
+    _clip_gradients_and_check,
 )
 from hierarchos.utils.checkpoint import sanitize_model_state_dict
 
@@ -30,6 +36,59 @@ class _FakeTrainModel(nn.Module):
         self.ltm = _FakeLTM()
         self.proj = nn.Linear(2, 2)
         self.config = {"context_dim": 2}
+
+
+class _NaNLossModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(()))
+        self.config = SimpleNamespace(vocab_size=8, cpu_chunked_lm_loss=False, cuda_chunked_lm_loss=False)
+        self.reset_called = False
+
+    def reset_memory(self):
+        self.reset_called = True
+
+    def forward(self, **kwargs):
+        nan_loss = self.weight * torch.tensor(float("nan"), device=self.weight.device)
+        return {
+            "loss": nan_loss,
+            "ponder_cost": torch.zeros((), device=self.weight.device),
+            "commitment_cost": torch.zeros((), device=self.weight.device),
+            "raw_topk_vals": None,
+            "ltm_memory_state": None,
+            "h_state": None,
+            "l_state": None,
+            "prev_context": None,
+            "target_context": None,
+            "drift_state": None,
+        }
+
+
+class _InfGradient(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, weight):
+        return weight.detach() * 0.0 + 1.0
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return torch.full_like(grad_output, float("inf"))
+
+
+class _InfGradModel(_NaNLossModel):
+    def forward(self, **kwargs):
+        finite_loss = _InfGradient.apply(self.weight)
+        return {
+            "loss": finite_loss,
+            "ponder_cost": torch.zeros((), device=self.weight.device),
+            "commitment_cost": torch.zeros((), device=self.weight.device),
+            "raw_topk_vals": None,
+            "ltm_memory_state": None,
+            "h_state": None,
+            "l_state": None,
+            "prev_context": None,
+            "target_context": None,
+            "drift_state": None,
+        }
 
 
 def test_training_checkpoint_preserves_resume_only_state():
@@ -170,6 +229,176 @@ def test_restore_model_grad_state_round_trips_pending_accumulation():
 
     assert restored is True
     assert torch.equal(model.proj.weight.grad, torch.full_like(model.proj.weight, 9.0))
+
+
+def test_training_state_finite_rejects_poisoned_optimizer_state():
+    model = _FakeTrainModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    x = torch.ones(1, 2)
+    loss = model.proj(x).sum()
+    loss.backward()
+    optimizer.step()
+
+    first_state = next(iter(optimizer.state.values()))
+    first_state["exp_avg"].view(-1)[0] = float("nan")
+
+    assert training_state_is_finite(model, optimizer) is False
+
+
+def test_training_state_finite_rejects_poisoned_pending_grad():
+    model = _FakeTrainModel()
+    model.proj.weight.grad = torch.ones_like(model.proj.weight)
+    model.proj.weight.grad.view(-1)[0] = float("nan")
+
+    assert training_state_is_finite(model, include_grads=True) is False
+
+
+def test_clip_gradients_and_check_rejects_nonfinite_gradients():
+    model = _FakeTrainModel()
+    model.proj.weight.grad = torch.ones_like(model.proj.weight)
+    model.proj.bias.grad = torch.ones_like(model.proj.bias)
+    model.proj.weight.grad.view(-1)[0] = float("inf")
+
+    ok, issue = _clip_gradients_and_check(model, max_norm=1.0)
+
+    assert ok is False
+    assert "gradient" in issue or "gradient total norm" in issue
+
+
+def test_train_step_skips_nonfinite_loss_before_backward():
+    model = _NaNLossModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    args = SimpleNamespace(
+        amp=False,
+        training_chunk_size=8,
+        compile=False,
+        pad_token_id=0,
+        padding_metrics=False,
+        cpu_chunked_lm_loss=False,
+        cuda_chunked_lm_loss=False,
+        grad_clip=1.0,
+    )
+    batch = {
+        "input_ids": torch.ones(1, 4, dtype=torch.long),
+        "labels": torch.ones(1, 4, dtype=torch.long),
+    }
+
+    outputs, states = train_step(
+        model,
+        batch,
+        optimizer,
+        scaler=None,
+        accumulation_steps=1,
+        step=0,
+        args=args,
+        running_states=(None, None, None, None, None, None),
+    )
+
+    assert outputs is None
+    assert states == (None, None, None, None, None, None)
+    assert args._train_step_had_nonfinite is True
+    assert model.weight.grad is None
+    assert model.reset_called is True
+
+
+def test_train_step_skips_nonfinite_gradient_before_optimizer_step():
+    model = _InfGradModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    args = SimpleNamespace(
+        amp=False,
+        training_chunk_size=8,
+        compile=False,
+        pad_token_id=0,
+        padding_metrics=False,
+        cpu_chunked_lm_loss=False,
+        cuda_chunked_lm_loss=False,
+        grad_clip=1.0,
+    )
+    batch = {
+        "input_ids": torch.ones(1, 4, dtype=torch.long),
+        "labels": torch.ones(1, 4, dtype=torch.long),
+    }
+
+    before = model.weight.detach().clone()
+    outputs, states = train_step(
+        model,
+        batch,
+        optimizer,
+        scaler=None,
+        accumulation_steps=1,
+        step=0,
+        args=args,
+        running_states=(None, None, None, None, None, None),
+    )
+
+    assert outputs is None
+    assert states == (None, None, None, None, None, None)
+    assert args._train_step_had_nonfinite is True
+    assert model.weight.grad is None
+    assert torch.equal(model.weight.detach(), before)
+    assert model.reset_called is True
+
+
+def test_checkpoint_save_allows_clean_state_and_writes_file():
+    model = _FakeTrainModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "clean.pt")
+
+        saved = save_training_checkpoint_if_finite({"ok": torch.tensor(1)}, path, model, optimizer)
+
+        assert saved is True
+        assert os.path.exists(path)
+
+
+def test_checkpoint_save_refuses_poisoned_gradient():
+    model = _FakeTrainModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    model.proj.weight.grad = torch.ones_like(model.proj.weight)
+    model.proj.weight.grad.view(-1)[0] = float("nan")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "poisoned_grad.pt")
+
+        saved = save_training_checkpoint_if_finite({"bad": torch.tensor(1)}, path, model, optimizer)
+
+        assert saved is False
+        assert not os.path.exists(path)
+
+
+def test_checkpoint_save_refuses_poisoned_optimizer_state():
+    model = _FakeTrainModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    x = torch.ones(1, 2)
+    loss = model.proj(x).sum()
+    loss.backward()
+    optimizer.step()
+    next(iter(optimizer.state.values()))["exp_avg"].view(-1)[0] = float("nan")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "poisoned_optimizer.pt")
+
+        saved = save_training_checkpoint_if_finite({"bad": torch.tensor(1)}, path, model, optimizer)
+
+        assert saved is False
+        assert not os.path.exists(path)
+
+
+def test_checkpoint_save_refuses_poisoned_running_state_payload():
+    model = _FakeTrainModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    checkpoint = {
+        "model_state_dict": model.state_dict(),
+        "running_states": (torch.tensor([float("nan")]), None, None, None, None, None),
+    }
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "poisoned_running_state.pt")
+
+        saved = save_training_checkpoint_if_finite(checkpoint, path, model, optimizer)
+
+        assert saved is False
+        assert not os.path.exists(path)
 
 
 def test_length_grouped_sampler_state_restores_epoch_order():

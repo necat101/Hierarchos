@@ -174,6 +174,31 @@ def _sanitize_tensor_nonfinite_(tensor: torch.Tensor, nan: float = 0.0, posinf: 
         tensor.nan_to_num_(nan=nan, posinf=posinf, neginf=neginf)
     return bad_count
 
+def _positive_float(value, default: float = 0.0) -> float:
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return default
+    return value if math.isfinite(value) and value > 0.0 else default
+
+def _cap_loss_component_for_backward(value: torch.Tensor, ceiling: float) -> torch.Tensor:
+    ceiling = _positive_float(ceiling, 0.0)
+    if ceiling <= 0.0 or not torch.is_tensor(value):
+        return value
+    return torch.minimum(value, value.new_tensor(ceiling))
+
+def _clamp_tensor_finite_magnitude_(tensor: torch.Tensor, max_abs: float) -> int:
+    if not torch.is_tensor(tensor) or not tensor.is_floating_point():
+        return 0
+    max_abs = _positive_float(max_abs, 0.0)
+    if max_abs <= 0.0:
+        return 0
+    over = torch.abs(tensor) > max_abs
+    over_count = int(over.sum().item())
+    if over_count:
+        tensor.clamp_(min=-max_abs, max=max_abs)
+    return over_count
+
 def _sanitize_optimizer_state_(optimizer) -> int:
     if optimizer is None:
         return 0
@@ -197,6 +222,22 @@ def _sanitize_model_nonfinite_(model, *, include_transient_ltm: bool = False, lo
     if cleaned:
         print(f"WARNING: Sanitized {cleaned} non-finite {log_prefix} parameter/buffer value(s): NaN->0, +Inf->1, -Inf->-1.")
     return cleaned
+
+def _clamp_model_finite_magnitude_(model, max_abs: float, *, include_transient_ltm: bool = False, log_prefix: str = "model") -> int:
+    max_abs = _positive_float(max_abs, 0.0)
+    if max_abs <= 0.0:
+        return 0
+    clamped = 0
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            clamped += _clamp_tensor_finite_magnitude_(param, max_abs)
+        for name, buffer in model.named_buffers():
+            if not include_transient_ltm and _is_transient_ltm_state_name(name):
+                continue
+            clamped += _clamp_tensor_finite_magnitude_(buffer, max_abs)
+    if clamped:
+        print(f"WARNING: Clamped {clamped} finite {log_prefix} parameter/buffer value(s) to +/-{max_abs:g}.")
+    return clamped
 
 def _sanitize_model_transient_state_(model, max_abs: float = 1.0) -> int:
     cleaned = 0
@@ -228,12 +269,45 @@ def _sanitize_model_transient_state_(model, max_abs: float = 1.0) -> int:
 
 def _sanitize_gradient_nonfinite_(model, max_abs: float) -> int:
     cleaned = 0
+    clamped = 0
+    max_abs = _positive_float(max_abs, 1.0)
     for param in model.parameters():
         if param.grad is not None:
-            cleaned += _sanitize_tensor_nonfinite_(param.grad, nan=0.0, posinf=1.0, neginf=-1.0)
+            cleaned += _sanitize_tensor_nonfinite_(param.grad, nan=0.0, posinf=max_abs, neginf=-max_abs)
+            clamped += _clamp_tensor_finite_magnitude_(param.grad, max_abs)
     if cleaned:
-        print(f"WARNING: Sanitized {cleaned} non-finite gradient value(s): NaN->0, +Inf->1, -Inf->-1 before clipping.")
+        print(f"WARNING: Sanitized {cleaned} non-finite gradient value(s): NaN->0, +Inf->{max_abs:g}, -Inf->{-max_abs:g} before clipping.")
+    if clamped:
+        print(f"WARNING: Saturated {clamped} finite gradient value(s) to +/-{max_abs:g} before global clipping.")
     return cleaned
+
+def _find_first_nonfinite_gradient_tensor(model):
+    for name, param in model.named_parameters():
+        if param.grad is not None and _tensor_is_nonfinite(param.grad):
+            return _describe_tensor_issue(f"gradient {name}", param.grad)
+    return None
+
+def _manual_clip_grad_norm_(params, max_norm: float):
+    norms = []
+    for param in params:
+        grad = param.grad.detach()
+        if grad.is_sparse:
+            grad = grad.coalesce()._values()
+        norms.append(grad.float().norm(2))
+    if norms:
+        total_norm = torch.stack(norms).norm(2)
+    else:
+        total_norm = torch.zeros(())
+    if max_norm > 0.0:
+        if not bool(torch.isfinite(total_norm).all().item()):
+            for param in params:
+                param.grad.detach().zero_()
+            return total_norm
+        clip_coef = max_norm / (float(total_norm.item()) + 1e-6)
+        if clip_coef < 1.0:
+            for param in params:
+                param.grad.detach().mul_(clip_coef)
+    return total_norm
 
 def save_training_checkpoint_if_finite(checkpoint_dict, path: str, model, optimizer=None) -> bool:
     max_abs = _checkpoint_grad_clip(checkpoint_dict)
@@ -258,14 +332,11 @@ def _clip_gradients_and_check(model, max_norm: float):
         return True, None
     max_norm = float(max_norm or 0.0)
     _sanitize_gradient_nonfinite_(model, max_abs=max_norm)
-    if max_norm > 0:
-        total_norm = nn.utils.clip_grad_norm_(params, max_norm)
-    else:
-        norms = [p.grad.detach().float().norm(2) for p in params]
-        total_norm = torch.stack(norms).norm(2) if norms else torch.zeros(())
+    total_norm = _manual_clip_grad_norm_(params, max_norm)
     if torch.is_tensor(total_norm) and not bool(torch.isfinite(total_norm).all().item()):
-        return False, _describe_tensor_issue("gradient total norm", total_norm)
-    issue = _find_first_nonfinite_model_tensor(model, include_grads=True)
+        _sanitize_gradient_nonfinite_(model, max_abs=max_norm)
+        total_norm = _manual_clip_grad_norm_(params, max_norm)
+    issue = _find_first_nonfinite_gradient_tensor(model)
     if issue:
         return False, issue
     return True, total_norm
@@ -846,44 +917,11 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                 ce_loss = outputs['loss']
                 ponder_cost = outputs.get('ponder_cost')
                 commitment_cost = outputs.get('commitment_cost')
-                
-                aux_loss = torch.zeros_like(ce_loss)
-                
-                # --- ACT Sensitivity: Adaptive Ponder Loss ---
-                if ponder_cost is not None:
-                    ponder_weight = getattr(args, 'ponder_loss_weight', 0.01)
-                    
-                    if getattr(args, 'encourage_thinking', False):
-                        # RECOVERY MODE: Invert ponder penalty to REWARD thinking
-                        # Negative weight means higher ponder = lower loss
-                        aux_loss = aux_loss - (abs(ponder_weight) * ponder_cost)
-                    elif getattr(args, 'adaptive_ponder', False):
-                        # ADAPTIVE MODE: Scale ponder target with loss
-                        # Higher CE loss = more thinking needed
-                        max_h_steps = getattr(args, 'max_h_steps', 5)
-                        target_scale = getattr(args, 'ponder_target_scale', 0.5)
-                        target_ponder = torch.clamp(ce_loss.detach() * target_scale, min=1.0, max=float(max_h_steps))
-                        ponder_diff = target_ponder - ponder_cost
-                        # Penalize under-thinking (when ponder < target), ignore over-thinking
-                        ponder_penalty = torch.relu(ponder_diff) * ponder_weight
-                        aux_loss = aux_loss + ponder_penalty
-                    else:
-                        # STANDARD MODE: Original additive penalty (penalizes thinking)
-                        aux_loss = aux_loss + (ponder_weight * ponder_cost)
-                
-                if commitment_cost is not None:
-                    aux_loss = aux_loss + (getattr(args, 'commitment_loss_weight', 0.5) * commitment_cost)
-
-                # CE is already averaged over valid labels within this chunk.
-                # Weight it by supervised answer-token count so long masked
-                # prompts/tool traces do not dilute the actual learning signal.
-                chunk_loss = ((ce_loss * label_ratio) + (aux_loss * token_ratio)) / accumulation_steps
 
                 ce_valid = _component_is_finite(ce_loss)
                 ponder_valid = ponder_cost is None or _component_is_finite(ponder_cost)
                 commitment_valid = commitment_cost is None or _component_is_finite(commitment_cost)
-                chunk_loss_valid = _component_is_finite(chunk_loss)
-                if not (ce_valid and ponder_valid and commitment_valid and chunk_loss_valid):
+                if not (ce_valid and ponder_valid and commitment_valid):
                     print(
                         f"\nCRITICAL: Non-finite training loss at step {step+1}, "
                         f"chunk {chunk_idx} ({start_t}:{end_t})."
@@ -894,8 +932,62 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                         print("  " + _describe_tensor_issue("ponder_cost", ponder_cost))
                     if not commitment_valid and commitment_cost is not None:
                         print("  " + _describe_tensor_issue("commitment_cost", commitment_cost))
-                    if not chunk_loss_valid:
-                        print("  " + _describe_tensor_issue("chunk_loss", chunk_loss))
+                    print("  Skipping this batch and clearing recurrent/LTM state before it can poison optimizer state.")
+                    args._train_step_had_nonfinite = True
+                    return None, _reset_after_nonfinite(optimizer, model)
+
+                ce_loss_for_backward = _cap_loss_component_for_backward(
+                    ce_loss,
+                    getattr(args, 'max_ce_loss_for_backward', 10.0),
+                )
+                
+                aux_loss = torch.zeros_like(ce_loss)
+                
+                # --- ACT Sensitivity: Adaptive Ponder Loss ---
+                if ponder_cost is not None:
+                    ponder_weight = getattr(args, 'ponder_loss_weight', 0.01)
+                    ponder_cost_for_backward = _cap_loss_component_for_backward(
+                        ponder_cost,
+                        getattr(args, 'max_ponder_cost_for_backward', 0.0),
+                    )
+                    
+                    if getattr(args, 'encourage_thinking', False):
+                        # RECOVERY MODE: Invert ponder penalty to REWARD thinking
+                        # Negative weight means higher ponder = lower loss
+                        aux_loss = aux_loss - (abs(ponder_weight) * ponder_cost_for_backward)
+                    elif getattr(args, 'adaptive_ponder', False):
+                        # ADAPTIVE MODE: Scale ponder target with loss
+                        # Higher CE loss = more thinking needed
+                        max_h_steps = getattr(args, 'max_h_steps', 5)
+                        target_scale = getattr(args, 'ponder_target_scale', 0.5)
+                        target_ponder = torch.clamp(ce_loss.detach() * target_scale, min=1.0, max=float(max_h_steps))
+                        ponder_diff = target_ponder - ponder_cost_for_backward
+                        # Penalize under-thinking (when ponder < target), ignore over-thinking
+                        ponder_penalty = torch.relu(ponder_diff) * ponder_weight
+                        aux_loss = aux_loss + ponder_penalty
+                    else:
+                        # STANDARD MODE: Original additive penalty (penalizes thinking)
+                        aux_loss = aux_loss + (ponder_weight * ponder_cost_for_backward)
+                
+                if commitment_cost is not None:
+                    commitment_cost_for_backward = _cap_loss_component_for_backward(
+                        commitment_cost,
+                        getattr(args, 'max_commitment_cost_for_backward', 2.0),
+                    )
+                    aux_loss = aux_loss + (getattr(args, 'commitment_loss_weight', 0.5) * commitment_cost_for_backward)
+
+                # CE is already averaged over valid labels within this chunk.
+                # Weight it by supervised answer-token count so long masked
+                # prompts/tool traces do not dilute the actual learning signal.
+                chunk_loss = ((ce_loss_for_backward * label_ratio) + (aux_loss * token_ratio)) / accumulation_steps
+
+                chunk_loss_valid = _component_is_finite(chunk_loss)
+                if not chunk_loss_valid:
+                    print(
+                        f"\nCRITICAL: Non-finite training loss at step {step+1}, "
+                        f"chunk {chunk_idx} ({start_t}:{end_t})."
+                    )
+                    print("  " + _describe_tensor_issue("chunk_loss", chunk_loss))
                     print("  Skipping this batch and clearing recurrent/LTM state before it can poison optimizer state.")
                     args._train_step_had_nonfinite = True
                     return None, _reset_after_nonfinite(optimizer, model)
@@ -928,14 +1020,15 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                     for t_val in outputs["raw_topk_vals"]:
                         t_val.grad = None
                     outputs["raw_topk_vals"] = None  # Free tensor references (BUG #3: memory leak fix)
-                    ltm_grads_tensor = torch.nan_to_num(ltm_grads_tensor, nan=0.0, posinf=0.0, neginf=0.0)
+                    _clip_val = _positive_float(getattr(args, 'grad_clip', 1.0), 1.0)
+                    ltm_grads_tensor = torch.nan_to_num(ltm_grads_tensor, nan=0.0, posinf=_clip_val, neginf=-_clip_val)
+                    ltm_grads_tensor.clamp_(min=-_clip_val, max=_clip_val)
 
                     if ltm_grads_tensor is not None:
                         # Direct tensor clipping (clip_grad_norm_ expects parameters with .grad,
                         # but ltm_grads_tensor IS the gradient data itself — no .grad attribute)
-                        _clip_val = getattr(args, 'grad_clip', 1.0)
                         if _clip_val > 0:
-                            _grad_norm = ltm_grads_tensor.norm()
+                            _grad_norm = ltm_grads_tensor.float().norm()
                             _clip_coef = torch.clamp(
                                 ltm_grads_tensor.new_tensor(float(_clip_val)) / (_grad_norm + 1e-8),
                                 max=1.0,
@@ -1375,6 +1468,11 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                 print("Warning: Mid-epoch checkpoint has no running RWKV/LTM states while --persist-state is enabled; continuing with reset states.")
 
     _sanitize_model_nonfinite_(model, log_prefix="startup model")
+    _clamp_model_finite_magnitude_(
+        model,
+        getattr(args, 'startup_weight_max_abs', 100.0),
+        log_prefix="startup model",
+    )
     _sanitize_model_transient_state_(model, max_abs=getattr(args, 'grad_clip', 1.0))
     _sanitize_optimizer_state_(optimizer)
     _sanitize_gradient_nonfinite_(model, max_abs=1.0)
@@ -1762,6 +1860,11 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
             print("Warning: Cannot enable LR schedule, dataset might be too small.")
 
     _sanitize_model_nonfinite_(model, log_prefix="fine-tune startup model")
+    _clamp_model_finite_magnitude_(
+        model,
+        getattr(args, 'startup_weight_max_abs', 100.0),
+        log_prefix="fine-tune startup model",
+    )
     _sanitize_model_transient_state_(model, max_abs=getattr(args, 'grad_clip', 1.0))
     _sanitize_optimizer_state_(optimizer)
     _sanitize_gradient_nonfinite_(model, max_abs=1.0)
@@ -1835,15 +1938,30 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                 loss_accum = 0.0
 
                 if ce_valid:
-                    loss_accum = loss_accum + cross_entropy_loss
+                    loss_accum = loss_accum + _cap_loss_component_for_backward(
+                        cross_entropy_loss,
+                        getattr(args, 'max_ce_loss_for_backward', 10.0),
+                    )
                 elif i % accumulation_steps == 0:
                     print(f"\nWarning: CE loss is NaN/Inf at step {i+1}. Skipping.")
 
                 if pc_valid:
-                    loss_accum = loss_accum + (ponder_loss_weight * ponder_cost)
+                    loss_accum = loss_accum + (
+                        ponder_loss_weight
+                        * _cap_loss_component_for_backward(
+                            ponder_cost,
+                            getattr(args, 'max_ponder_cost_for_backward', 0.0),
+                        )
+                    )
                 
                 if cc_valid:
-                    loss_accum = loss_accum + (commitment_loss_weight * commitment_cost)
+                    loss_accum = loss_accum + (
+                        commitment_loss_weight
+                        * _cap_loss_component_for_backward(
+                            commitment_cost,
+                            getattr(args, 'max_commitment_cost_for_backward', 2.0),
+                        )
+                    )
 
                 if ce_valid:
                     combined_loss = loss_accum
@@ -1896,9 +2014,22 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                             else:
                                 valid_update = False
 
-                        if valid_update and torch.isfinite(ltm_grads_copy).all():
-                            if grad_clip > 0:
-                                torch.nn.utils.clip_grad_norm_([ltm_grads_copy], grad_clip)
+                        if valid_update:
+                            ltm_clip = _positive_float(grad_clip, 1.0)
+                            ltm_grads_copy = torch.nan_to_num(
+                                ltm_grads_copy,
+                                nan=0.0,
+                                posinf=ltm_clip,
+                                neginf=-ltm_clip,
+                            )
+                            ltm_grads_copy.clamp_(min=-ltm_clip, max=ltm_clip)
+                            if ltm_clip > 0:
+                                ltm_norm = ltm_grads_copy.float().norm()
+                                clip_coef = torch.clamp(
+                                    ltm_grads_copy.new_tensor(float(ltm_clip)) / (ltm_norm + 1e-8),
+                                    max=1.0,
+                                )
+                                ltm_grads_copy = ltm_grads_copy * clip_coef
                             base_ltm.inner_update(
                                 outputs["topk_idx"],
                                 ltm_grads_copy,

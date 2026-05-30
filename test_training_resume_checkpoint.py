@@ -18,6 +18,7 @@ from hierarchos.training.trainer import (
     training_state_is_finite,
     _sanitize_model_nonfinite_,
     _sanitize_model_transient_state_,
+    _clamp_model_finite_magnitude_,
     _clip_gradients_and_check,
 )
 from hierarchos.utils.checkpoint import sanitize_model_state_dict
@@ -83,6 +84,24 @@ class _InfGradModel(_NaNLossModel):
             "loss": finite_loss,
             "ponder_cost": torch.zeros((), device=self.weight.device),
             "commitment_cost": torch.zeros((), device=self.weight.device),
+            "raw_topk_vals": None,
+            "ltm_memory_state": None,
+            "h_state": None,
+            "l_state": None,
+            "prev_context": None,
+            "target_context": None,
+            "drift_state": None,
+        }
+
+
+class _HighFiniteLossModel(_NaNLossModel):
+    def forward(self, **kwargs):
+        high_loss = self.weight * 20.0
+        high_commitment = self.weight * 20.0
+        return {
+            "loss": high_loss,
+            "ponder_cost": torch.zeros((), device=self.weight.device),
+            "commitment_cost": high_commitment,
             "raw_topk_vals": None,
             "ltm_memory_state": None,
             "h_state": None,
@@ -271,6 +290,21 @@ def test_clip_gradients_and_check_saturates_nonfinite_gradients():
     assert torch.isfinite(model.proj.bias.grad).all()
 
 
+def test_clip_gradients_and_check_saturates_huge_finite_gradients():
+    model = _FakeTrainModel()
+    model.proj.weight.grad = torch.full_like(model.proj.weight, 1e30)
+    model.proj.bias.grad = torch.full_like(model.proj.bias, -1e30)
+
+    ok, issue = _clip_gradients_and_check(model, max_norm=1.0)
+
+    assert ok is True
+    assert issue is not None or torch.isfinite(model.proj.weight.grad).all()
+    assert torch.isfinite(model.proj.weight.grad).all()
+    assert torch.isfinite(model.proj.bias.grad).all()
+    assert model.proj.weight.grad.abs().max().item() <= 1.0
+    assert model.proj.bias.grad.abs().max().item() <= 1.0
+
+
 def test_model_nonfinite_sanitizer_repairs_parameters_and_buffers():
     model = _FakeTrainModel()
     model.proj.weight.data.view(-1)[0] = float("inf")
@@ -285,6 +319,20 @@ def test_model_nonfinite_sanitizer_repairs_parameters_and_buffers():
     assert model.proj.weight.data.view(-1)[1].item() == -1.0
     assert model.proj.bias.data.view(-1)[0].item() == 0.0
     assert torch.isinf(model.ltm.fast_vals[0, 0])
+
+
+def test_model_startup_magnitude_clamp_repairs_all_weights_and_buffers():
+    model = _FakeTrainModel()
+    model.proj.weight.data.fill_(123.0)
+    model.proj.bias.data.fill_(-123.0)
+    model.register_buffer("finite_buffer", torch.tensor([77.0]))
+
+    clamped = _clamp_model_finite_magnitude_(model, 0.75)
+
+    assert clamped == model.proj.weight.numel() + model.proj.bias.numel() + 1
+    assert model.proj.weight.data.abs().max().item() == 0.75
+    assert model.proj.bias.data.abs().max().item() == 0.75
+    assert model.finite_buffer.abs().max().item() == 0.75
 
 
 def test_train_step_skips_nonfinite_loss_before_backward():
@@ -359,6 +407,46 @@ def test_train_step_saturates_nonfinite_gradient_before_optimizer_step():
     assert model.weight.grad is None
     assert not torch.equal(model.weight.detach(), before)
     assert model.reset_called is True
+
+
+def test_train_step_caps_finite_loss_explosion_for_backward():
+    model = _HighFiniteLossModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.0)
+    args = SimpleNamespace(
+        amp=False,
+        training_chunk_size=8,
+        compile=False,
+        pad_token_id=0,
+        padding_metrics=False,
+        cpu_chunked_lm_loss=False,
+        cuda_chunked_lm_loss=False,
+        grad_clip=1.0,
+        max_ce_loss_for_backward=10.0,
+        max_commitment_cost_for_backward=2.0,
+    )
+    batch = {
+        "input_ids": torch.ones(1, 4, dtype=torch.long),
+        "labels": torch.ones(1, 4, dtype=torch.long),
+    }
+
+    before = model.weight.detach().clone()
+    outputs, states = train_step(
+        model,
+        batch,
+        optimizer,
+        scaler=None,
+        accumulation_steps=1,
+        step=0,
+        args=args,
+        running_states=(None, None, None, None, None, None),
+    )
+
+    assert outputs is not None
+    assert outputs["loss"].item() == 20.0
+    assert outputs["commitment_cost"].item() == 20.0
+    assert args._train_step_had_nonfinite is False
+    assert torch.equal(model.weight.detach(), before)
+    assert states == (None, None, None, None, None, None)
 
 
 def test_ltm_transient_recovery_resets_fast_and_saturates_momentum():

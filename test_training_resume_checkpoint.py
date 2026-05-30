@@ -16,6 +16,7 @@ from hierarchos.training.trainer import (
     save_training_checkpoint_if_finite,
     train_step,
     training_state_is_finite,
+    _sanitize_model_transient_state_,
     _clip_gradients_and_check,
 )
 from hierarchos.utils.checkpoint import sanitize_model_state_dict
@@ -253,16 +254,20 @@ def test_training_state_finite_rejects_poisoned_pending_grad():
     assert training_state_is_finite(model, include_grads=True) is False
 
 
-def test_clip_gradients_and_check_rejects_nonfinite_gradients():
+def test_clip_gradients_and_check_saturates_nonfinite_gradients():
     model = _FakeTrainModel()
     model.proj.weight.grad = torch.ones_like(model.proj.weight)
     model.proj.bias.grad = torch.ones_like(model.proj.bias)
     model.proj.weight.grad.view(-1)[0] = float("inf")
+    model.proj.weight.grad.view(-1)[1] = float("-inf")
+    model.proj.bias.grad.view(-1)[0] = float("nan")
 
     ok, issue = _clip_gradients_and_check(model, max_norm=1.0)
 
-    assert ok is False
-    assert "gradient" in issue or "gradient total norm" in issue
+    assert ok is True
+    assert issue is not None
+    assert torch.isfinite(model.proj.weight.grad).all()
+    assert torch.isfinite(model.proj.bias.grad).all()
 
 
 def test_train_step_skips_nonfinite_loss_before_backward():
@@ -301,7 +306,7 @@ def test_train_step_skips_nonfinite_loss_before_backward():
     assert model.reset_called is True
 
 
-def test_train_step_skips_nonfinite_gradient_before_optimizer_step():
+def test_train_step_saturates_nonfinite_gradient_before_optimizer_step():
     model = _InfGradModel()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     args = SimpleNamespace(
@@ -331,12 +336,33 @@ def test_train_step_skips_nonfinite_gradient_before_optimizer_step():
         running_states=(None, None, None, None, None, None),
     )
 
-    assert outputs is None
+    assert outputs is not None
     assert states == (None, None, None, None, None, None)
-    assert args._train_step_had_nonfinite is True
+    assert args._train_step_had_nonfinite is False
     assert model.weight.grad is None
-    assert torch.equal(model.weight.detach(), before)
+    assert not torch.equal(model.weight.detach(), before)
     assert model.reset_called is True
+
+
+def test_ltm_transient_recovery_resets_fast_and_saturates_momentum():
+    model = _FakeTrainModel()
+    model.ltm.fast_vals.fill_(3.0)
+    model.ltm._mom_vals.fill_(4.0)
+    model.ltm._mom_vals[0, 0] = float("inf")
+    model.ltm._mom_vals[0, 1] = float("-inf")
+    model.ltm._mom_vals[1, 0] = float("nan")
+    model.ltm.timestamps[0] = float("inf")
+    model.ltm.sources[0] = 2
+
+    cleaned = _sanitize_model_transient_state_(model, max_abs=0.75)
+
+    assert cleaned > 0
+    assert torch.count_nonzero(model.ltm.fast_vals) == 0
+    assert model.ltm._mom_vals[0, 0].item() == 0.75
+    assert model.ltm._mom_vals[0, 1].item() == -0.75
+    assert model.ltm._mom_vals[1, 0].item() == 0.0
+    assert model.ltm._mom_vals[1, 1].item() == 4.0
+    assert model.ltm.timestamps[0].item() == 0.0
 
 
 def test_checkpoint_save_allows_clean_state_and_writes_file():
@@ -384,7 +410,7 @@ def test_checkpoint_save_refuses_poisoned_optimizer_state():
         assert not os.path.exists(path)
 
 
-def test_checkpoint_save_refuses_poisoned_running_state_payload():
+def test_checkpoint_save_sanitizes_poisoned_running_state_payload():
     model = _FakeTrainModel()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     checkpoint = {
@@ -396,9 +422,11 @@ def test_checkpoint_save_refuses_poisoned_running_state_payload():
         path = os.path.join(tmp, "poisoned_running_state.pt")
 
         saved = save_training_checkpoint_if_finite(checkpoint, path, model, optimizer)
+        loaded = torch.load(path, map_location="cpu", weights_only=False)
 
-        assert saved is False
-        assert not os.path.exists(path)
+        assert saved is True
+        assert os.path.exists(path)
+        assert torch.equal(loaded["running_states"][0], torch.zeros(1))
 
 
 def test_length_grouped_sampler_state_restores_epoch_order():

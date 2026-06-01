@@ -979,7 +979,13 @@ def main():
     train_group.add_argument("--memory-gate-warmup-steps", "--memory_gate_warmup_steps", dest="memory_gate_warmup_steps", type=int, default=2000, help="Training batches used to softly keep ROSA/LTM gates open before decaying to learned gates.")
     train_group.add_argument("--memory-gate-warmup-floor", "--memory_gate_warmup_floor", dest="memory_gate_warmup_floor", type=float, default=0.10, help="Initial minimum memory gate floor during warmup. Decays to 0 over --memory-gate-warmup-steps.")
     train_group.add_argument("--reset-halt-bias", type=float, default=None, metavar="BIAS", help="SURGICAL FIX: Reset h_halt_proj.bias to this value on load (e.g., -2.0 for ~12%% halt prob).")
-    train_group.add_argument("--override-scheduling", action="store_true")
+    train_group.add_argument(
+        "--override-scheduling",
+        "--override_scheduling",
+        dest="override_scheduling",
+        action="store_true",
+        help="When resuming, ignore optimizer/scheduler/scaler state and use the current LR schedule args.",
+    )
     train_group.add_argument("--persist-state", action="store_true", default=False, help="Persist RNN/LTM states between batches. Default: False.")
     train_group.add_argument("--no-persist-state", dest="persist_state", action="store_false", help="Disable state persistence between chunks.")
     train_group.add_argument("--training-chunk-size", "--training_chunk_size", type=int, default=256, help="TBPTT chunk size. Default 256 targets 96GB Blackwell CUDA runs; use 128 if memory gets tight.")

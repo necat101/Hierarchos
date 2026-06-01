@@ -967,7 +967,12 @@ def handle_start_training(params: dict):
                 memory_gate_warmup_steps=2000,
                 memory_gate_warmup_floor=0.10,
                 reset_halt_bias=None,
-                override_scheduling=False,
+                override_scheduling=bool(
+                    params.get(
+                        "override_scheduling",
+                        params.get("override-scheduling", False),
+                    )
+                ),
                 compile=False, force_compile=False,
                 compile_mode="max-autotune-no-cudagraphs",
                 compile_backend=None,

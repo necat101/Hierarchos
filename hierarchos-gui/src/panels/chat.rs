@@ -7,53 +7,140 @@
 use crate::bridge::{PythonBridge, SamplingParams};
 use crate::theme::{get_accent, HierarchosColors};
 use crate::widgets::message_bubble::{typing_indicator, MessageBubble, MessageRole};
-use egui::{self, Color32, RichText, Rounding, ScrollArea, Stroke, TextStyle, Vec2};
+use egui::{self, Color32, RichText, Rounding, ScrollArea, Stroke, Vec2};
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::{Path, PathBuf};
 
 /// A single chat message.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: MessageRole_,
     pub content: String,
     pub timestamp: String,
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub enum MessageRole_ {
     User,
     Assistant,
     System,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+struct ChatSessionData {
+    pub id: String,
+    pub title: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub messages: Vec<ChatMessage>,
+    #[serde(default)]
+    pub sampling: SamplingParams,
+    #[serde(default)]
+    pub total_tokens: u64,
+    #[serde(default)]
+    pub runtime_state_path: String,
+}
+
+#[derive(Clone)]
+pub struct ChatSessionSummary {
+    pub id: String,
+    pub title: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub message_count: usize,
+}
+
 /// State for the chat panel.
 pub struct ChatState {
+    pub active_session_id: String,
+    pub sessions: Vec<ChatSessionSummary>,
     pub messages: Vec<ChatMessage>,
     pub input_text: String,
     pub sampling: SamplingParams,
     pub is_generating: bool,
     pub current_stream: String,
     pub show_sidebar: bool,
+    pub show_history: bool,
     pub scroll_to_bottom: bool,
     pub total_tokens: u64,
+    storage_dir: PathBuf,
 }
 
 impl Default for ChatState {
     fn default() -> Self {
-        Self {
+        Self::load_or_create()
+    }
+}
+
+impl ChatState {
+    fn load_or_create() -> Self {
+        let storage_dir = crate::embedded::get_app_data_dir().join("chats");
+        let _ = fs::create_dir_all(storage_dir.join("runtime"));
+
+        let mut sessions = Self::load_session_summaries(&storage_dir);
+        sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+
+        if let Some(first) = sessions.first().cloned() {
+            if let Ok(data) = Self::read_session_file(&storage_dir, &first.id) {
+                return Self {
+                    active_session_id: data.id,
+                    sessions,
+                    messages: data.messages,
+                    input_text: String::new(),
+                    sampling: data.sampling,
+                    is_generating: false,
+                    current_stream: String::new(),
+                    show_sidebar: false,
+                    show_history: false,
+                    scroll_to_bottom: true,
+                    total_tokens: data.total_tokens,
+                    storage_dir,
+                };
+            }
+        }
+
+        let id = Self::new_session_id();
+        let now = Self::now_datetime();
+        let mut state = Self {
+            active_session_id: id,
+            sessions: Vec::new(),
             messages: vec![Self::welcome_message()],
             input_text: String::new(),
             sampling: SamplingParams::default(),
             is_generating: false,
             current_stream: String::new(),
             show_sidebar: false,
+            show_history: false,
             scroll_to_bottom: true,
             total_tokens: 0,
-        }
+            storage_dir,
+        };
+        state.sessions.push(ChatSessionSummary {
+            id: state.active_session_id.clone(),
+            title: "New chat".to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+            message_count: state.messages.len(),
+        });
+        let _ = state.save_active_chat();
+        state
     }
-}
 
-impl ChatState {
     fn now_timestamp() -> String {
         chrono::Local::now().format("%H:%M").to_string()
+    }
+
+    fn now_datetime() -> String {
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+    }
+
+    fn new_session_id() -> String {
+        format!(
+            "chat-{}-{}",
+            chrono::Local::now().format("%Y%m%d%H%M%S%3f"),
+            std::process::id()
+        )
     }
 
     fn welcome_message() -> ChatMessage {
@@ -62,6 +149,166 @@ impl ChatState {
             content: "Welcome to Hierarchos. Load a model via Settings, then start chatting.\nCommands: /new, /clear, /reset, /reset_ltm, /status, /temp <f>, /topk <n>, /topp <f>, /threads <n>".to_string(),
             timestamp: Self::now_timestamp(),
         }
+    }
+
+    fn chat_file_path(storage_dir: &Path, id: &str) -> PathBuf {
+        storage_dir.join(format!("{}.json", id))
+    }
+
+    fn runtime_file_path(storage_dir: &Path, id: &str) -> PathBuf {
+        storage_dir.join("runtime").join(format!("{}.pt", id))
+    }
+
+    fn read_session_file(storage_dir: &Path, id: &str) -> Result<ChatSessionData, String> {
+        let path = Self::chat_file_path(storage_dir, id);
+        let text = fs::read_to_string(&path)
+            .map_err(|e| format!("Could not read {}: {}", path.display(), e))?;
+        serde_json::from_str(&text)
+            .map_err(|e| format!("Could not parse {}: {}", path.display(), e))
+    }
+
+    fn load_session_summaries(storage_dir: &Path) -> Vec<ChatSessionSummary> {
+        let mut summaries = Vec::new();
+        let entries = match fs::read_dir(storage_dir) {
+            Ok(entries) => entries,
+            Err(_) => return summaries,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(data) = serde_json::from_str::<ChatSessionData>(&text) else {
+                continue;
+            };
+            summaries.push(ChatSessionSummary {
+                id: data.id,
+                title: data.title,
+                created_at: data.created_at,
+                updated_at: data.updated_at,
+                message_count: data.messages.len(),
+            });
+        }
+
+        summaries
+    }
+
+    fn title_from_messages(&self) -> String {
+        self.messages
+            .iter()
+            .find(|msg| msg.role == MessageRole_::User && !msg.content.trim().is_empty())
+            .map(|msg| {
+                let mut title = msg.content.trim().replace('\n', " ");
+                if title.chars().count() > 42 {
+                    title = title.chars().take(39).collect::<String>() + "...";
+                }
+                title
+            })
+            .unwrap_or_else(|| "New chat".to_string())
+    }
+
+    fn upsert_active_summary(&mut self, title: String, updated_at: String) {
+        let summary = ChatSessionSummary {
+            id: self.active_session_id.clone(),
+            title,
+            created_at: self
+                .sessions
+                .iter()
+                .find(|session| session.id == self.active_session_id)
+                .map(|session| session.created_at.clone())
+                .unwrap_or_else(|| updated_at.clone()),
+            updated_at,
+            message_count: self.messages.len(),
+        };
+
+        if let Some(existing) = self
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == self.active_session_id)
+        {
+            *existing = summary;
+        } else {
+            self.sessions.push(summary);
+        }
+        self.sessions
+            .sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    }
+
+    pub fn runtime_state_path(&self) -> PathBuf {
+        Self::runtime_file_path(&self.storage_dir, &self.active_session_id)
+    }
+
+    pub fn runtime_state_path_string(&self) -> String {
+        self.runtime_state_path().to_string_lossy().to_string()
+    }
+
+    pub fn runtime_state_exists(&self) -> bool {
+        self.runtime_state_path().exists()
+    }
+
+    pub fn save_active_chat(&mut self) -> Result<(), String> {
+        fs::create_dir_all(self.storage_dir.join("runtime")).map_err(|e| {
+            format!(
+                "Could not create chat storage at {}: {}",
+                self.storage_dir.display(),
+                e
+            )
+        })?;
+
+        let title = self.title_from_messages();
+        let updated_at = Self::now_datetime();
+        let data = ChatSessionData {
+            id: self.active_session_id.clone(),
+            title: title.clone(),
+            created_at: self
+                .sessions
+                .iter()
+                .find(|session| session.id == self.active_session_id)
+                .map(|session| session.created_at.clone())
+                .unwrap_or_else(|| updated_at.clone()),
+            updated_at: updated_at.clone(),
+            messages: self.messages.clone(),
+            sampling: self.sampling.clone(),
+            total_tokens: self.total_tokens,
+            runtime_state_path: self.runtime_state_path_string(),
+        };
+
+        let path = Self::chat_file_path(&self.storage_dir, &self.active_session_id);
+        let temp_path = path.with_extension("json.tmp");
+        let text = serde_json::to_string_pretty(&data)
+            .map_err(|e| format!("Could not serialize chat: {}", e))?;
+        fs::write(&temp_path, text)
+            .map_err(|e| format!("Could not write {}: {}", temp_path.display(), e))?;
+        if path.exists() {
+            fs::remove_file(&path)
+                .map_err(|e| format!("Could not replace {}: {}", path.display(), e))?;
+        }
+        fs::rename(&temp_path, &path)
+            .map_err(|e| format!("Could not replace {}: {}", path.display(), e))?;
+
+        self.upsert_active_summary(title, updated_at);
+        Ok(())
+    }
+
+    pub fn switch_to_session(&mut self, id: &str) -> Result<(), String> {
+        if id == self.active_session_id {
+            return Ok(());
+        }
+        let _ = self.save_active_chat();
+        let data = Self::read_session_file(&self.storage_dir, id)?;
+        self.active_session_id = data.id;
+        self.messages = data.messages;
+        self.input_text.clear();
+        self.sampling = data.sampling;
+        self.is_generating = false;
+        self.current_stream.clear();
+        self.total_tokens = data.total_tokens;
+        self.scroll_to_bottom = true;
+        Ok(())
     }
 
     /// Clear visible chat history without resetting backend runtime state.
@@ -77,6 +324,8 @@ impl ChatState {
 
     /// Start a fresh conversation and clear local streaming counters.
     pub fn start_new_chat(&mut self) {
+        let _ = self.save_active_chat();
+        self.active_session_id = Self::new_session_id();
         self.messages.clear();
         self.input_text.clear();
         self.current_stream.clear();
@@ -84,6 +333,7 @@ impl ChatState {
         self.total_tokens = 0;
         self.scroll_to_bottom = true;
         self.messages.push(Self::welcome_message());
+        let _ = self.save_active_chat();
     }
 
     /// Handle a streamed token.
@@ -104,6 +354,7 @@ impl ChatState {
             self.current_stream.clear();
         }
         self.is_generating = false;
+        let _ = self.save_active_chat();
     }
 
     /// Handle system status message.
@@ -114,6 +365,7 @@ impl ChatState {
             timestamp: Self::now_timestamp(),
         });
         self.scroll_to_bottom = true;
+        let _ = self.save_active_chat();
     }
 }
 
@@ -243,6 +495,10 @@ pub fn draw_chat_panel(ui: &mut egui::Ui, state: &mut ChatState, bridge: &Python
     if state.show_sidebar {
         draw_sampling_window(ui.ctx(), state, bridge);
     }
+
+    if state.show_history {
+        draw_history_window(ui.ctx(), state, bridge);
+    }
 }
 
 fn draw_chat_header(ui: &mut egui::Ui, state: &mut ChatState, bridge: &PythonBridge) {
@@ -275,6 +531,23 @@ fn draw_chat_header(ui: &mut egui::Ui, state: &mut ChatState, bridge: &PythonBri
                 .clicked()
             {
                 state.show_sidebar = !state.show_sidebar;
+            }
+
+            if ui
+                .add(
+                    egui::Button::new(
+                        RichText::new("History")
+                            .color(HierarchosColors::TEXT_SECONDARY)
+                            .size(12.0),
+                    )
+                    .fill(HierarchosColors::BG_CARD)
+                    .stroke(Stroke::new(1.0, HierarchosColors::BORDER_SUBTLE))
+                    .corner_radius(Rounding::same(6)),
+                )
+                .on_hover_text("Reopen a saved chat session")
+                .clicked()
+            {
+                state.show_history = !state.show_history;
             }
 
             if ui
@@ -399,6 +672,7 @@ fn draw_input_area(ui: &mut egui::Ui, state: &mut ChatState, bridge: &PythonBrid
                                 timestamp: ChatState::now_timestamp(),
                             });
                             bridge.execute_command(text.clone());
+                            let _ = state.save_active_chat();
                         }
                     } else {
                         // Regular message
@@ -409,6 +683,7 @@ fn draw_input_area(ui: &mut egui::Ui, state: &mut ChatState, bridge: &PythonBrid
                         });
                         state.is_generating = true;
                         state.current_stream.clear();
+                        let _ = state.save_active_chat();
                         bridge.send_message(text, state.sampling.clone());
                     }
                     state.scroll_to_bottom = true;
@@ -427,10 +702,102 @@ fn start_new_chat_session(state: &mut ChatState, bridge: &PythonBridge) {
     }
     state.start_new_chat();
     if bridge.is_connected() {
-        bridge.execute_command("/reset".to_string());
+        bridge.reset_chat_runtime_state(state.runtime_state_path_string());
     } else {
         state.on_status("New chat started. Backend state will reset after connecting.".to_string());
     }
+}
+
+fn draw_history_window(ctx: &egui::Context, state: &mut ChatState, bridge: &PythonBridge) {
+    let mut open = state.show_history;
+    let sessions = state.sessions.clone();
+    let active_id = state.active_session_id.clone();
+    let mut selected: Option<String> = None;
+
+    egui::Window::new("Chats")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(true)
+        .default_width(360.0)
+        .default_height(420.0)
+        .anchor(egui::Align2::RIGHT_TOP, egui::Vec2::new(-18.0, 86.0))
+        .show(ctx, |ui| {
+            ui.label(
+                RichText::new("Saved Chats")
+                    .color(HierarchosColors::TEXT_PRIMARY)
+                    .size(14.0)
+                    .strong(),
+            );
+            ui.add_space(8.0);
+
+            ScrollArea::vertical()
+                .max_height(350.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for session in &sessions {
+                        let is_active = session.id == active_id;
+                        let label = format!(
+                            "{}\n{} | {} messages",
+                            session.title, session.updated_at, session.message_count
+                        );
+                        let response = ui.add_enabled(
+                            !state.is_generating,
+                            egui::Button::new(
+                                RichText::new(label)
+                                    .color(if is_active {
+                                        HierarchosColors::TEXT_ON_PRIMARY
+                                    } else {
+                                        HierarchosColors::TEXT_PRIMARY
+                                    })
+                                    .size(12.0),
+                            )
+                            .fill(if is_active {
+                                get_accent().primary_dim
+                            } else {
+                                HierarchosColors::BG_CARD
+                            })
+                            .stroke(Stroke::new(
+                                1.0,
+                                if is_active {
+                                    get_accent().primary
+                                } else {
+                                    HierarchosColors::BORDER_SUBTLE
+                                },
+                            ))
+                            .corner_radius(Rounding::same(6))
+                            .min_size(Vec2::new(ui.available_width(), 48.0)),
+                        );
+
+                        if response.clicked() && !is_active {
+                            selected = Some(session.id.clone());
+                        }
+                        ui.add_space(6.0);
+                    }
+                });
+        });
+
+    if let Some(id) = selected {
+        match state.switch_to_session(&id) {
+            Ok(()) => {
+                if bridge.is_connected() {
+                    if state.runtime_state_exists() {
+                        bridge.load_chat_runtime_state(state.runtime_state_path_string());
+                    } else {
+                        bridge.reset_chat_runtime_state(state.runtime_state_path_string());
+                    }
+                } else {
+                    state.on_status(
+                        "Chat reopened. Its runtime state will restore after connecting."
+                            .to_string(),
+                    );
+                }
+                open = false;
+            }
+            Err(err) => state.on_status(format!("Could not reopen chat: {}", err)),
+        }
+    }
+
+    state.show_history = open;
 }
 
 fn handle_local_command(state: &mut ChatState, bridge: &PythonBridge, text: &str) -> bool {

@@ -102,6 +102,10 @@ impl HierarchosApp {
                 }
                 BridgeEvent::GenerationComplete => {
                     self.chat_state.on_generation_complete();
+                    if self.bridge.is_connected() {
+                        self.bridge
+                            .save_chat_runtime_state(self.chat_state.runtime_state_path_string());
+                    }
                 }
                 BridgeEvent::TrainingMetrics {
                     epoch,
@@ -146,6 +150,13 @@ impl HierarchosApp {
                     ));
                     // Auto-request model info
                     self.bridge.request_model_info();
+                    if self.chat_state.runtime_state_exists() {
+                        self.bridge
+                            .load_chat_runtime_state(self.chat_state.runtime_state_path_string());
+                    } else {
+                        self.bridge
+                            .reset_chat_runtime_state(self.chat_state.runtime_state_path_string());
+                    }
                 }
                 BridgeEvent::LoadProgress(progress) => {
                     let pct = progress.progress.clamp(0.0, 1.0);
@@ -233,6 +244,11 @@ impl eframe::App for HierarchosApp {
         }
 
         if ctx.input(|i| i.viewport().close_requested()) && !self.close_confirmed {
+            let _ = self.chat_state.save_active_chat();
+            if self.bridge.is_connected() {
+                self.bridge
+                    .save_chat_runtime_state(self.chat_state.runtime_state_path_string());
+            }
             if self.bridge.is_model_loaded() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.close_dialog_open = true;
@@ -401,6 +417,9 @@ fn draw_close_dialog(ctx: &egui::Context, app: &mut HierarchosApp) {
                 .fill(get_accent().primary)
                 .corner_radius(Rounding::same(6));
                 if ui.add_enabled(save_enabled, save).clicked() {
+                    let _ = app.chat_state.save_active_chat();
+                    app.bridge
+                        .save_chat_runtime_state(app.chat_state.runtime_state_path_string());
                     app.ltm_save_in_progress = true;
                     app.close_after_ltm_save = true;
                     app.ltm_save_error = None;
@@ -416,6 +435,11 @@ fn draw_close_dialog(ctx: &egui::Context, app: &mut HierarchosApp) {
                 .stroke(Stroke::new(1.0, HierarchosColors::BORDER_SUBTLE))
                 .corner_radius(Rounding::same(6));
                 if ui.add_enabled(!app.ltm_save_in_progress, discard).clicked() {
+                    let _ = app.chat_state.save_active_chat();
+                    if app.bridge.is_connected() {
+                        app.bridge
+                            .save_chat_runtime_state(app.chat_state.runtime_state_path_string());
+                    }
                     app.close_confirmed = true;
                     app.close_dialog_open = false;
                     app.close_after_ltm_save = false;

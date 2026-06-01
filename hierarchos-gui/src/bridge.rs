@@ -187,19 +187,19 @@ impl Default for TrainingConfig {
         Self {
             data_path: String::new(),
             epochs: 3,
-            batch_size: 4,
+            batch_size: 64,
             learning_rate: 1e-4,
             min_lr: 1e-6,
-            training_chunk_size: 128,
+            training_chunk_size: 256,
             accumulation_steps: 1,
             grad_clip: 1.0,
             persist_state: false,
             amp: true,
             save_steps: 0,
             out_dir: "./hierarchos_model".to_string(),
-            context_dim: 768,
-            h_hidden: 768,
-            l_hidden: 768,
+            context_dim: 448,
+            h_hidden: 448,
+            l_hidden: 448,
             persistent_dim: 128,
             ltm_slots: 1024,
             ltm_key_dim: 128,
@@ -730,6 +730,36 @@ impl PythonBridge {
     /// Persist current runtime LTM updates next to the loaded model.
     pub fn save_ltm_updates(&self) {
         self.send_rpc("save_ltm_updates", serde_json::json!({}));
+    }
+
+    /// Persist the active chat's tiny hierarchical runtime state.
+    pub fn save_chat_runtime_state(&self, path: String) {
+        self.send_rpc(
+            "save_chat_runtime_state",
+            serde_json::json!({
+                "path": path,
+            }),
+        );
+    }
+
+    /// Restore a previously saved chat runtime state.
+    pub fn load_chat_runtime_state(&self, path: String) {
+        self.send_rpc(
+            "load_chat_runtime_state",
+            serde_json::json!({
+                "path": path,
+            }),
+        );
+    }
+
+    /// Reset backend runtime state and save an empty snapshot for this chat.
+    pub fn reset_chat_runtime_state(&self, path: String) {
+        self.send_rpc(
+            "reset_chat_runtime_state",
+            serde_json::json!({
+                "path": path,
+            }),
+        );
     }
 
     /// Send a chat message and stream tokens back.

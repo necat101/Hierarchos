@@ -151,6 +151,56 @@ def _length_bucketing_enabled(args, default=True):
         return bool(default)
     return bool(value)
 
+
+def _bool_cli_literal(value):
+    text = str(value).strip().lower()
+    if text in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    return None
+
+
+def _normalize_optional_bool_flags(argv, flag_names):
+    """Allow boolean endpoint forms like --flag true without breaking bare flags."""
+    normalized = []
+    i = 0
+    flag_names = tuple(flag_names)
+    while i < len(argv):
+        token = argv[i]
+        matched_inline = None
+        for flag in flag_names:
+            prefix = f"{flag}="
+            if token.startswith(prefix):
+                matched_inline = (flag, token[len(prefix):])
+                break
+
+        if matched_inline:
+            flag, raw_value = matched_inline
+            parsed = _bool_cli_literal(raw_value)
+            if parsed is None:
+                normalized.append(token)
+            elif parsed:
+                normalized.append(flag)
+            i += 1
+            continue
+
+        if token in flag_names:
+            if i + 1 < len(argv):
+                parsed = _bool_cli_literal(argv[i + 1])
+                if parsed is not None:
+                    if parsed:
+                        normalized.append(token)
+                    i += 2
+                    continue
+            normalized.append(token)
+            i += 1
+            continue
+
+        normalized.append(token)
+        i += 1
+    return normalized
+
 def _rounded_bucket_size(bucket_size, batch_size, sample_count):
     batch_size = max(1, int(batch_size or 1))
     sample_count = max(batch_size, int(sample_count or batch_size))
@@ -1133,7 +1183,10 @@ def main():
     util_group.add_argument("--inf-output", type=str, default=None, help="Output inference model path for ckpt-2-inf mode.")
     util_group.add_argument("--ckpt-tok-path", type=str, default=None, help="HuggingFace tokenizer name/path to embed in the inference model (e.g., 'gpt2', 'openai-community/gpt2').")
     
-    args = parser.parse_args()
+    args = parser.parse_args(_normalize_optional_bool_flags(
+        sys.argv[1:],
+        ("--override-scheduling", "--override_scheduling"),
+    ))
 
     if args.mode == "benchmark" and args.list_benchmarks:
         if format_benchmark_catalog is None:

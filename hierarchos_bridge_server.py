@@ -812,6 +812,21 @@ def handle_start_training(params: dict):
                     value = int(default)
                 return max(minimum, value)
 
+            def _bool_param(name, default=False):
+                value = params.get(name, default)
+                if isinstance(value, bool):
+                    return value
+                if value is None:
+                    return bool(default)
+                if isinstance(value, (int, float)):
+                    return bool(value)
+                text = str(value).strip().lower()
+                if text in {"1", "true", "t", "yes", "y", "on"}:
+                    return True
+                if text in {"0", "false", "f", "no", "n", "off"}:
+                    return False
+                return bool(default)
+
             context_dim = _int_param("context_dim", _config.get("context_dim", 448), 32)
             train_arch = {
                 "context_dim": context_dim,
@@ -967,11 +982,9 @@ def handle_start_training(params: dict):
                 memory_gate_warmup_steps=2000,
                 memory_gate_warmup_floor=0.10,
                 reset_halt_bias=None,
-                override_scheduling=bool(
-                    params.get(
-                        "override_scheduling",
-                        params.get("override-scheduling", False),
-                    )
+                override_scheduling=_bool_param(
+                    "override_scheduling",
+                    _bool_param("override-scheduling", False),
                 ),
                 compile=False, force_compile=False,
                 compile_mode="max-autotune-no-cudagraphs",

@@ -9,8 +9,12 @@ from torch.utils.data import DataLoader, TensorDataset
 from hierarchos.training.datasets import EpochShuffleSampler, LengthGroupedBatchSampler
 from hierarchos.training.trainer import (
     build_training_checkpoint,
+    capture_ltm_lr_scheduler_state,
     capture_dataloader_state,
+    configure_ltm_lr_schedule,
     compute_remaining_update_steps,
+    get_current_ltm_lr,
+    advance_ltm_lr_schedule,
     restore_dataloader_state,
     restore_model_grad_state,
     save_training_checkpoint_if_finite,
@@ -226,6 +230,56 @@ def test_remaining_update_steps_counts_mid_accumulation_boundaries():
         total_epochs=2,
         start_step=5,
     ) == 49
+
+
+def test_ltm_lr_cosine_schedule_decays_and_advances():
+    args = SimpleNamespace(
+        ltm_lr=1e-3,
+        min_ltm_lr=1e-5,
+        min_lr=1e-7,
+        disable_ltm_lr_schedule=False,
+    )
+
+    configure_ltm_lr_schedule(args, num_update_steps=10)
+
+    assert abs(get_current_ltm_lr(args) - 1e-3) < 1e-12
+    for _ in range(5):
+        advance_ltm_lr_schedule(args)
+    midpoint_lr = get_current_ltm_lr(args)
+    assert 1e-5 < midpoint_lr < 1e-3
+    for _ in range(5):
+        advance_ltm_lr_schedule(args)
+    assert abs(get_current_ltm_lr(args) - 1e-5) < 1e-12
+
+
+def test_ltm_lr_scheduler_state_round_trips_in_training_checkpoint():
+    model = _FakeTrainModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    args = SimpleNamespace(
+        ltm_lr=1e-4,
+        min_ltm_lr=1e-8,
+        min_lr=1e-8,
+        disable_ltm_lr_schedule=False,
+    )
+    configure_ltm_lr_schedule(args, num_update_steps=20)
+    for _ in range(7):
+        advance_ltm_lr_schedule(args)
+
+    checkpoint = build_training_checkpoint(
+        model,
+        optimizer,
+        scheduler=None,
+        scaler=None,
+        args=args,
+        dataloader=None,
+        completed_epoch=0,
+        mid_epoch_step=7,
+    )
+
+    expected = capture_ltm_lr_scheduler_state(args)
+    assert checkpoint["ltm_scheduler_state"] == expected
+    assert checkpoint["ltm_scheduler_state"]["step"] == 7
+    assert checkpoint["ltm_scheduler_state"]["total_steps"] == 20
 
 
 def test_epoch_boundary_checkpoint_has_clean_resume_position():

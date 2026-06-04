@@ -181,6 +181,13 @@ def _positive_float(value, default: float = 0.0) -> float:
         return default
     return value if math.isfinite(value) and value > 0.0 else default
 
+def _nonnegative_float(value, default: float = 0.0) -> float:
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return default
+    return value if math.isfinite(value) and value >= 0.0 else default
+
 def _cap_loss_component_for_backward(value: torch.Tensor, ceiling: float) -> torch.Tensor:
     ceiling = _positive_float(ceiling, 0.0)
     if ceiling <= 0.0 or not torch.is_tensor(value):
@@ -437,6 +444,80 @@ def compute_remaining_update_steps(dataloader_len: int, accumulation_steps: int,
     updates_left_this_epoch = max(0, updates_per_full_epoch - updates_already_done_this_epoch)
     remaining_updates = updates_left_this_epoch + (remaining_epochs_after_current * updates_per_full_epoch)
     return max(1, remaining_updates)
+
+def _resolve_ltm_lr_bounds(args):
+    max_lr = _positive_float(getattr(args, 'ltm_lr', 1e-3), 1e-3)
+    min_ltm_lr = getattr(args, 'min_ltm_lr', None)
+    if min_ltm_lr is None:
+        min_lr = _nonnegative_float(getattr(args, 'min_lr', 0.0), 0.0)
+    else:
+        min_lr = _nonnegative_float(min_ltm_lr, 0.0)
+    return max_lr, min(min_lr, max_lr)
+
+def _cosine_annealed_value(max_value: float, min_value: float, step: int, total_steps: int) -> float:
+    max_value = _nonnegative_float(max_value, 0.0)
+    min_value = min(_nonnegative_float(min_value, 0.0), max_value)
+    total_steps = max(1, int(total_steps or 1))
+    step = max(0, min(int(step or 0), total_steps))
+    cosine = 0.5 * (1.0 + math.cos(math.pi * step / float(total_steps)))
+    return min_value + (max_value - min_value) * cosine
+
+def configure_ltm_lr_schedule(args, num_update_steps: int, checkpoint=None, *, override_schedule: bool = False, scheduler=None):
+    max_lr, min_lr = _resolve_ltm_lr_bounds(args)
+    schedule_enabled = not bool(getattr(args, 'disable_ltm_lr_schedule', False))
+    total_steps = max(1, int(num_update_steps or 1))
+    current_step = 0
+
+    state = checkpoint.get('ltm_scheduler_state') if isinstance(checkpoint, dict) else None
+    if schedule_enabled and state and not override_schedule:
+        total_steps = max(1, int(state.get('total_steps', total_steps) or total_steps))
+        current_step = max(0, int(state.get('step', 0) or 0))
+    elif schedule_enabled and scheduler is not None and not override_schedule:
+        current_step = max(0, int(getattr(scheduler, 'last_epoch', 0) or 0))
+
+    args._ltm_lr_schedule_enabled = schedule_enabled
+    args._ltm_lr_schedule_total_steps = total_steps
+    args._ltm_lr_schedule_step = min(current_step, total_steps)
+    args._ltm_lr_max = max_lr
+    args._ltm_lr_min = min_lr
+    args._current_ltm_lr = get_current_ltm_lr(args)
+    if schedule_enabled:
+        print(
+            f"INFO: Cosine Annealing LTM LR scheduler ENABLED. "
+            f"Total steps: {total_steps}, Max LTM LR: {max_lr:.2e}, Min LTM LR: {min_lr:.2e}"
+        )
+    else:
+        print(f"INFO: LTM LR scheduler disabled. Fixed LTM LR: {max_lr:.2e}")
+    return args._current_ltm_lr
+
+def get_current_ltm_lr(args) -> float:
+    max_lr = _positive_float(getattr(args, '_ltm_lr_max', getattr(args, 'ltm_lr', 1e-3)), 1e-3)
+    min_lr = _nonnegative_float(getattr(args, '_ltm_lr_min', getattr(args, 'min_ltm_lr', 0.0) or 0.0), 0.0)
+    if not bool(getattr(args, '_ltm_lr_schedule_enabled', True)):
+        return max_lr
+    return _cosine_annealed_value(
+        max_lr,
+        min_lr,
+        getattr(args, '_ltm_lr_schedule_step', 0),
+        getattr(args, '_ltm_lr_schedule_total_steps', 1),
+    )
+
+def advance_ltm_lr_schedule(args):
+    if bool(getattr(args, '_ltm_lr_schedule_enabled', True)):
+        total_steps = max(1, int(getattr(args, '_ltm_lr_schedule_total_steps', 1) or 1))
+        current_step = max(0, int(getattr(args, '_ltm_lr_schedule_step', 0) or 0))
+        args._ltm_lr_schedule_step = min(current_step + 1, total_steps)
+    args._current_ltm_lr = get_current_ltm_lr(args)
+    return args._current_ltm_lr
+
+def capture_ltm_lr_scheduler_state(args):
+    return {
+        "enabled": bool(getattr(args, '_ltm_lr_schedule_enabled', True)),
+        "step": int(getattr(args, '_ltm_lr_schedule_step', 0) or 0),
+        "total_steps": int(getattr(args, '_ltm_lr_schedule_total_steps', 1) or 1),
+        "max_lr": float(getattr(args, '_ltm_lr_max', getattr(args, 'ltm_lr', 1e-3))),
+        "min_lr": float(getattr(args, '_ltm_lr_min', getattr(args, 'min_ltm_lr', 0.0) or 0.0)),
+    }
 
 def build_hierarchos_optimizer(model, args, device):
     """RWKV-style AdamW grouping: decay matrices/embeddings, never norms or scalars."""
@@ -766,6 +847,7 @@ def build_training_checkpoint(
         "data_state": capture_dataloader_state(dataloader),
         "grad_state_dict": grad_state,
         "grad_accumulation_active": bool(grad_state),
+        "ltm_scheduler_state": capture_ltm_lr_scheduler_state(args),
         "training_complete": False,
     }
     if running_states is not None:
@@ -1076,7 +1158,7 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                         new_fast, new_mom = model.ltm.inner_update(
                             outputs["topk_idx"],
                             ltm_grads_tensor,
-                            current_lr=getattr(args, 'ltm_lr', 0.001),
+                            current_lr=get_current_ltm_lr(args),
                             source=2, # SRC_TRAINING_DATA
                             timestamp=float(end_t),
                             tokens_covered=end_t - start_t,
@@ -1357,6 +1439,9 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         # Runtime overrides
         model_config.compile = args.compile
         model_config.max_length = args.max_length or model_config.get('max_length', 1024)
+        model_config.ltm_lr = getattr(args, 'ltm_lr', model_config.get('ltm_lr', 1e-3))
+        model_config.min_ltm_lr = getattr(args, 'min_ltm_lr', model_config.get('min_ltm_lr', None))
+        model_config.disable_ltm_lr_schedule = getattr(args, 'disable_ltm_lr_schedule', False)
 
         print(f"INFO: Final Adjusted ARCH: context_dim={model_config.context_dim}, persistent={model_config.get('persistent_dim', 128)}, ltm_val={model_config.get('ltm_val_dim', 128)}, h_hidden={model_config.h_hidden}, l_hidden={model_config.l_hidden}, vocab_size={model_config.vocab_size}")
         
@@ -1486,6 +1571,17 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         if args.resume_from_ckpt and not getattr(args, 'override_scheduling', False) and 'scheduler_state_dict' in checkpoint:
             try: scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             except: pass
+    configure_ltm_lr_schedule(
+        args,
+        num_update_steps,
+        checkpoint=checkpoint,
+        override_schedule=bool(getattr(args, 'override_scheduling', False)),
+        scheduler=scheduler,
+    )
+    if hasattr(model, 'config'):
+        model.config.ltm_lr = getattr(args, 'ltm_lr', getattr(model.config, 'ltm_lr', 1e-3))
+        model.config.min_ltm_lr = getattr(args, 'min_ltm_lr', getattr(model.config, 'min_ltm_lr', None))
+        model.config.disable_ltm_lr_schedule = getattr(args, 'disable_ltm_lr_schedule', False)
     if checkpoint:
         restore_dataloader_state(dataloader, checkpoint.get('data_state'))
         restore_rng_state(checkpoint.get('rng_state'))
@@ -1577,10 +1673,13 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                     postfix["seq"] = int(outputs.get('seq_len', 0) or 0)
                 if scheduler:
                     postfix["lr"] = f"{scheduler.get_last_lr()[0]:.2e}"
+                postfix["ltm_lr"] = f"{get_current_ltm_lr(args):.2e}"
                 pbar.set_postfix(postfix)
 
             if scheduler and getattr(args, '_optimizer_step_was_taken', False):
                 scheduler.step()
+            if getattr(args, '_optimizer_step_was_taken', False):
+                advance_ltm_lr_schedule(args)
 
             # Periodic Checkpointing (Progress Protection)
             if args.save_steps > 0 and (step + 1) % args.save_steps == 0:
@@ -1900,9 +1999,9 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
 
     # Scheduler setup
     scheduler = None
+    accumulation_steps = getattr(args, 'accumulation_steps', 1)
+    num_update_steps = (dataloader_len // accumulation_steps) * args.epochs if dataloader_len > 0 else 0
     if not getattr(args, 'disable_lr_schedule', False):
-        accumulation_steps = getattr(args, 'accumulation_steps', 1)
-        num_update_steps = (dataloader_len // accumulation_steps) * args.epochs if dataloader_len > 0 else 0
         if num_update_steps > 0:
             print(f"INFO: Cosine Annealing LR scheduler ENABLED. Total steps: {num_update_steps}, Max LR: {args.starting_lr}, Min LR: {args.min_lr}")
             scheduler = CosineAnnealingLR(optimizer, T_max=num_update_steps, eta_min=args.min_lr)
@@ -1911,6 +2010,17 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                 except: pass
         else:
             print("Warning: Cannot enable LR schedule, dataset might be too small.")
+    configure_ltm_lr_schedule(
+        args,
+        num_update_steps,
+        checkpoint=checkpoint,
+        override_schedule=bool(getattr(args, 'override_scheduling', False)),
+        scheduler=scheduler,
+    )
+    if hasattr(model, 'config'):
+        model.config.ltm_lr = getattr(args, 'ltm_lr', getattr(model.config, 'ltm_lr', 1e-3))
+        model.config.min_ltm_lr = getattr(args, 'min_ltm_lr', getattr(model.config, 'min_ltm_lr', None))
+        model.config.disable_ltm_lr_schedule = getattr(args, 'disable_ltm_lr_schedule', False)
 
     _sanitize_model_nonfinite_(model, log_prefix="fine-tune startup model")
     _clamp_model_finite_magnitude_(
@@ -1924,11 +2034,9 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
 
     optimizer.zero_grad(set_to_none=True)
     global_step = 0
-    accumulation_steps = getattr(args, 'accumulation_steps', 1)
     ponder_loss_weight = getattr(args, 'ponder_loss_weight', 0.01)
     commitment_loss_weight = getattr(args, 'commitment_loss_weight', 0.5)
     grad_clip = getattr(args, 'grad_clip', 1.0)
-    ltm_lr = getattr(args, 'ltm_lr', 0.001)
 
     for epoch in range(start_epoch, args.epochs):
         print(f"\n--- LoRA Finetune Epoch {epoch + 1} / {args.epochs} ---")
@@ -2086,7 +2194,7 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                             base_ltm.inner_update(
                                 outputs["topk_idx"],
                                 ltm_grads_copy,
-                                current_lr=ltm_lr,
+                                current_lr=get_current_ltm_lr(args),
                                 timestamp=float(i + 1),
                                 source=2  # SRC_TRAINING_DATA
                             )
@@ -2115,6 +2223,7 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
 
                     if scheduler:
                         scheduler.step()
+                    advance_ltm_lr_schedule(args)
 
                     optimizer.zero_grad(set_to_none=True)
                     backward_called_in_cycle = False
@@ -2131,6 +2240,7 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                             'optimizer_state_dict': optimizer.state_dict(),
                             'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
                             'scaler_state_dict': scaler.state_dict() if scaler else None,
+                            'ltm_scheduler_state': capture_ltm_lr_scheduler_state(args),
                             'config': dict(model.config),
                         }, ckpt_path, model, optimizer)
                 else:
@@ -2148,7 +2258,8 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                 "loss": f"{avg_loss:.4f}",
                 "ponder": f"{avg_ponder:.2f}",
                 "commit": f"{avg_commit:.2e}",
-                "lr": f"{current_lr:.2e}"
+                "lr": f"{current_lr:.2e}",
+                "ltm_lr": f"{get_current_ltm_lr(args):.2e}"
             })
 
     # Save LoRA adapter

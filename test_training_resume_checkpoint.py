@@ -146,6 +146,29 @@ def test_training_checkpoint_preserves_resume_only_state():
     assert checkpoint["running_states"][0].device.type == "cpu"
 
 
+def test_training_checkpoint_repairs_nonfinite_model_before_snapshot():
+    model = _FakeTrainModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    model.proj.weight.data.view(-1)[0] = float("inf")
+    args = SimpleNamespace(startup_weight_max_abs=0.0)
+
+    checkpoint = build_training_checkpoint(
+        model,
+        optimizer,
+        scheduler=None,
+        scaler=None,
+        args=args,
+        dataloader=None,
+        completed_epoch=0,
+        mid_epoch_step=1,
+    )
+
+    saved_weight = checkpoint["model_state_dict"]["proj.weight"]
+    assert torch.isfinite(saved_weight).all()
+    assert saved_weight.view(-1)[0].item() == 1.0
+    assert model.proj.weight.data.view(-1)[0].item() == 1.0
+
+
 def test_mid_epoch_checkpoint_preserves_v8_running_ltm_state():
     model = _FakeTrainModel()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
@@ -534,6 +557,25 @@ def test_checkpoint_save_sanitizes_poisoned_running_state_payload():
         assert saved is True
         assert os.path.exists(path)
         assert torch.equal(loaded["running_states"][0], torch.zeros(1))
+
+
+def test_checkpoint_save_refreshes_stale_poisoned_model_snapshot():
+    model = _FakeTrainModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    stale_state = {key: value.detach().clone() for key, value in model.state_dict().items()}
+    stale_state["proj.weight"].view(-1)[0] = float("inf")
+    checkpoint = {"model_state_dict": stale_state}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "stale_model_snapshot.pt")
+
+        saved = save_training_checkpoint_if_finite(checkpoint, path, model, optimizer)
+        loaded = torch.load(path, map_location="cpu", weights_only=False)
+
+        assert saved is True
+        assert os.path.exists(path)
+        assert torch.isfinite(loaded["model_state_dict"]["proj.weight"]).all()
+        assert torch.equal(loaded["model_state_dict"]["proj.weight"], model.state_dict()["proj.weight"])
 
 
 def test_length_grouped_sampler_state_restores_epoch_order():

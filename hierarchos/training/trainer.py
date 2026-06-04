@@ -221,15 +221,21 @@ def _sanitize_optimizer_state_(optimizer) -> int:
 
 def _sanitize_model_nonfinite_(model, *, include_transient_ltm: bool = False, log_prefix: str = "model") -> int:
     cleaned = 0
+    first_issue = None
     with torch.no_grad():
         for name, param in model.named_parameters():
+            if first_issue is None and _tensor_is_nonfinite(param):
+                first_issue = _describe_tensor_issue(f"parameter {name}", param)
             cleaned += _sanitize_tensor_nonfinite_(param, nan=0.0, posinf=1.0, neginf=-1.0)
         for name, buffer in model.named_buffers():
             if not include_transient_ltm and _is_transient_ltm_state_name(name):
                 continue
+            if first_issue is None and _tensor_is_nonfinite(buffer):
+                first_issue = _describe_tensor_issue(f"buffer {name}", buffer)
             cleaned += _sanitize_tensor_nonfinite_(buffer, nan=0.0, posinf=1.0, neginf=-1.0)
     if cleaned:
-        print(f"WARNING: Sanitized {cleaned} non-finite {log_prefix} parameter/buffer value(s): NaN->0, +Inf->1, -Inf->-1.")
+        detail = f" First repaired tensor: {first_issue}." if first_issue else ""
+        print(f"WARNING: Sanitized {cleaned} non-finite {log_prefix} parameter/buffer value(s): NaN->0, +Inf->1, -Inf->-1.{detail}")
     return cleaned
 
 def _clamp_model_finite_magnitude_(model, max_abs: float, *, include_transient_ltm: bool = False, log_prefix: str = "model") -> int:
@@ -321,6 +327,8 @@ def _manual_clip_grad_norm_(params, max_norm: float):
 def save_training_checkpoint_if_finite(checkpoint_dict, path: str, model, optimizer=None) -> bool:
     max_abs = _checkpoint_grad_clip(checkpoint_dict)
     _sanitize_model_nonfinite_(model, log_prefix="checkpoint model")
+    if isinstance(checkpoint_dict, dict) and model is not None and "model_state_dict" in checkpoint_dict:
+        checkpoint_dict["model_state_dict"] = sanitize_model_state_dict(model, reset_transient_ltm=False)
     _sanitize_model_transient_state_(model, max_abs=max_abs)
     _sanitize_gradient_nonfinite_(model, max_abs=1.0)
     _sanitize_optimizer_state_(optimizer)
@@ -332,6 +340,10 @@ def save_training_checkpoint_if_finite(checkpoint_dict, path: str, model, optimi
         cleaned = _sanitize_payload_nonfinite_(checkpoint_dict, max_abs=max_abs)
         print(f"WARNING: Non-finite checkpoint payload detected: {issue}")
         print(f"WARNING: Sanitized {cleaned} non-finite checkpoint payload value(s) before saving.")
+    issue = _find_first_nonfinite_payload_tensor(checkpoint_dict)
+    if issue:
+        print(f"CRITICAL: Checkpoint still contains non-finite tensor after repair; refusing to save. {issue}")
+        return False
     save_checkpoint_safely(checkpoint_dict, path)
     return True
 
@@ -733,6 +745,12 @@ def build_training_checkpoint(
     mid_epoch_step: int = 0,
     running_states=None,
 ):
+    _sanitize_model_nonfinite_(model, log_prefix="pre-checkpoint model")
+    _clamp_model_finite_magnitude_(
+        model,
+        getattr(args, 'startup_weight_max_abs', 100.0),
+        log_prefix="pre-checkpoint model",
+    )
     grad_state = capture_model_grad_state(model)
     checkpoint = {
         "checkpoint_version": 2,
@@ -1271,6 +1289,17 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         saved_config = checkpoint.get('config', {})
         model_config = AttrDict(saved_config)
         state_dict = sanitize_model_state_dict(checkpoint['model_state_dict'], reset_transient_ltm=False)
+        load_cleaned = _sanitize_payload_nonfinite_(
+            state_dict,
+            "model_state_dict",
+            max_abs=getattr(args, 'grad_clip', 1.0),
+        )
+        if load_cleaned:
+            print(
+                f"WARNING: Sanitized {load_cleaned} non-finite checkpoint model_state_dict "
+                "value(s) before loading. Future checkpoints will be saved clean."
+            )
+        checkpoint['model_state_dict'] = state_dict
         
         # ARCH Detection (Safely handling compiled checkpoints with '_orig_mod.' prefix)
         state_dict_keys = set()
@@ -1821,7 +1850,19 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
         print(f"Resuming LoRA finetune from: {args.resume_from_ckpt}")
         checkpoint = torch.load(args.resume_from_ckpt, map_location='cpu')
         if 'model_state_dict' in checkpoint:
-            model.load_state_dict(sanitize_model_state_dict(checkpoint['model_state_dict'], reset_transient_ltm=False), strict=False)
+            state_dict = sanitize_model_state_dict(checkpoint['model_state_dict'], reset_transient_ltm=False)
+            load_cleaned = _sanitize_payload_nonfinite_(
+                state_dict,
+                "model_state_dict",
+                max_abs=getattr(args, 'grad_clip', 1.0),
+            )
+            if load_cleaned:
+                print(
+                    f"WARNING: Sanitized {load_cleaned} non-finite checkpoint model_state_dict "
+                    "value(s) before loading. Future checkpoints will be saved clean."
+                )
+            checkpoint['model_state_dict'] = state_dict
+            model.load_state_dict(state_dict, strict=False)
         start_epoch = checkpoint.get('completed_epoch', 0)
         start_step = checkpoint.get('mid_epoch_step', 0)
         print(f"INFO: Resuming from epoch {start_epoch+1}, step {start_step}.")

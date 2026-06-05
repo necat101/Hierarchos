@@ -35,6 +35,7 @@ class _FakeLTM(nn.Module):
         self.register_buffer("_mom_vals", torch.zeros(3, 2))
         self.register_buffer("timestamps", torch.zeros(3))
         self.register_buffer("sources", torch.zeros(3, dtype=torch.long))
+        self.register_buffer("neg_inf", torch.tensor(-float("inf")), persistent=False)
 
 
 class _FakeTrainModel(nn.Module):
@@ -396,6 +397,16 @@ def test_model_nonfinite_sanitizer_repairs_parameters_and_buffers():
     assert model.proj.weight.data.view(-1)[1].item() == -1.0
     assert model.proj.bias.data.view(-1)[0].item() == 0.0
     assert torch.isinf(model.ltm.fast_vals[0, 0])
+
+
+def test_model_sanitizer_preserves_intentional_ltm_neg_inf_buffer():
+    model = _FakeTrainModel()
+
+    cleaned = _sanitize_model_nonfinite_(model)
+
+    assert cleaned == 0
+    assert torch.isneginf(model.ltm.neg_inf)
+    assert training_state_is_finite(model) is True
 
 
 def test_model_startup_magnitude_clamp_repairs_all_weights_and_buffers():

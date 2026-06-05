@@ -53,6 +53,14 @@ def _is_transient_ltm_state_name(name: str) -> bool:
     clean_name = str(name).replace("_orig_mod.", "")
     return any(clean_name.endswith(suffix) for suffix in TRANSIENT_LTM_STATE_KEYS)
 
+INTENTIONAL_NONFINITE_BUFFER_KEYS = (
+    "ltm.neg_inf",
+)
+
+def _is_intentional_nonfinite_buffer_name(name: str) -> bool:
+    clean_name = str(name).replace("_orig_mod.", "")
+    return any(clean_name.endswith(suffix) for suffix in INTENTIONAL_NONFINITE_BUFFER_KEYS)
+
 def _find_first_nonfinite_model_tensor(model, include_grads: bool = False, include_transient_ltm: bool = False):
     for name, param in model.named_parameters():
         if _tensor_is_nonfinite(param):
@@ -60,6 +68,8 @@ def _find_first_nonfinite_model_tensor(model, include_grads: bool = False, inclu
         if include_grads and param.grad is not None and _tensor_is_nonfinite(param.grad):
             return _describe_tensor_issue(f"gradient {name}", param.grad)
     for name, buffer in model.named_buffers():
+        if _is_intentional_nonfinite_buffer_name(name):
+            continue
         if not include_transient_ltm and _is_transient_ltm_state_name(name):
             continue
         if _tensor_is_nonfinite(buffer):
@@ -76,6 +86,8 @@ def _find_first_nonfinite_optimizer_tensor(optimizer):
     return None
 
 def _find_first_nonfinite_payload_tensor(value, path: str = "checkpoint"):
+    if _is_intentional_nonfinite_buffer_name(path):
+        return None
     if _is_transient_ltm_state_name(path):
         return None
     if torch.is_tensor(value):
@@ -95,6 +107,8 @@ def _find_first_nonfinite_payload_tensor(value, path: str = "checkpoint"):
     return None
 
 def _sanitize_payload_nonfinite_(value, path: str = "checkpoint", max_abs: float = 1.0) -> int:
+    if _is_intentional_nonfinite_buffer_name(path):
+        return 0
     if torch.is_tensor(value):
         if path.endswith("[0]") and "running_states[5]" in path:
             return _sanitize_tensor_nonfinite_(value, nan=0.0, posinf=0.0, neginf=0.0)
@@ -134,6 +148,8 @@ def _checkpoint_grad_clip(checkpoint_dict) -> float:
     return 1.0
 
 def _sanitize_ltm_payload_state_(value, path: str = "checkpoint", max_abs: float = 1.0) -> int:
+    if _is_intentional_nonfinite_buffer_name(path):
+        return 0
     if torch.is_tensor(value):
         clean_path = path.replace("_orig_mod.", "")
         if clean_path.endswith("ltm.fast_vals"):
@@ -235,6 +251,8 @@ def _sanitize_model_nonfinite_(model, *, include_transient_ltm: bool = False, lo
                 first_issue = _describe_tensor_issue(f"parameter {name}", param)
             cleaned += _sanitize_tensor_nonfinite_(param, nan=0.0, posinf=1.0, neginf=-1.0)
         for name, buffer in model.named_buffers():
+            if _is_intentional_nonfinite_buffer_name(name):
+                continue
             if not include_transient_ltm and _is_transient_ltm_state_name(name):
                 continue
             if first_issue is None and _tensor_is_nonfinite(buffer):
@@ -254,6 +272,8 @@ def _clamp_model_finite_magnitude_(model, max_abs: float, *, include_transient_l
         for name, param in model.named_parameters():
             clamped += _clamp_tensor_finite_magnitude_(param, max_abs)
         for name, buffer in model.named_buffers():
+            if _is_intentional_nonfinite_buffer_name(name):
+                continue
             if not include_transient_ltm and _is_transient_ltm_state_name(name):
                 continue
             clamped += _clamp_tensor_finite_magnitude_(buffer, max_abs)

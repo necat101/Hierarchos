@@ -7,6 +7,7 @@ import torch
 import hierarchos
 from hierarchos import AttrDict, HierarchosCore
 from hierarchos.inference.chat import load_hierarchical_chat_state, save_hierarchical_chat_state
+from hierarchos.inference.chat_state import CHAT_STATE_VERSION
 from hierarchos.models.core import _resolve_compile_kwargs
 from hierarchos.models.rwkv_cell import RWKVCell
 from hierarchos.utils.rosa import precompute_rosa_ids_for_chunks
@@ -489,7 +490,7 @@ class RWKVV8IntegrityTests(unittest.TestCase):
             )
             payload = torch.load(path, map_location="cpu", weights_only=False)
 
-            self.assertEqual(payload["version"], 2)
+            self.assertEqual(payload["version"], CHAT_STATE_VERSION)
             self.assertEqual(payload["recurrent_state_layout"]["h"]["layout"], "rwkv_v8_matrix_packed")
             self.assertEqual(payload["recurrent_state_layout"]["h"]["head_size"], model.h_rnn.head_size)
             self.assertEqual(payload["recurrent_state_layout"]["h"]["state_size"], model.h_rnn.state_size)

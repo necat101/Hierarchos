@@ -11,6 +11,7 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 
 from hierarchos import AttrDict, HierarchosCore
+from hierarchos.utils.checkpoint import sanitize_model_state_dict
 
 
 MODEL_WEIGHTS_NAME = "hierarchos.pt"
@@ -26,10 +27,24 @@ LATEST_CONFIG_DEFAULTS = {
     "commitment_threshold": 0.05,
     "detach_every_n_steps": 32,
     "h_halt_thresh": 0.9,
+    "memory_token_routers": True,
+    "memory_gate_warmup_steps": 2000,
+    "memory_gate_warmup_floor": 0.10,
     "gradient_checkpointing": False,
     "compile": False,
+    "compile_mode": "max-autotune-no-cudagraphs",
+    "compile_backend": None,
+    "compile_dynamic": False,
+    "compile_fullgraph_worker": False,
+    "compile_cudagraphs": False,
+    "compile_pad_to_chunk_size": True,
+    "compile_static_worker_loop": None,
+    "compile_h_rnn": True,
+    "compile_quiet": True,
     "use_deepembed": True,
     "use_rosa": True,
+    "rosa_max_context": 512,
+    "rwkv_head_size": None,
 }
 
 ARCH_UPDATE_KEYS = [
@@ -50,9 +65,14 @@ ARCH_UPDATE_KEYS = [
     "commitment_threshold",
     "detach_every_n_steps",
     "h_halt_thresh",
+    "memory_token_routers",
+    "memory_gate_warmup_steps",
+    "memory_gate_warmup_floor",
     "ltm_forget_rate",
     "use_deepembed",
     "use_rosa",
+    "rosa_max_context",
+    "rwkv_head_size",
 ]
 
 DERIVED_OR_RUNTIME_KEYS = {
@@ -207,6 +227,9 @@ def _infer_missing_config(config: Dict[str, Any], state_dict: Dict[str, torch.Te
     if "h_rnn.key.weight" in state_dict and state_dict["h_rnn.key.weight"].ndim == 2:
         inferred.setdefault("h_hidden", int(state_dict["h_rnn.key.weight"].shape[0]))
 
+    if "h_rnn.r_k" in state_dict and state_dict["h_rnn.r_k"].ndim == 2:
+        inferred.setdefault("rwkv_head_size", int(state_dict["h_rnn.r_k"].shape[1]))
+
     if "l_rnn.key.weight" in state_dict and state_dict["l_rnn.key.weight"].ndim == 2:
         inferred.setdefault("l_hidden", int(state_dict["l_rnn.key.weight"].shape[0]))
 
@@ -283,7 +306,7 @@ def _layer_note(name: str) -> str:
     return "new/current layer"
 
 
-def scan_dataset_for_max_length(dataset_path: str, tokenizer, kayla_mode: bool) -> int:
+def scan_dataset_for_max_length(dataset_path: str, tokenizer, kayla_mode: bool, alpaca_mode: bool = False) -> int:
     """Scan a JSON or JSONL dataset and return the max token length rounded to 8."""
     max_found_length = 0
     print(f"Scanning dataset '{dataset_path}' to determine max length...")
@@ -291,7 +314,7 @@ def scan_dataset_for_max_length(dataset_path: str, tokenizer, kayla_mode: bool) 
     if not os.path.exists(dataset_path):
         raise FileNotFoundError(f"Dataset file not found: {dataset_path}")
 
-    def get_text_from_obj(obj: Dict[str, Any], kayla: bool) -> str:
+    def get_text_from_obj(obj: Dict[str, Any], kayla: bool, alpaca: bool) -> str:
         try:
             if kayla:
                 feelings_part = f"### Feelings:\n{obj.get('feelings')}\n\n" if obj.get("feelings") else ""
@@ -300,6 +323,13 @@ def scan_dataset_for_max_length(dataset_path: str, tokenizer, kayla_mode: bool) 
                     f"{feelings_part}"
                     f"### Thought Process:\n{obj.get('thought-process', '')}\n\n"
                     f"### Response:\n{obj.get('output', '')}"
+                )
+            if alpaca:
+                input_part = f"### Input:\n{obj.get('input', '')}\n\n" if obj.get("input") else ""
+                return (
+                    f"### Instruction:\n{obj.get('instruction', '')}\n\n"
+                    f"{input_part}"
+                    f"### Response:\n{obj.get('output', '') or obj.get('response', '')}"
                 )
             return (
                 f"### Instruction:\n{obj.get('instruction', '')}\n\n"
@@ -317,7 +347,7 @@ def scan_dataset_for_max_length(dataset_path: str, tokenizer, kayla_mode: bool) 
                 for obj in tqdm(data, desc="Scanning JSON"):
                     if not isinstance(obj, dict):
                         continue
-                    length = len(tokenizer.encode(get_text_from_obj(obj, kayla_mode))) + 1
+                    length = len(tokenizer.encode(get_text_from_obj(obj, kayla_mode, alpaca_mode))) + 1
                     max_found_length = max(max_found_length, length)
         except json.JSONDecodeError:
             f.seek(0)
@@ -326,7 +356,7 @@ def scan_dataset_for_max_length(dataset_path: str, tokenizer, kayla_mode: bool) 
                     obj = json.loads(line)
                     if not isinstance(obj, dict):
                         continue
-                    length = len(tokenizer.encode(get_text_from_obj(obj, kayla_mode))) + 1
+                    length = len(tokenizer.encode(get_text_from_obj(obj, kayla_mode, alpaca_mode))) + 1
                     max_found_length = max(max_found_length, length)
                 except (json.JSONDecodeError, AttributeError, TypeError):
                     continue
@@ -412,6 +442,9 @@ def transplant_weights(old_model_path: str, new_config: Dict[str, Any], output_t
             stats["resized"] += 1
 
     new_model.load_state_dict(new_state_dict, strict=True)
+    if hasattr(new_model, "reset_memory"):
+        new_model.reset_memory()
+        print("Reset transient LTM working memory before saving expanded model.")
 
     print(f"\nSaving expanded model directory to: {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -419,7 +452,7 @@ def transplant_weights(old_model_path: str, new_config: Dict[str, Any], output_t
 
     torch.save(
         {
-            "model_state_dict": new_model.state_dict(),
+            "model_state_dict": sanitize_model_state_dict(new_model, reset_transient_ltm=True),
             "config": final_config,
         },
         output_weights_path,
@@ -483,7 +516,7 @@ def build_expanded_config(args: argparse.Namespace, device: str) -> Dict[str, An
             if tokenizer.pad_token is None:
                 tokenizer.pad_token = tokenizer.eos_token
 
-            determined_len = scan_dataset_for_max_length(args.dataset_for_length, tokenizer, args.kayla)
+            determined_len = scan_dataset_for_max_length(args.dataset_for_length, tokenizer, args.kayla, args.alpaca)
             if determined_len > 0:
                 new_max_len = determined_len
         except Exception as exc:
@@ -543,6 +576,8 @@ def main() -> None:
     dim_group.add_argument("--detach_every_n_steps", "--detach-every-n-steps", dest="detach_every_n_steps", type=int)
     dim_group.add_argument("--h_halt_thresh", "--h-halt-thresh", dest="h_halt_thresh", type=float)
     dim_group.add_argument("--ltm_forget_rate", "--ltm-forget-rate", dest="ltm_forget_rate", type=float)
+    dim_group.add_argument("--rosa_max_context", "--rosa-max-context", dest="rosa_max_context", type=int)
+    dim_group.add_argument("--rwkv_head_size", "--rwkv-head-size", dest="rwkv_head_size", type=int)
     deepembed_group = dim_group.add_mutually_exclusive_group()
     deepembed_group.add_argument("--use-deepembed", dest="use_deepembed", action="store_true", default=None)
     deepembed_group.add_argument("--no-deepembed", dest="use_deepembed", action="store_false")
@@ -558,7 +593,9 @@ def main() -> None:
         help="Scan a dataset to determine max_length. Requires --dataset-for-length.",
     )
     length_group.add_argument("--dataset-for-length", type=str, help="Dataset (.jsonl or .json) for --auto-max-length.")
-    length_group.add_argument("--kayla", action="store_true", help="Use Kayla formatting for auto length scanning.")
+    scan_format_group = length_group.add_mutually_exclusive_group()
+    scan_format_group.add_argument("--kayla", action="store_true", help="Use Kayla formatting for auto length scanning.")
+    scan_format_group.add_argument("--alpaca", action="store_true", help="Use Alpaca instruction/input/output formatting for auto length scanning.")
 
     args = parser.parse_args()
     device = "cpu"

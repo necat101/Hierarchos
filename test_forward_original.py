@@ -1,53 +1,67 @@
-import sys
+import os
 import importlib.util
+import sys
 
-# Directly load the monolithic hierarchos.py file
-spec = importlib.util.spec_from_file_location("hierarchos_mono", "hierarchos.py")
-orig = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(orig)
-
+import pytest
 import torch
 
-# Load checkpoint
-ckpt = torch.load('rog_ally_model/hierarchos_epoch_31.pt', map_location='cpu', weights_only=False)
+DEFAULT_CKPT_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "rog_ally_model",
+    "hierarchos_epoch_31.pt",
+)
 
-# Build config as dict
-cfg = {
-    'vocab_size': 50257,
-    'context_dim': 384,
-    'h_hidden': 384,
-    'l_hidden': 384,
-    'ltm_slots': 1024,
-    'ltm_key_dim': 128,
-    'ltm_val_dim': 128,
-    'ltm_topk': 4,
-    'persistent_dim': 128,
-    'max_h_steps': 5,
-    'max_l_steps': 5,
-    'h_stride': 4,
-    'max_length': 1024,
-    'compile': False,
-    'commitment_threshold': 0.1,
-}
-# Merge checkpoint config
-for k, v in ckpt.get('config', {}).items():
-    if k not in cfg:
-        cfg[k] = v
 
-# Create and load original model
-model = orig.HierarchosCore(cfg)
-model.load_state_dict(ckpt['model_state_dict'])
-model.eval()
+def test_original_forward_checkpoint():
+    if not os.path.exists(DEFAULT_CKPT_PATH):
+        pytest.skip(f"legacy comparison checkpoint not found: {DEFAULT_CKPT_PATH}")
 
-# Test forward pass with same input
-torch.manual_seed(42)
-x = torch.randint(0, 1000, (1, 10))
-labels = x.clone()
-labels[:, 0] = -100
+    spec = importlib.util.spec_from_file_location("hierarchos_mono", "hierarchos.py")
+    orig = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = orig
+    spec.loader.exec_module(orig)
 
-with torch.no_grad():
-    out = model(x, labels=labels)
+    ckpt = torch.load(DEFAULT_CKPT_PATH, map_location="cpu", weights_only=False)
+    cfg = {
+        "vocab_size": 50257,
+        "context_dim": 384,
+        "h_hidden": 384,
+        "l_hidden": 384,
+        "ltm_slots": 1024,
+        "ltm_key_dim": 128,
+        "ltm_val_dim": 128,
+        "ltm_topk": 4,
+        "persistent_dim": 128,
+        "max_h_steps": 5,
+        "max_l_steps": 5,
+        "h_stride": 4,
+        "max_length": 1024,
+        "compile": False,
+        "commitment_threshold": 0.1,
+    }
+    cfg.update({k: v for k, v in ckpt.get("config", {}).items() if k not in cfg})
 
-print(f'Original Loss: {out["loss"].item():.4f}')
-print(f'Original Logits shape: {out["logits"].shape}')
-print(f'Original Logits sample (first 5): {out["logits"][0, 0, :5]}')
+    model = orig.HierarchosCore(cfg)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+
+    torch.manual_seed(42)
+    x = torch.randint(0, 1000, (1, 10))
+    labels = x.clone()
+    labels[:, 0] = -100
+
+    with torch.no_grad():
+        out = model(x, labels=labels)
+
+    loss = out["loss"]
+    logits = out["logits"]
+    print(f"Original Loss: {loss.item():.4f}")
+    print(f"Original Logits shape: {logits.shape}")
+    print(f"Original Logits sample (first 5): {logits[0, 0, :5]}")
+
+    assert torch.isfinite(loss)
+    assert logits.shape[:2] == x.shape
+
+
+if __name__ == "__main__":
+    test_original_forward_checkpoint()

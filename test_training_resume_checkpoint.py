@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import argparse
 import os
 import tempfile
 
@@ -26,6 +27,7 @@ from hierarchos.training.trainer import (
     _clip_gradients_and_check,
 )
 from hierarchos.utils.checkpoint import sanitize_model_state_dict
+import hierarchos_cli
 
 
 class _FakeLTM(nn.Module):
@@ -303,6 +305,181 @@ def test_epoch_boundary_checkpoint_has_clean_resume_position():
     assert "running_states" not in checkpoint
     assert checkpoint["grad_accumulation_active"] is False
     assert checkpoint["grad_state_dict"] is None
+
+
+def _continuation_parser_and_args(model_path=None, resume_from_ckpt=None, epochs=3):
+    defaults = {
+        "mode": "train",
+        "model_path": model_path,
+        "resume_from_ckpt": resume_from_ckpt,
+        "out_dir": "./hierarchos_model",
+        "epochs": epochs,
+        "train": None,
+        "hf_dataset": None,
+        "hf_dataset_config": None,
+        "hf_dataset_split": "train",
+        "text_column": None,
+        "prompt_column": None,
+        "completion_column": None,
+        "max_length": 1024,
+        "training_chunk_size": 256,
+        "batch_size": 64,
+        "starting_lr": 1e-4,
+        "min_lr": 1e-6,
+        "ltm_lr": 1e-3,
+        "min_ltm_lr": None,
+        "alpaca": False,
+        "kayla": False,
+        "compile": False,
+        "force_compile": False,
+        "amp": False,
+        "train_prompt_tokens": True,
+    }
+    parser = argparse.ArgumentParser()
+    for key, value in defaults.items():
+        parser.add_argument(f"--{key}", dest=key, default=value)
+    return parser, SimpleNamespace(**defaults)
+
+
+def test_cli_model_path_continuation_hydrates_saved_training_config():
+    saved_config = {
+        "hf_dataset": "netcat420/Experiment_0.1",
+        "hf_dataset_split": "train",
+        "alpaca": True,
+        "max_length": 8880,
+        "starting_lr": 7.5e-5,
+        "min_lr": 9e-9,
+        "ltm_lr": 5e-7,
+        "min_ltm_lr": 1e-10,
+        "compile": True,
+        "force_compile": True,
+        "amp": True,
+        "completed_epoch": 11,
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "hierarchos_config.json"), "w", encoding="utf-8") as f:
+            import json
+            json.dump(saved_config, f)
+
+        parser, args = _continuation_parser_and_args(model_path=tmp, epochs=3)
+        hierarchos_cli._hydrate_training_args_from_model_config(
+            args,
+            parser,
+            explicit_dests={"epochs", "out_dir"},
+        )
+
+    assert args.hf_dataset == "netcat420/Experiment_0.1"
+    assert args.alpaca is True
+    assert args.max_length == 8880
+    assert args.starting_lr == 7.5e-5
+    assert args.min_lr == 9e-9
+    assert args.ltm_lr == 5e-7
+    assert args.min_ltm_lr == 1e-10
+    assert args.compile is True
+    assert args.force_compile is True
+    assert args.amp is True
+    assert args.train_prompt_tokens is True
+    assert args.epochs == 3
+    assert args.base_completed_epoch == 11
+
+
+def test_cli_resume_checkpoint_hydrates_config_without_base_epoch_offset():
+    checkpoint = {
+        "config": {
+            "hf_dataset": "netcat420/Experiment_0.1",
+            "alpaca": True,
+            "max_length": 8880,
+            "starting_lr": 7.5e-5,
+            "ltm_lr": 5e-7,
+        },
+        "completed_epoch": 11,
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        ckpt_path = os.path.join(tmp, "epoch11.pt")
+        torch.save(checkpoint, ckpt_path)
+
+        parser, args = _continuation_parser_and_args(resume_from_ckpt=ckpt_path, epochs=14)
+        hierarchos_cli._hydrate_training_args_from_model_config(
+            args,
+            parser,
+            explicit_dests={"epochs", "out_dir"},
+        )
+
+    assert args.hf_dataset == "netcat420/Experiment_0.1"
+    assert args.alpaca is True
+    assert args.max_length == 8880
+    assert args.starting_lr == 7.5e-5
+    assert args.ltm_lr == 5e-7
+    assert args.train_prompt_tokens is True
+    assert args.epochs == 14
+    assert args.resume_completed_epoch == 11
+    assert not hasattr(args, "base_completed_epoch")
+
+
+def test_cli_resume_checkpoint_rejects_non_advancing_epoch_target():
+    args = SimpleNamespace(
+        mode="train",
+        resume_from_ckpt="epoch11.pt",
+        epochs=3,
+        resume_completed_epoch=11,
+    )
+
+    try:
+        hierarchos_cli._validate_resume_epoch_target(args)
+    except SystemExit as exc:
+        assert exc.code == 1
+    else:
+        raise AssertionError("Expected non-advancing resume target to exit")
+
+
+def test_cli_resume_checkpoint_preserves_explicit_colab_overrides():
+    checkpoint = {
+        "config": {
+            "hf_dataset": "netcat420/Experiment_0.1",
+            "alpaca": True,
+            "max_length": 1024,
+            "starting_lr": 7.5e-5,
+            "min_lr": 9e-9,
+            "ltm_lr": 5e-7,
+            "min_ltm_lr": 1e-10,
+            "train_prompt_tokens": False,
+        },
+        "completed_epoch": 11,
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        ckpt_path = os.path.join(tmp, "hierarchos_epoch_11.pt")
+        torch.save(checkpoint, ckpt_path)
+
+        parser, args = _continuation_parser_and_args(resume_from_ckpt=ckpt_path, epochs=14)
+        args.max_length = 8880
+        args.starting_lr = 1e-5
+        args.min_lr = 1e-8
+        args.ltm_lr = 1e-5
+        args.min_ltm_lr = 1e-9
+        args.train_prompt_tokens = True
+        hierarchos_cli._hydrate_training_args_from_model_config(
+            args,
+            parser,
+            explicit_dests={
+                "epochs",
+                "out_dir",
+                "max_length",
+                "starting_lr",
+                "min_lr",
+                "ltm_lr",
+                "min_ltm_lr",
+            },
+        )
+
+    assert args.hf_dataset == "netcat420/Experiment_0.1"
+    assert args.alpaca is True
+    assert args.max_length == 8880
+    assert args.starting_lr == 1e-5
+    assert args.min_lr == 1e-8
+    assert args.ltm_lr == 1e-5
+    assert args.min_ltm_lr == 1e-9
+    assert args.train_prompt_tokens is True
+    assert args.resume_completed_epoch == 11
 
 
 def test_inference_sanitization_still_clears_transient_ltm():

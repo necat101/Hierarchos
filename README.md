@@ -220,7 +220,7 @@ This guide covers common scenarios from data preparation to inference.
 | Entry Point | Status | Description |
 |-------------|--------|-------------|
 | `hierarchos_cli.py` | ✅ **Recommended** | Modular CLI - faster, stable, actively maintained |
-| `hierarchos.py` | ⚠️ **Legacy** | Unmaintained monolith (5,600 lines). Kept only as reference for agentic AI workflows. | <-- DO NOT USE THIS! ITS 15 VERSIONS OUT OF DATE!!
+| `hierarchos.py` | ⚠️ **Legacy** | Unmaintained monolith (5,600 lines). Kept only as reference for agentic AI workflows. | <-- DO NOT USE THIS! ITS 16 VERSIONS OUT OF DATE!!
 
 **Example:**
 ```bash
@@ -631,7 +631,7 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.5 --top-
 
 ## ⚙️ Command-Line Reference
 
-### `hierarchos.py` Arguments
+### `hierarchos_cli.py` Arguments
 
 | Argument                     | Mode(s)                             | Description                                                                                                                              | Default                 |
 | :----------------------------- | :---------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------- | :---------------------- |

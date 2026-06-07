@@ -79,7 +79,7 @@ cd C:\Users\User\Downloads\Hierarchos-main\Hierarchos-main
 .\venv_dml\Scripts\Activate.ps1
 
 # Then train:
-python hierarchos.py --mode train --train data.jsonl ...
+python hierarchos_cli.py train --train data.jsonl ...
 ```
 
 ### Step 7: Deactivate venv When Done

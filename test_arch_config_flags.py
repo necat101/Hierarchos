@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from hierarchos.utils.checkpoint import _infer_arch_flags_from_state_dict
+from hierarchos.utils.checkpoint import _infer_arch_flags_from_state_dict, _reject_unsupported_rwkv_state_dict
 
 
 class ArchitectureConfigFlagTests(unittest.TestCase):
@@ -32,6 +32,17 @@ class ArchitectureConfigFlagTests(unittest.TestCase):
         self.assertFalse(config["use_deepembed"])
         self.assertFalse(config["use_rosa"])
         self.assertNotIn("rosa_max_context", config)
+
+    def test_rejects_legacy_scalar_rwkv_checkpoint(self):
+        state = {
+            "h_rnn.time_decay": torch.empty(4),
+            "h_rnn.time_mix_k": torch.empty(1, 1, 4),
+            "l_rnn.time_decay": torch.empty(4),
+            "rosa_emb.weight": torch.empty(8, 4),
+        }
+
+        with self.assertRaisesRegex(ValueError, "v8-only"):
+            _reject_unsupported_rwkv_state_dict(state, "legacy.pt")
 
     def test_does_not_override_explicit_config(self):
         config = {"use_deepembed": False, "use_rosa": True, "rosa_max_context": 128}

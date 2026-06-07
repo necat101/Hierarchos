@@ -5,3 +5,4 @@ datasets
 numpy
 tqdm
 lm-eval
+pytest

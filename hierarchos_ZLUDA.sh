@@ -16,6 +16,5 @@ echo "== Running Hierarchos with ZLUDA (AMD Support) =="
 echo "=================================================="
 echo ""
 
-# Run the command
-# We explicitly pass --device cuda because ZLUDA mocks CUDA
-"$ZLUDA_BIN" -- python hierarchos.py "$@" --device cuda
+# Run the modular CLI. We explicitly pass --device cuda because ZLUDA mocks CUDA.
+"$ZLUDA_BIN" -- python hierarchos_cli.py "$@" --device cuda

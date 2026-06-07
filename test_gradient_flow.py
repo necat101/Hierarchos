@@ -89,7 +89,7 @@ def test_gradient_flow_end_to_end():
         print(f"FAIL: {len(params_with_nan_grad)} parameters have NaN gradients!")
         for name in params_with_nan_grad:
             print(f"  - {name}")
-        return False
+        assert False, "Parameters have NaN gradients"
     
     if params_with_zero_grad:
         print(f"INFO: {len(params_with_zero_grad)} parameters have zero gradients (may be expected)")
@@ -105,7 +105,6 @@ def test_gradient_flow_end_to_end():
             print(f"[WARN] {comp} missing meaningful gradients")
     
     print("[PASS] End-to-end gradient flow test")
-    return True
 
 def test_state_continuity():
     """Test 2: Verify state updates are meaningful and continuous."""
@@ -161,7 +160,6 @@ def test_state_continuity():
     assert not l_exploded, "FAIL: l_state exploded (NaN/Inf)"
     
     print("[PASS] State continuity test")
-    return True
 
 def test_training_convergence():
     """Test 3: Verify model can actually learn (loss decreases)."""
@@ -189,7 +187,7 @@ def test_training_convergence():
         
         if torch.isnan(loss) or torch.isinf(loss):
             print(f"FAIL: Loss became {loss.item()} at step {step}")
-            return False
+            assert False, f"Loss became non-finite at step {step}: {loss.item()}"
         
         loss.backward()
         
@@ -219,10 +217,8 @@ def test_training_convergence():
     
     if improvement > 5.0:  # At least 5% improvement
         print("[PASS] Model is learning (loss decreased)")
-        return True
     else:
         print(f"WARNING: Model may not be learning effectively (improvement: {improvement:.1f}%)")
-        return True  # Don't fail the test, just warn
 
 def test_memory_gradient_flow():
     """Test 4: Verify gradients flow through the differentiable memory update."""
@@ -260,13 +256,12 @@ def test_memory_gradient_flow():
         print(f"Initial fast_vals grad norm: {grad_norm:.6f}")
         if grad_norm > 0:
             print("[PASS] Gradients flow through memory updates!")
-            return True
         else:
             print("[FAIL] Initial fast_vals grad is zero (chain broken?)")
-            return False
+            assert False, "Initial fast_vals grad is zero"
     else:
         print("[FAIL] Initial fast_vals has no grad (detached?)")
-        return False
+        assert False, "Initial fast_vals has no grad"
 
 def run_all_tests():
     """Run all validation tests."""
@@ -285,8 +280,8 @@ def run_all_tests():
     results = []
     for name, test_func in tests:
         try:
-            result = test_func()
-            results.append((name, result))
+            test_func()
+            results.append((name, True))
         except Exception as e:
             print(f"\\n[FAIL] Exception in {name}: {e}")
             import traceback

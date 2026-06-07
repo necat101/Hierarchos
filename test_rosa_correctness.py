@@ -191,7 +191,7 @@ class ROSACorrectnessTests(unittest.TestCase):
         self.assertEqual(past.tolist(), [seq])
         self.assertEqual(states[0].tokens, seq)
 
-    def test_async_sliding_window_alignment(self):
+    def test_async_full_history_alignment_across_chunks(self):
         seq = [6, 3, 6, 3, 7, 6, 3, 8, 6]
         chunks = [2, 3, 1, 3]
         cap = 4
@@ -204,11 +204,7 @@ class ROSACorrectnessTests(unittest.TestCase):
         for step in chunks:
             cur = seq[pos:pos + step]
             end = pos + len(cur)
-            window = seq[max(0, end - cap):end]
-            overlap_len = min(len(cur), len(window))
-            expected = [-1] * (len(cur) - overlap_len)
-            if overlap_len:
-                expected.extend(ROSA(window)[-overlap_len:])
+            expected = ROSA(seq[:end])[-len(cur):]
 
             finalize = rosa_async_pipeline(
                 torch.tensor([cur], dtype=torch.long),
@@ -223,10 +219,11 @@ class ROSACorrectnessTests(unittest.TestCase):
 
             self.assertEqual(len(actual), len(cur))
             self.assertEqual(actual, expected)
-            self.assertEqual(states[0].tokens, window)
+            self.assertEqual(past.tolist(), [seq[:end]])
+            self.assertEqual(states[0].tokens, seq[:end])
             pos = end
 
-    def test_async_chunk_longer_than_window_preserves_model_length(self):
+    def test_async_chunk_longer_than_window_preserves_full_history_and_model_length(self):
         sentinel = 99
         finalize = rosa_async_pipeline(
             torch.tensor([[6, 3]], dtype=torch.long),
@@ -240,8 +237,8 @@ class ROSACorrectnessTests(unittest.TestCase):
 
         self.assertEqual(out.shape, (1, 2))
         self.assertEqual(_decode_sentinel(out[0].tolist(), sentinel), [-1, -1])
-        self.assertEqual(past.tolist(), [[3]])
-        self.assertEqual(states[0].tokens, [3])
+        self.assertEqual(past.tolist(), [[6, 3]])
+        self.assertEqual(states[0].tokens, [6, 3])
 
     def test_precomputed_chunk_ids_match_async_pipeline(self):
         seq = [1, 2, 1, 2, 3, 1, 2, 4, 1, 2, 3, 5, 1]

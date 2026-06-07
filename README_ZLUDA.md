@@ -22,7 +22,7 @@ ZLUDA allows you to run CUDA applications (like PyTorch with CUDA support) on AM
 Use `zluda.exe` to launch your Python script. This intercepts the CUDA calls and translates them to Vulkan/ROCm for your AMD GPU.
 
 ```bash
-<path_to_zluda>\zluda.exe -- python hierarchos.py train --train --hf_dataset "tatsu-lab/alpaca" --device cuda ...
+<path_to_zluda>\zluda.exe -- python hierarchos_cli.py train --train --hf_dataset "tatsu-lab/alpaca" --device cuda ...
 ```
 
 **Note**: You must specify `--device cuda` because ZLUDA makes your AMD GPU appear as a CUDA device to PyTorch.

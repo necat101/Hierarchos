@@ -45,9 +45,8 @@ if not exist "%PYTHON_EXE%" (
 echo INFO: Using Python at: "%PYTHON_EXE%"
 echo INFO: Launching ZLUDA...
 
-:: Run the command
-:: We explicitly pass --device cuda because ZLUDA mocks CUDA
-ZLUDA\zluda_with.exe -- "%PYTHON_EXE%" hierarchos.py %* --device cuda
+:: Run the modular CLI. We explicitly pass --device cuda because ZLUDA mocks CUDA.
+ZLUDA\zluda_with.exe -- "%PYTHON_EXE%" hierarchos_cli.py %* --device cuda
 
 if %errorlevel% neq 0 (
     echo.

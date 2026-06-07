@@ -12,7 +12,11 @@ cmake
 peft
 accelerate
 bitsandbytes
+numba  # ROSA JIT acceleration (10-50x speedup for suffix automaton)
 
 # Optional: lm-evaluation-harness for benchmark evaluation during training
 # Install with: pip install lm-eval
 lm-eval
+
+# Test runner for pre-flight checks
+pytest

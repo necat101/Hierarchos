@@ -61,11 +61,8 @@ def test_deterministic_memory():
     timestamps1 = model.ltm.timestamps.clone()
     
     # Verify update actually happened
-    if torch.all(state1 == 0):
-        print("[FAIL] Memory state is still all zeros after update!")
-        return False
-    else:
-        print(f"[INFO] Memory state updated successfully. Mean: {state1.mean().item()}")
+    assert not torch.all(state1 == 0), "Memory state is still all zeros after update"
+    print(f"[INFO] Memory state updated successfully. Mean: {state1.mean().item()}")
     
     # Run 2 (Reset and repeat)
     set_seed(42) # Reset seed to ensure same initialization if we re-created model, but here we just reset memory
@@ -102,7 +99,7 @@ def test_deterministic_memory():
         print("[FAIL] Memory state or timestamps mismatch!")
         print(f"State diff: {(state1 - state2).abs().max().item()}")
         print(f"Timestamp diff: {(timestamps1 - timestamps2).abs().max().item()}")
-        return False
+        assert False, "Memory state or timestamps mismatch"
         
     # Test 3: Different timestamp should produce different result (if time encoding is used)
     # Actually, the update logic stores the timestamp. So checking timestamps is enough.
@@ -115,18 +112,13 @@ def test_deterministic_memory():
         print("[PASS] Different timestamps stored correctly.")
     else:
         print("[FAIL] Timestamps did not update!")
-        return False
-
-    return True
+        assert False, "Timestamps did not update"
 
 if __name__ == "__main__":
     try:
-        if test_deterministic_memory():
-            print("\nAll coherence tests passed!")
-            exit(0)
-        else:
-            print("\nCoherence tests failed!")
-            exit(1)
+        test_deterministic_memory()
+        print("\nAll coherence tests passed!")
+        exit(0)
     except Exception as e:
         print(f"\nAn error occurred: {e}")
         import traceback

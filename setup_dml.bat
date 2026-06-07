@@ -130,7 +130,7 @@ echo DirectML has been installed successfully
 echo You can now train Hierarchos with AMD GPU acceleration
 echo.
 echo Quick Start:
-echo   python hierarchos.py --mode train --train your_data.jsonl --epochs 3 --batch-size 4
+echo   python hierarchos_cli.py train --train your_data.jsonl --epochs 3 --batch_size 4 --device dml
 echo.
 echo DirectML will auto-detect, or use --device dml to force it
 echo ========================================

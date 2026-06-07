@@ -146,7 +146,7 @@ def test_process_text_sample_autodetects_common_columns():
     assert instruct_sample is not None
     assert text_sample["input_ids"].dtype == torch.long
     assert instruct_sample["labels"].shape == instruct_sample["input_ids"].shape
-    assert (instruct_sample["labels"] == -100).any()
+    assert not (instruct_sample["labels"] == -100).any()
 
 
 def test_alpaca_instruction_input_output_uses_input_section():
@@ -172,6 +172,29 @@ def test_alpaca_instruction_input_output_uses_input_section():
     )
     assert tokenizer.calls[1] == ("A short summary.", False)
     assert "User:" not in tokenizer.calls[0][0]
+    prompt_ids = torch.tensor(TinyTokenizer().encode(tokenizer.calls[0][0]), dtype=torch.long)
+    assert torch.equal(
+        processed["labels"][: len(prompt_ids)],
+        prompt_ids,
+    )
+
+
+def test_alpaca_prompt_tokens_can_be_masked_for_legacy_sft():
+    tokenizer = RecordingTokenizer()
+    processed = process_text_sample(
+        tokenizer,
+        {
+            "instruction": "Explain the protocol.",
+            "input": "A long prompt prefix.",
+            "output": "Done.",
+        },
+        max_length=256,
+        prompt_column="instruction",
+        completion_column="output",
+        train_prompt_tokens=False,
+    )
+
+    assert processed is not None
     prompt_len = len(TinyTokenizer().encode(tokenizer.calls[0][0]))
     assert torch.equal(
         processed["labels"][:prompt_len],
@@ -543,6 +566,109 @@ def test_cli_hf_token_cache_respects_disabled_length_bucketing():
         hierarchos_cli.load_hf_dataset = original_loader
 
 
+def test_hf_token_cache_preserves_alpaca_input_and_all_token_labels():
+    import hierarchos_cli
+
+    original_loader = hierarchos_cli.load_hf_dataset
+    rows = [{
+        "instruction": "Answer using the prior context.",
+        "input": "Previous turn: the user asked about token caches.",
+        "output": "The cache keeps instruction, input, and output tokens.",
+    }]
+
+    try:
+        hierarchos_cli.load_hf_dataset = lambda *args, **kwargs: list(rows)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = types.SimpleNamespace(
+                hf_dataset="fake/alpaca",
+                hf_dataset_config=None,
+                hf_dataset_split="train",
+                hf_token_cache_dir=tmpdir,
+                hf_shard_cache_dir=None,
+                refresh_hf_token_cache=True,
+                tokenizer_path=None,
+                model_path=None,
+                max_length=512,
+                kayla=False,
+                alpaca=True,
+                text_column=None,
+                prompt_column=None,
+                completion_column=None,
+                train_prompt_tokens=True,
+                use_rosa=False,
+                rosa_max_context=512,
+                training_chunk_size=256,
+            )
+            cache_dir = hierarchos_cli.materialize_hf_token_cache(args, RecordingTokenizer())
+            with open(os.path.join(cache_dir, "_SUCCESS"), "r", encoding="utf-8") as f:
+                success = json.load(f)
+            index = torch.load(os.path.join(cache_dir, "index.pt"), map_location="cpu")
+            dataset = TokenizedBinaryDataset(cache_dir, max_length=512)
+            try:
+                raw_item = dataset[0]
+                item = {
+                    "input_ids": raw_item["input_ids"].clone(),
+                    "labels": raw_item["labels"].clone(),
+                    "_length": raw_item["_length"],
+                }
+            finally:
+                dataset.close()
+
+    finally:
+        hierarchos_cli.load_hf_dataset = original_loader
+
+    expected_prompt = (
+        "### Instruction:\nAnswer using the prior context.\n\n"
+        "### Input:\nPrevious turn: the user asked about token caches.\n\n"
+        "### Response:\n"
+    )
+    expected_ids = (
+        TinyTokenizer().encode(expected_prompt)
+        + TinyTokenizer().encode("The cache keeps instruction, input, and output tokens.", add_special_tokens=False)
+        + [TinyTokenizer.eos_token_id]
+    )
+    assert success["format"] == "map-token-bin-v4"
+    assert success["formatter"] == hierarchos_cli.HF_CACHE_FORMATTER_VERSION
+    assert success["cache_payload"]["alpaca_input_role"] == "previous_context"
+    assert success["cache_payload"]["train_prompt_tokens"] is True
+    assert index["formatter"] == hierarchos_cli.HF_CACHE_FORMATTER_VERSION
+    assert item["_length"] == len(expected_ids)
+    assert item["input_ids"].tolist() == expected_ids
+    assert item["labels"].tolist() == expected_ids
+    assert not (item["labels"] == -100).any()
+
+
+def test_hf_cache_keys_reject_legacy_masked_or_ambiguous_formatter_versions():
+    import hierarchos_cli
+
+    args = types.SimpleNamespace(
+        hf_dataset="netcat420/Experiment_0.1",
+        hf_dataset_config=None,
+        hf_dataset_split="train",
+        tokenizer_path=None,
+        model_path=None,
+        max_length=8880,
+        kayla=False,
+        alpaca=True,
+        train_prompt_tokens=True,
+        text_column=None,
+        prompt_column=None,
+        completion_column=None,
+        use_rosa=True,
+        rosa_max_context=512,
+        training_chunk_size=256,
+        hf_cache_chunks_per_file=2048,
+    )
+
+    assert hierarchos_cli._hf_token_cache_key(args) != hierarchos_cli._legacy_hf_token_cache_key(args)
+    assert hierarchos_cli._hf_shard_cache_key(args, 8) != hierarchos_cli._legacy_hf_shard_cache_key(args, 8)
+    payload = hierarchos_cli._hf_cache_key_payload(args, format_name="map-token-bin-v4")
+    assert payload["formatter"] == hierarchos_cli.HF_CACHE_FORMATTER_VERSION
+    assert payload["alpaca_input_field"] == "input"
+    assert payload["alpaca_input_role"] == "previous_context"
+    assert payload["train_prompt_tokens"] is True
+
+
 def test_hf_streaming_dataloader_batches():
     tokenizer = TinyTokenizer()
     hf_rows = FakeHFStream({"text": f"streamed sample {idx}"} for idx in range(10))
@@ -729,6 +855,9 @@ def test_map_style_jsonl_fallback_still_loads_text_samples():
 def main():
     tests = [
         test_process_text_sample_autodetects_common_columns,
+        test_alpaca_instruction_input_output_uses_input_section,
+        test_alpaca_prompt_tokens_can_be_masked_for_legacy_sft,
+        test_alpaca_flag_defaults_instruction_output_columns,
         test_streaming_jsonl_dataloader_batches_without_materializing,
         test_jsonl_byte_shards_cover_lines_once,
         test_jsonl_file_shards_assign_whole_files_to_workers,
@@ -740,6 +869,8 @@ def main():
         test_tokenized_binary_cache_is_map_style_and_bucketed,
         test_cli_builds_and_uses_hf_token_cache,
         test_cli_hf_token_cache_respects_disabled_length_bucketing,
+        test_hf_token_cache_preserves_alpaca_input_and_all_token_labels,
+        test_hf_cache_keys_reject_legacy_masked_or_ambiguous_formatter_versions,
         test_hf_streaming_dataloader_batches,
         test_hf_worker_shards_cover_samples_once,
         test_streaming_jsonl_length_buckets_reduce_padding,

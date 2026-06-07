@@ -299,39 +299,50 @@ if _NUMBA_OK:
         d = np.zeros(s, dtype=np.int64)       # lengths
         e = np.full(s, -1, dtype=np.int64)    # endpos (rightmost)
 
-        # Transitions stored as parallel arrays (state, symbol) -> target
-        # Use a simple dict-like structure via sorted arrays per state
-        # For Numba, we use a flat array of (parent, symbol, child) triples
+        # Transitions stored as an adjacency list mapped to contiguous flat arrays
+        # head[state] points to the first transition index.
+        # next_tr[tr_idx] points to the next transition index for the same parent.
         MAX_TRANS = 4 * n + 4
-        tr_parent = np.full(MAX_TRANS, -1, dtype=np.int64)
+        head = np.full(s, -1, dtype=np.int64)
+        next_tr = np.full(MAX_TRANS, -1, dtype=np.int64)
         tr_symbol = np.full(MAX_TRANS, -1, dtype=np.int64)
         tr_child = np.full(MAX_TRANS, -1, dtype=np.int64)
         tr_count = 0
 
         def _find_trans(parent, symbol):
-            """Linear scan for transition. Fast for small fan-out (typical for token-level SA)."""
-            for idx in range(tr_count):
-                if tr_parent[idx] == parent and tr_symbol[idx] == symbol:
+            """Scan only the outgoing transitions of parent state using adjacency list."""
+            idx = head[parent]
+            while idx != -1:
+                if tr_symbol[idx] == symbol:
                     return tr_child[idx], idx
+                idx = next_tr[idx]
             return -1, -1
 
         def _set_trans(parent, symbol, child):
             nonlocal tr_count
-            for idx in range(tr_count):
-                if tr_parent[idx] == parent and tr_symbol[idx] == symbol:
+            # Try to update existing transition
+            idx = head[parent]
+            while idx != -1:
+                if tr_symbol[idx] == symbol:
                     tr_child[idx] = child
                     return
+                idx = next_tr[idx]
+            # Create new transition
             if tr_count < MAX_TRANS:
-                tr_parent[tr_count] = parent
                 tr_symbol[tr_count] = symbol
                 tr_child[tr_count] = child
+                next_tr[tr_count] = head[parent]
+                head[parent] = tr_count
                 tr_count += 1
+            else:
+                raise RuntimeError("ROSA transition buffer exhausted")
 
         def _copy_trans(src_state, dst_state):
-            """Copy all transitions from src to dst."""
-            for idx in range(tr_count):
-                if tr_parent[idx] == src_state:
-                    _set_trans(dst_state, tr_symbol[idx], tr_child[idx])
+            """Copy all transitions of src_state to dst_state."""
+            idx = head[src_state]
+            while idx != -1:
+                _set_trans(dst_state, tr_symbol[idx], tr_child[idx])
+                idx = next_tr[idx]
 
         g = 0  # last state
         z = 1  # next free state
@@ -471,6 +482,39 @@ def rosa_batch_parallel(
 # ─────────────────────────────────────────────────────────────
 # Async GPU Pipeline
 # ─────────────────────────────────────────────────────────────
+def precompute_rosa_ids_for_chunks(
+    tokens: List[int],
+    vocab_size: int,
+    chunk_size: int,
+    rosa_max_ctx: int = 512,
+) -> List[int]:
+    """
+    Precompute the exact ROSA ids produced by the training forward path.
+
+    The live path now carries full ROSA history across chunks, so this mirrors
+    rosa_async_pipeline chunk-by-chunk with persistent automaton state.
+    """
+    tokens = [int(token) for token in tokens]
+    total = len(tokens)
+    if total == 0:
+        return []
+
+    no_prediction = int(vocab_size)
+    chunk_size = max(1, int(chunk_size or total))
+    cached = [no_prediction] * total
+    state = None
+
+    for start in range(0, total, chunk_size):
+        end = min(start + chunk_size, total)
+        rosa_chunk, state = rosa_single(tokens[start:end], state)
+        cached[start:end] = [
+            no_prediction if int(pred) == -1 else int(pred)
+            for pred in rosa_chunk
+        ]
+
+    return cached
+
+
 class _ImmediateFuture:
     """A future-like object that wraps an already-computed value."""
     __slots__ = ("_value",)
@@ -498,38 +542,43 @@ def rosa_async_pipeline(
     """
     B, T = input_ids.shape
     is_cuda = (device.type == 'cuda')
+    no_prediction = vocab_size
 
-    # Build full context
+    # Keep full ROSA history for continuation. rosa_max_ctx is retained for
+    # API compatibility with older callers, but past_tokens is no longer capped.
     if past_tokens is not None:
-        # past_tokens is stored on CPU between chunks to save GPU memory (see core.py).
-        # Move it to the same device as input_ids before concatenation.
-        if past_tokens.device != input_ids.device:
-            past_tokens = past_tokens.to(input_ids.device, non_blocking=is_cuda)
-        full_input_ids = torch.cat([past_tokens, input_ids], dim=1)
+        past_cpu = past_tokens.detach()
+        if past_cpu.device.type != "cpu" or past_cpu.dtype != torch.int64:
+            past_cpu = past_cpu.to(device="cpu", dtype=torch.int64)
+        else:
+            past_cpu = past_cpu.clone()
+        if past_cpu.dim() == 1:
+            past_cpu = past_cpu.unsqueeze(0)
+        if past_cpu.shape[0] == 1 and B > 1:
+            past_cpu = past_cpu.expand(B, -1)
+        elif past_cpu.shape[0] != B:
+            raise ValueError(
+                f"ROSA past_tokens batch {past_cpu.shape[0]} does not match input batch {B}"
+            )
     else:
-        full_input_ids = input_ids
+        past_cpu = None
 
-    # Cap context window
-    if full_input_ids.shape[1] > rosa_max_ctx:
-        rosa_input = full_input_ids[:, -rosa_max_ctx:]
-    else:
-        rosa_input = full_input_ids
-
-    # Transfer to CPU (async if CUDA)
+    # Transfer only the current model tokens to CPU (async if CUDA). The
+    # previous history already lives on CPU between chunks in core.py.
     if is_cuda:
         # Use pinned buffer for async D2H copy
-        host_buf = _PINNED.get("rosa_input", (B, rosa_input.shape[1]), dtype=torch.int64)
-        if host_buf.shape != rosa_input.shape:
-            host_buf = _PINNED.get("rosa_input", tuple(rosa_input.shape), dtype=torch.int64)
+        host_buf = _PINNED.get("rosa_current", (B, T), dtype=torch.int64)
+        if host_buf.shape != input_ids.shape:
+            host_buf = _PINNED.get("rosa_current", tuple(input_ids.shape), dtype=torch.int64)
 
         copy_stream = _get_rosa_stream(device)
         copy_stream.wait_stream(torch.cuda.current_stream(device))
         with torch.cuda.stream(copy_stream):
-            host_buf.copy_(rosa_input.to(torch.int64), non_blocking=True)
+            host_buf.copy_(input_ids.to(torch.int64), non_blocking=True)
             ev_copy = torch.cuda.Event()
             ev_copy.record(copy_stream)
     else:
-        host_buf = rosa_input.to(torch.int64)
+        host_buf = input_ids.to(torch.int64)
         ev_copy = None
 
     # Build the states list
@@ -544,23 +593,55 @@ def rosa_async_pipeline(
         if ev_copy is not None:
             ev_copy.synchronize()
 
-        input_lists = host_buf.tolist()
+        current_tokens_cpu = host_buf.detach().cpu().clone()
+        current_input_lists = current_tokens_cpu.tolist()
+        if past_cpu is not None:
+            next_past_tokens = torch.cat([past_cpu, current_tokens_cpu], dim=1)
+            past_input_lists = past_cpu.tolist()
+        else:
+            next_past_tokens = current_tokens_cpu.clone()
+            past_input_lists = [[] for _ in range(B)]
+
+        state_inputs = []
+        state_seeds = []
+        rebuild_flags = []
+
+        for past_row, current_row, state in zip(past_input_lists, current_input_lists, rosa_states):
+            state_tokens = getattr(state, "tokens", None) if state is not None else None
+            if state is not None and state_tokens == past_row:
+                # Incremental ROSA state already represents the complete saved
+                # history; extend it with only the current chunk.
+                state_inputs.append(current_row)
+                state_seeds.append(state)
+                rebuild_flags.append(False)
+            else:
+                # Rebuild from the complete history when state is missing,
+                # stale, or loaded from token history without automaton state.
+                state_inputs.append(past_row + current_row)
+                state_seeds.append(None)
+                rebuild_flags.append(True)
 
         # Parallel ROSA batch computation
-        rosa_preds, new_states = rosa_batch_parallel(input_lists, rosa_states)
+        rosa_preds, new_states = rosa_batch_parallel(state_inputs, state_seeds)
 
-        # Slice to only the last T predictions (current chunk)
-        rosa_raw = [preds[-T:] for preds in rosa_preds]
+        # Return exactly one ROSA token per model token.
+        rosa_raw = []
+        for preds, rebuilt in zip(rosa_preds, rebuild_flags):
+            current_preds = preds[-T:] if rebuilt else preds
+            if len(current_preds) != T:
+                current_preds = current_preds[-T:] if T > 0 else []
+                current_preds = [-1] * (T - len(current_preds)) + current_preds
+            rosa_raw.append(current_preds)
 
         # Vectorized post-processing via numpy
         rosa_np = np.array(rosa_raw, dtype=np.int64)
-        rosa_np[rosa_np == -1] = vocab_size  # sentinel for "no prediction"
+        rosa_np[rosa_np == -1] = no_prediction  # sentinel for "no prediction"
 
         # Use pinned buffer for H2D transfer
         result_buf = _PINNED.get("rosa_result", (B, T), dtype=torch.int64)
         np.copyto(np.asarray(result_buf), rosa_np, casting="unsafe")
 
-        return result_buf, rosa_input, new_states
+        return result_buf, next_past_tokens, new_states
 
     if pool is not None and B > 1:
         future = pool.submit(_cpu_work)

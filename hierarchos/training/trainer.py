@@ -4,14 +4,23 @@ import torch.nn as nn
 from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import time
+import random
 from tqdm import tqdm
 import sys
 import traceback
 import numpy as np
+import math
 
 from .optimizers import DirectMLAdamW
 from ..utils.device import is_directml_device, set_threads
-from ..utils.checkpoint import save_checkpoint_safely, load_full_model_with_config, sanitize_model_state_dict
+from ..utils.checkpoint import (
+    TRANSIENT_LTM_STATE_KEYS,
+    save_checkpoint_safely,
+    load_full_model_with_config,
+    sanitize_model_state_dict,
+    _reject_rwkv_load_mismatch,
+    _reject_unsupported_rwkv_state_dict,
+)
 from ..models.core import HierarchosCore
 
 # Helper for AttrDict access
@@ -25,6 +34,373 @@ def validate_loss(loss: torch.Tensor, name: str = "loss") -> bool:
         print(f"ERROR: Invalid loss ({loss.item()}) detected in {name}!")
         return False
     return True
+
+def _tensor_is_nonfinite(tensor: torch.Tensor) -> bool:
+    if not torch.is_tensor(tensor) or not tensor.is_floating_point():
+        return False
+    return not bool(torch.isfinite(tensor).all().item())
+
+def _describe_tensor_issue(name: str, tensor: torch.Tensor) -> str:
+    detached = tensor.detach()
+    nan_count = int(torch.isnan(detached).sum().item())
+    inf_count = int(torch.isinf(detached).sum().item())
+    finite = detached[torch.isfinite(detached)]
+    if finite.numel() > 0:
+        finite_min = float(finite.min().item())
+        finite_max = float(finite.max().item())
+        return f"{name} has {nan_count} NaN and {inf_count} Inf values; finite range=[{finite_min:.4e}, {finite_max:.4e}]"
+    return f"{name} has {nan_count} NaN and {inf_count} Inf values; no finite values"
+
+def _is_transient_ltm_state_name(name: str) -> bool:
+    clean_name = str(name).replace("_orig_mod.", "")
+    return any(clean_name.endswith(suffix) for suffix in TRANSIENT_LTM_STATE_KEYS)
+
+INTENTIONAL_NONFINITE_BUFFER_KEYS = (
+    "ltm.neg_inf",
+)
+
+def _is_intentional_nonfinite_buffer_name(name: str) -> bool:
+    clean_name = str(name).replace("_orig_mod.", "")
+    return any(clean_name.endswith(suffix) for suffix in INTENTIONAL_NONFINITE_BUFFER_KEYS)
+
+def _find_first_nonfinite_model_tensor(model, include_grads: bool = False, include_transient_ltm: bool = False):
+    for name, param in model.named_parameters():
+        if _tensor_is_nonfinite(param):
+            return _describe_tensor_issue(f"parameter {name}", param)
+        if include_grads and param.grad is not None and _tensor_is_nonfinite(param.grad):
+            return _describe_tensor_issue(f"gradient {name}", param.grad)
+    for name, buffer in model.named_buffers():
+        if _is_intentional_nonfinite_buffer_name(name):
+            continue
+        if not include_transient_ltm and _is_transient_ltm_state_name(name):
+            continue
+        if _tensor_is_nonfinite(buffer):
+            return _describe_tensor_issue(f"buffer {name}", buffer)
+    return None
+
+def _find_first_nonfinite_optimizer_tensor(optimizer):
+    if optimizer is None:
+        return None
+    for param_idx, state in enumerate(optimizer.state.values()):
+        for key, value in state.items():
+            if _tensor_is_nonfinite(value):
+                return _describe_tensor_issue(f"optimizer state[{param_idx}].{key}", value)
+    return None
+
+def _find_first_nonfinite_payload_tensor(value, path: str = "checkpoint"):
+    if _is_intentional_nonfinite_buffer_name(path):
+        return None
+    if _is_transient_ltm_state_name(path):
+        return None
+    if torch.is_tensor(value):
+        if _tensor_is_nonfinite(value):
+            return _describe_tensor_issue(path, value)
+        return None
+    if isinstance(value, dict):
+        for key, item in value.items():
+            issue = _find_first_nonfinite_payload_tensor(item, f"{path}.{key}")
+            if issue:
+                return issue
+    elif isinstance(value, (list, tuple)):
+        for idx, item in enumerate(value):
+            issue = _find_first_nonfinite_payload_tensor(item, f"{path}[{idx}]")
+            if issue:
+                return issue
+    return None
+
+def _sanitize_payload_nonfinite_(value, path: str = "checkpoint", max_abs: float = 1.0) -> int:
+    if _is_intentional_nonfinite_buffer_name(path):
+        return 0
+    if torch.is_tensor(value):
+        if path.endswith("[0]") and "running_states[5]" in path:
+            return _sanitize_tensor_nonfinite_(value, nan=0.0, posinf=0.0, neginf=0.0)
+        if path.endswith("[1]") and "running_states[5]" in path:
+            return _sanitize_tensor_nonfinite_(value, nan=0.0, posinf=max_abs, neginf=-max_abs)
+        if ".model_state_dict." in path or ".grad_state_dict." in path:
+            return _sanitize_tensor_nonfinite_(value, nan=0.0, posinf=1.0, neginf=-1.0)
+        return _sanitize_tensor_nonfinite_(value, nan=0.0, posinf=1.0, neginf=-1.0)
+    cleaned = 0
+    if isinstance(value, dict):
+        for key, item in value.items():
+            cleaned += _sanitize_payload_nonfinite_(item, f"{path}.{key}", max_abs=max_abs)
+    elif isinstance(value, (list, tuple)):
+        for idx, item in enumerate(value):
+            cleaned += _sanitize_payload_nonfinite_(item, f"{path}[{idx}]", max_abs=max_abs)
+    return cleaned
+
+def training_state_is_finite(model, optimizer=None, check_optimizer: bool = True, include_grads: bool = False) -> bool:
+    issue = _find_first_nonfinite_model_tensor(model, include_grads=include_grads)
+    if issue:
+        print(f"CRITICAL: Non-finite training state detected: {issue}")
+        return False
+    if check_optimizer:
+        issue = _find_first_nonfinite_optimizer_tensor(optimizer)
+        if issue:
+            print(f"CRITICAL: Non-finite training state detected: {issue}")
+            return False
+    return True
+
+def _checkpoint_grad_clip(checkpoint_dict) -> float:
+    config = checkpoint_dict.get("config") if isinstance(checkpoint_dict, dict) else None
+    if isinstance(config, dict):
+        try:
+            return float(config.get("grad_clip", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            return 1.0
+    return 1.0
+
+def _sanitize_ltm_payload_state_(value, path: str = "checkpoint", max_abs: float = 1.0) -> int:
+    if _is_intentional_nonfinite_buffer_name(path):
+        return 0
+    if torch.is_tensor(value):
+        clean_path = path.replace("_orig_mod.", "")
+        if clean_path.endswith("ltm.fast_vals"):
+            if value.is_floating_point():
+                changed = int(torch.count_nonzero(value).item())
+                value.zero_()
+                return changed
+            return 0
+        if clean_path.endswith("ltm._mom_vals"):
+            return _sanitize_tensor_nonfinite_(value, nan=0.0, posinf=max_abs, neginf=-max_abs)
+        if clean_path.endswith("ltm.timestamps"):
+            return _sanitize_tensor_nonfinite_(value, nan=0.0, posinf=0.0, neginf=0.0)
+        return 0
+    cleaned = 0
+    if isinstance(value, dict):
+        for key, item in value.items():
+            cleaned += _sanitize_ltm_payload_state_(item, f"{path}.{key}", max_abs=max_abs)
+    elif isinstance(value, (list, tuple)):
+        for idx, item in enumerate(value):
+            cleaned += _sanitize_ltm_payload_state_(item, f"{path}[{idx}]", max_abs=max_abs)
+    return cleaned
+
+def _component_is_finite(value) -> bool:
+    return value is not None and torch.is_tensor(value) and bool(torch.isfinite(value).all().item())
+
+def _reset_after_nonfinite(optimizer, model=None):
+    if optimizer is not None:
+        optimizer.zero_grad(set_to_none=True)
+    if model is not None and hasattr(model, "reset_memory"):
+        model.reset_memory()
+    return (None, None, None, None, None, None)
+
+def _sanitize_tensor_nonfinite_(tensor: torch.Tensor, nan: float = 0.0, posinf: float = 0.0, neginf: float = 0.0) -> int:
+    if not torch.is_tensor(tensor) or not tensor.is_floating_point():
+        return 0
+    bad_count = int((~torch.isfinite(tensor)).sum().item())
+    if bad_count:
+        tensor.nan_to_num_(nan=nan, posinf=posinf, neginf=neginf)
+    return bad_count
+
+def _positive_float(value, default: float = 0.0) -> float:
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return default
+    return value if math.isfinite(value) and value > 0.0 else default
+
+def _nonnegative_float(value, default: float = 0.0) -> float:
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return default
+    return value if math.isfinite(value) and value >= 0.0 else default
+
+def _cap_loss_component_for_backward(value: torch.Tensor, ceiling: float) -> torch.Tensor:
+    ceiling = _positive_float(ceiling, 0.0)
+    if ceiling <= 0.0 or not torch.is_tensor(value):
+        return value
+    return torch.minimum(value, value.new_tensor(ceiling))
+
+def _clamp_tensor_finite_magnitude_(tensor: torch.Tensor, max_abs: float) -> int:
+    if not torch.is_tensor(tensor) or not tensor.is_floating_point():
+        return 0
+    max_abs = _positive_float(max_abs, 0.0)
+    if max_abs <= 0.0:
+        return 0
+    over = torch.abs(tensor) > max_abs
+    over_count = int(over.sum().item())
+    if over_count:
+        tensor.clamp_(min=-max_abs, max=max_abs)
+    return over_count
+
+def _detach_finite_clamp(tensor: torch.Tensor, max_abs: float) -> torch.Tensor:
+    max_abs = _positive_float(max_abs, 1.0)
+    detached = tensor.detach()
+    return torch.clamp(
+        torch.nan_to_num(detached, nan=0.0, posinf=max_abs, neginf=-max_abs),
+        min=-max_abs,
+        max=max_abs,
+    )
+
+def _sanitize_optimizer_state_(optimizer) -> int:
+    if optimizer is None:
+        return 0
+    cleaned = 0
+    for state in optimizer.state.values():
+        for value in state.values():
+            cleaned += _sanitize_tensor_nonfinite_(value, nan=0.0, posinf=0.0, neginf=0.0)
+    if cleaned:
+        print(f"WARNING: Reset {cleaned} non-finite optimizer state value(s) to 0.0 for recovery resume.")
+    return cleaned
+
+def _sanitize_model_nonfinite_(model, *, include_transient_ltm: bool = False, log_prefix: str = "model") -> int:
+    cleaned = 0
+    first_issue = None
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if first_issue is None and _tensor_is_nonfinite(param):
+                first_issue = _describe_tensor_issue(f"parameter {name}", param)
+            cleaned += _sanitize_tensor_nonfinite_(param, nan=0.0, posinf=1.0, neginf=-1.0)
+        for name, buffer in model.named_buffers():
+            if _is_intentional_nonfinite_buffer_name(name):
+                continue
+            if not include_transient_ltm and _is_transient_ltm_state_name(name):
+                continue
+            if first_issue is None and _tensor_is_nonfinite(buffer):
+                first_issue = _describe_tensor_issue(f"buffer {name}", buffer)
+            cleaned += _sanitize_tensor_nonfinite_(buffer, nan=0.0, posinf=1.0, neginf=-1.0)
+    if cleaned:
+        detail = f" First repaired tensor: {first_issue}." if first_issue else ""
+        print(f"WARNING: Sanitized {cleaned} non-finite {log_prefix} parameter/buffer value(s): NaN->0, +Inf->1, -Inf->-1.{detail}")
+    return cleaned
+
+def _clamp_model_finite_magnitude_(model, max_abs: float, *, include_transient_ltm: bool = False, log_prefix: str = "model") -> int:
+    max_abs = _positive_float(max_abs, 0.0)
+    if max_abs <= 0.0:
+        return 0
+    clamped = 0
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            clamped += _clamp_tensor_finite_magnitude_(param, max_abs)
+        for name, buffer in model.named_buffers():
+            if _is_intentional_nonfinite_buffer_name(name):
+                continue
+            if not include_transient_ltm and _is_transient_ltm_state_name(name):
+                continue
+            clamped += _clamp_tensor_finite_magnitude_(buffer, max_abs)
+    if clamped:
+        print(f"WARNING: Clamped {clamped} finite {log_prefix} parameter/buffer value(s) to +/-{max_abs:g}.")
+    return clamped
+
+def _sanitize_model_transient_state_(model, max_abs: float = 1.0) -> int:
+    cleaned = 0
+    max_abs = float(max_abs or 0.0)
+    if max_abs <= 0.0:
+        max_abs = 1.0
+    for name, buffer in model.named_buffers():
+        clean_name = str(name).replace("_orig_mod.", "")
+        if clean_name.endswith("ltm.fast_vals"):
+            if torch.is_tensor(buffer) and buffer.is_floating_point():
+                changed = int(torch.count_nonzero(buffer).item())
+                if changed:
+                    buffer.zero_()
+                    cleaned += changed
+        elif clean_name.endswith("ltm._mom_vals"):
+            cleaned += _sanitize_tensor_nonfinite_(buffer, nan=0.0, posinf=max_abs, neginf=-max_abs)
+        elif clean_name.endswith("ltm.timestamps"):
+            cleaned += _sanitize_tensor_nonfinite_(buffer, nan=0.0, posinf=0.0, neginf=0.0)
+        elif clean_name.endswith("ltm.sources"):
+            if torch.is_tensor(buffer) and not bool(torch.isfinite(buffer.float()).all().item()):
+                buffer.fill_(0)
+                cleaned += int(buffer.numel())
+    if cleaned:
+        print(
+            f"WARNING: Sanitized transient LTM state ({cleaned} value(s)): "
+            "fast_vals reset; _mom_vals saturated; metadata reset."
+        )
+    return cleaned
+
+def _sanitize_gradient_nonfinite_(model, max_abs: float) -> int:
+    cleaned = 0
+    clamped = 0
+    max_abs = _positive_float(max_abs, 1.0)
+    for param in model.parameters():
+        if param.grad is not None:
+            cleaned += _sanitize_tensor_nonfinite_(param.grad, nan=0.0, posinf=max_abs, neginf=-max_abs)
+            clamped += _clamp_tensor_finite_magnitude_(param.grad, max_abs)
+    if cleaned:
+        print(f"WARNING: Sanitized {cleaned} non-finite gradient value(s): NaN->0, +Inf->{max_abs:g}, -Inf->{-max_abs:g} before clipping.")
+    if clamped:
+        print(f"WARNING: Saturated {clamped} finite gradient value(s) to +/-{max_abs:g} before global clipping.")
+    return cleaned
+
+def _find_first_nonfinite_gradient_tensor(model):
+    for name, param in model.named_parameters():
+        if param.grad is not None and _tensor_is_nonfinite(param.grad):
+            return _describe_tensor_issue(f"gradient {name}", param.grad)
+    return None
+
+def _manual_clip_grad_norm_(params, max_norm: float):
+    norms = []
+    for param in params:
+        grad = param.grad.detach()
+        if grad.is_sparse:
+            grad = grad.coalesce()._values()
+        norms.append(grad.float().norm(2))
+    if norms:
+        total_norm = torch.stack(norms).norm(2)
+    else:
+        total_norm = torch.zeros(())
+    if max_norm > 0.0:
+        if not bool(torch.isfinite(total_norm).all().item()):
+            for param in params:
+                param.grad.detach().zero_()
+            return total_norm
+        clip_coef = max_norm / (float(total_norm.item()) + 1e-6)
+        if clip_coef < 1.0:
+            for param in params:
+                param.grad.detach().mul_(clip_coef)
+    return total_norm
+
+def save_training_checkpoint_if_finite(checkpoint_dict, path: str, model, optimizer=None) -> bool:
+    max_abs = _checkpoint_grad_clip(checkpoint_dict)
+    _sanitize_model_nonfinite_(model, log_prefix="checkpoint model")
+    if isinstance(checkpoint_dict, dict) and model is not None and "model_state_dict" in checkpoint_dict:
+        checkpoint_dict["model_state_dict"] = sanitize_model_state_dict(model, reset_transient_ltm=False)
+    _sanitize_model_transient_state_(model, max_abs=max_abs)
+    _sanitize_gradient_nonfinite_(model, max_abs=1.0)
+    _sanitize_optimizer_state_(optimizer)
+    ltm_cleaned = _sanitize_ltm_payload_state_(checkpoint_dict, max_abs=max_abs)
+    if ltm_cleaned:
+        print(f"WARNING: Sanitized {ltm_cleaned} transient LTM checkpoint value(s) before saving.")
+    issue = _find_first_nonfinite_payload_tensor(checkpoint_dict)
+    if issue:
+        cleaned = _sanitize_payload_nonfinite_(checkpoint_dict, max_abs=max_abs)
+        print(f"WARNING: Non-finite checkpoint payload detected: {issue}")
+        print(f"WARNING: Sanitized {cleaned} non-finite checkpoint payload value(s) before saving.")
+    issue = _find_first_nonfinite_payload_tensor(checkpoint_dict)
+    if issue:
+        print(f"CRITICAL: Checkpoint still contains non-finite tensor after repair; refusing to save. {issue}")
+        return False
+    save_checkpoint_safely(checkpoint_dict, path)
+    return True
+
+def _clip_gradients_and_check(model, max_norm: float):
+    params = [p for p in model.parameters() if p.requires_grad and p.grad is not None]
+    if not params:
+        return True, None
+    max_norm = float(max_norm or 0.0)
+    _sanitize_gradient_nonfinite_(model, max_abs=max_norm)
+    total_norm = _manual_clip_grad_norm_(params, max_norm)
+    if torch.is_tensor(total_norm) and not bool(torch.isfinite(total_norm).all().item()):
+        _sanitize_gradient_nonfinite_(model, max_abs=max_norm)
+        total_norm = _manual_clip_grad_norm_(params, max_norm)
+    issue = _find_first_nonfinite_gradient_tensor(model)
+    if issue:
+        return False, issue
+    return True, total_norm
+
+def set_model_training_step(model, step: int):
+    setter = getattr(model, "set_training_step", None)
+    if callable(setter):
+        setter(step)
+        return
+    base_model = getattr(model, "base_model", None)
+    inner_model = getattr(base_model, "model", None)
+    setter = getattr(inner_model, "set_training_step", None)
+    if callable(setter):
+        setter(step)
 
 def compute_chunk_training_weights(labels: torch.Tensor, attention_mask: torch.Tensor = None, chunk_size: int = 128):
     """
@@ -82,39 +458,495 @@ def compute_remaining_update_steps(dataloader_len: int, accumulation_steps: int,
                                    total_epochs: int, start_step: int = 0) -> int:
     """Count optimizer updates that will actually run after an epoch/mid-epoch resume."""
     accumulation_steps = max(1, int(accumulation_steps))
+    dataloader_len = max(0, int(dataloader_len))
+    start_step = max(0, min(int(start_step), dataloader_len))
     remaining_epochs_after_current = max(0, int(total_epochs) - int(start_epoch) - 1)
-    remaining_batches = max(0, int(dataloader_len) - int(start_step))
-    remaining_batches += remaining_epochs_after_current * int(dataloader_len)
-    return max(1, remaining_batches // accumulation_steps)
+    updates_per_full_epoch = dataloader_len // accumulation_steps
+    updates_already_done_this_epoch = start_step // accumulation_steps
+    updates_left_this_epoch = max(0, updates_per_full_epoch - updates_already_done_this_epoch)
+    remaining_updates = updates_left_this_epoch + (remaining_epochs_after_current * updates_per_full_epoch)
+    return max(1, remaining_updates)
 
-def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, running_states):
-    """Training step with temporal chunking to match original hierarchos.py."""
+def _resolve_ltm_lr_bounds(args):
+    max_lr = _positive_float(getattr(args, 'ltm_lr', 1e-3), 1e-3)
+    min_ltm_lr = getattr(args, 'min_ltm_lr', None)
+    if min_ltm_lr is None:
+        min_lr = _nonnegative_float(getattr(args, 'min_lr', 0.0), 0.0)
+    else:
+        min_lr = _nonnegative_float(min_ltm_lr, 0.0)
+    return max_lr, min(min_lr, max_lr)
+
+def _cosine_annealed_value(max_value: float, min_value: float, step: int, total_steps: int) -> float:
+    max_value = _nonnegative_float(max_value, 0.0)
+    min_value = min(_nonnegative_float(min_value, 0.0), max_value)
+    total_steps = max(1, int(total_steps or 1))
+    step = max(0, min(int(step or 0), total_steps))
+    cosine = 0.5 * (1.0 + math.cos(math.pi * step / float(total_steps)))
+    return min_value + (max_value - min_value) * cosine
+
+def configure_ltm_lr_schedule(args, num_update_steps: int, checkpoint=None, *, override_schedule: bool = False, scheduler=None):
+    max_lr, min_lr = _resolve_ltm_lr_bounds(args)
+    schedule_enabled = not bool(getattr(args, 'disable_ltm_lr_schedule', False))
+    total_steps = max(1, int(num_update_steps or 1))
+    current_step = 0
+
+    state = checkpoint.get('ltm_scheduler_state') if isinstance(checkpoint, dict) else None
+    if schedule_enabled and state and not override_schedule:
+        total_steps = max(1, int(state.get('total_steps', total_steps) or total_steps))
+        current_step = max(0, int(state.get('step', 0) or 0))
+    elif schedule_enabled and scheduler is not None and not override_schedule:
+        current_step = max(0, int(getattr(scheduler, 'last_epoch', 0) or 0))
+
+    args._ltm_lr_schedule_enabled = schedule_enabled
+    args._ltm_lr_schedule_total_steps = total_steps
+    args._ltm_lr_schedule_step = min(current_step, total_steps)
+    args._ltm_lr_max = max_lr
+    args._ltm_lr_min = min_lr
+    args._current_ltm_lr = get_current_ltm_lr(args)
+    if schedule_enabled:
+        print(
+            f"INFO: Cosine Annealing LTM LR scheduler ENABLED. "
+            f"Total steps: {total_steps}, Max LTM LR: {max_lr:.2e}, Min LTM LR: {min_lr:.2e}"
+        )
+    else:
+        print(f"INFO: LTM LR scheduler disabled. Fixed LTM LR: {max_lr:.2e}")
+    return args._current_ltm_lr
+
+def get_current_ltm_lr(args) -> float:
+    max_lr = _positive_float(getattr(args, '_ltm_lr_max', getattr(args, 'ltm_lr', 1e-3)), 1e-3)
+    min_lr = _nonnegative_float(getattr(args, '_ltm_lr_min', getattr(args, 'min_ltm_lr', 0.0) or 0.0), 0.0)
+    if not bool(getattr(args, '_ltm_lr_schedule_enabled', True)):
+        return max_lr
+    return _cosine_annealed_value(
+        max_lr,
+        min_lr,
+        getattr(args, '_ltm_lr_schedule_step', 0),
+        getattr(args, '_ltm_lr_schedule_total_steps', 1),
+    )
+
+def advance_ltm_lr_schedule(args):
+    if bool(getattr(args, '_ltm_lr_schedule_enabled', True)):
+        total_steps = max(1, int(getattr(args, '_ltm_lr_schedule_total_steps', 1) or 1))
+        current_step = max(0, int(getattr(args, '_ltm_lr_schedule_step', 0) or 0))
+        args._ltm_lr_schedule_step = min(current_step + 1, total_steps)
+    args._current_ltm_lr = get_current_ltm_lr(args)
+    return args._current_ltm_lr
+
+def capture_ltm_lr_scheduler_state(args):
+    return {
+        "enabled": bool(getattr(args, '_ltm_lr_schedule_enabled', True)),
+        "step": int(getattr(args, '_ltm_lr_schedule_step', 0) or 0),
+        "total_steps": int(getattr(args, '_ltm_lr_schedule_total_steps', 1) or 1),
+        "max_lr": float(getattr(args, '_ltm_lr_max', getattr(args, 'ltm_lr', 1e-3))),
+        "min_lr": float(getattr(args, '_ltm_lr_min', getattr(args, 'min_ltm_lr', 0.0) or 0.0)),
+    }
+
+def build_hierarchos_optimizer(model, args, device):
+    """RWKV-style AdamW grouping: decay matrices/embeddings, never norms or scalars."""
+    lr = args.starting_lr
+    weight_decay = float(getattr(args, "rwkv_weight_decay", 0.1))
+    decay = []
+    no_decay = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if (".weight" in name or "emb" in name) and ("ln" not in name and "norm" not in name):
+            decay.append(param)
+        else:
+            no_decay.append(param)
+
+    param_groups = [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+    if is_directml_device(device):
+        return DirectMLAdamW(param_groups, lr=lr)
+    if device.type == 'cuda':
+        return torch.optim.AdamW(param_groups, lr=lr, fused=True)
+    return torch.optim.AdamW(param_groups, lr=lr)
+
+def estimate_cuda_loss_chunk_rows(free_bytes: int, batch_size: int, chunk_size: int,
+                                  vocab_size: int, requested_rows: int = 0) -> int:
+    """
+    Pick a CUDA lm_head loss chunk size from live free VRAM and current batch shape.
+
+    On 96GB-class GPUs this targets enough rows to cover batch=64 at a
+    256-token TBPTT chunk in one loss pass while still reserving most VRAM for
+    activations, optimizer state, CUDA graphs, and fragmentation.
+    """
+    requested_rows = int(requested_rows or 0)
+    if requested_rows > 0:
+        return requested_rows
+
+    free_bytes = max(0, int(free_bytes or 0))
+    batch_size = max(1, int(batch_size or 1))
+    chunk_size = max(1, int(chunk_size or 1))
+    vocab_size = max(1, int(vocab_size or 1))
+
+    free_gb = free_bytes / float(1024 ** 3)
+    if free_gb >= 72.0:
+        base_rows = 16834
+    elif free_gb >= 48.0:
+        base_rows = 12288
+    elif free_gb >= 24.0:
+        base_rows = 8192
+    elif free_gb >= 12.0:
+        base_rows = 4096
+    else:
+        base_rows = 2048
+
+    batch_rows = batch_size * max(1, chunk_size - 1)
+    batch_target_rows = int(math.ceil(batch_rows * 1.05))
+
+    # FP32 logits dominate; reserve room for backward/temp buffers and leave most
+    # free VRAM for activations, optimizer state, CUDA graphs, and fragmentation.
+    estimated_bytes_per_row = vocab_size * 4 * 3
+    memory_budget = max(512 * 1024 ** 2, int(free_bytes * 0.20))
+    memory_cap_rows = max(512, memory_budget // max(1, estimated_bytes_per_row))
+
+    rows = max(base_rows, min(batch_target_rows, memory_cap_rows))
+    rows = min(rows, memory_cap_rows)
+    return max(512, int(rows))
+
+def tune_cuda_loss_chunk_rows_once(model, args, batch_size: int, chunk_size: int):
+    """Auto-tune CUDA loss chunking once after startup/model allocation."""
+    if not (torch.cuda.is_available() and getattr(args, 'cuda_chunked_lm_loss', True)):
+        return
+    if not getattr(args, '_auto_cuda_loss_chunk_rows', False):
+        return
+
     device = next(model.parameters()).device
-    cpu_input_ids = batch['input_ids']
-    cpu_attention_mask = batch.get('attention_mask')
-    cpu_labels = batch['labels']
+    if device.type != 'cuda':
+        return
 
-    B, T = cpu_input_ids.shape
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    vocab_size = int(getattr(model.config, 'vocab_size', getattr(args, 'vocab_size', 1)))
+    rows = estimate_cuda_loss_chunk_rows(
+        free_bytes=free_bytes,
+        batch_size=batch_size,
+        chunk_size=chunk_size,
+        vocab_size=vocab_size,
+    )
 
-    # Temporal chunking (critical for RWKV-based models). Build the chunk plan
-    # while labels/masks are still on CPU so token counts do not synchronize CUDA.
-    chunk_size = getattr(args, 'training_chunk_size', 128)
-    if chunk_size <= 0 or chunk_size > T: chunk_size = T
-    chunk_plan = compute_chunk_training_weights(cpu_labels, cpu_attention_mask, chunk_size)
+    previous = int(getattr(args, 'cuda_loss_chunk_rows', 0) or 0)
+    if rows != previous:
+        args.cuda_loss_chunk_rows = rows
+        if hasattr(model, 'config'):
+            model.config.cuda_loss_chunk_rows = rows
+        free_gb = free_bytes / (1024 ** 3)
+        total_gb = total_bytes / (1024 ** 3)
+        print(
+            f"INFO: Startup CUDA loss chunk rows set to {rows} "
+            f"(free VRAM {free_gb:.1f}/{total_gb:.1f} GB, batch={batch_size}, chunk={chunk_size})."
+        )
 
+def trim_trailing_padding(input_ids: torch.Tensor, labels: torch.Tensor, attention_mask: torch.Tensor = None):
+    """Remove trailing columns that are padding for the entire batch."""
+    if attention_mask is None:
+        return input_ids, labels, attention_mask
+    if not isinstance(attention_mask, torch.Tensor):
+        return input_ids, labels, attention_mask
+    if input_ids.ndim != 2 or labels.ndim != 2 or attention_mask.ndim != 2:
+        return input_ids, labels, attention_mask
+    if attention_mask.shape[1] != input_ids.shape[1] or labels.shape[1] != input_ids.shape[1]:
+        return input_ids, labels, attention_mask
+
+    active_columns = attention_mask.bool().any(dim=0)
+    if not bool(active_columns.any().item()):
+        return input_ids, labels, attention_mask
+    trim_to = int(active_columns.nonzero(as_tuple=False)[-1].item()) + 1
+    if trim_to >= input_ids.shape[1]:
+        return input_ids, labels, attention_mask
+    return (
+        input_ids[:, :trim_to].contiguous(),
+        labels[:, :trim_to].contiguous(),
+        attention_mask[:, :trim_to].contiguous(),
+    )
+
+def pad_training_batch_to_multiple(
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    attention_mask: torch.Tensor = None,
+    multiple: int = 128,
+    pad_token_id: int = 0,
+):
+    """Pad sequence length to a chunk multiple so torch.compile sees stable shapes."""
+    multiple = int(multiple or 0)
+    if multiple <= 1 or input_ids.ndim != 2 or labels.ndim != 2:
+        return input_ids, labels, attention_mask
+    T = input_ids.shape[1]
+    target_T = int(math.ceil(T / multiple) * multiple)
+    pad_cols = target_T - T
+    if pad_cols <= 0:
+        return input_ids, labels, attention_mask
+
+    ids_pad = input_ids.new_full((input_ids.shape[0], pad_cols), int(pad_token_id))
+    label_pad = labels.new_full((labels.shape[0], pad_cols), -100)
+    input_ids = torch.cat([input_ids, ids_pad], dim=1).contiguous()
+    labels = torch.cat([labels, label_pad], dim=1).contiguous()
+    if attention_mask is not None:
+        mask_pad = attention_mask.new_zeros((attention_mask.shape[0], pad_cols))
+        attention_mask = torch.cat([attention_mask, mask_pad], dim=1).contiguous()
+    return input_ids, labels, attention_mask
+
+def set_dataloader_epoch(dataloader, epoch: int):
+    """Let length-grouped or distributed samplers reshuffle per epoch."""
+    for sampler in (
+        getattr(dataloader, "batch_sampler", None),
+        getattr(dataloader, "sampler", None),
+        getattr(dataloader, "dataset", None),
+    ):
+        set_epoch = getattr(sampler, "set_epoch", None)
+        if callable(set_epoch):
+            set_epoch(epoch)
+
+def should_update_progress(step: int, args, total_steps: int = None, first_step: int = 0) -> bool:
+    """Throttle CUDA-to-CPU metric syncs caused by progress-bar scalar logging."""
+    interval = max(1, int(getattr(args, 'progress_log_steps', 10) or 1))
+    return (
+        step == first_step
+        or (step + 1) % interval == 0
+        or (total_steps is not None and (step + 1) >= int(total_steps))
+    )
+
+def _state_to_cpu(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().clone()
+    if isinstance(value, tuple):
+        return tuple(_state_to_cpu(item) for item in value)
+    if isinstance(value, list):
+        return [_state_to_cpu(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _state_to_cpu(item) for key, item in value.items()}
+    return value
+
+def _state_to_device(value, device):
+    if isinstance(value, torch.Tensor):
+        return value.to(device)
+    if isinstance(value, tuple):
+        return tuple(_state_to_device(item, device) for item in value)
+    if isinstance(value, list):
+        return [_state_to_device(item, device) for item in value]
+    if isinstance(value, dict):
+        return {key: _state_to_device(item, device) for key, item in value.items()}
+    return value
+
+def capture_model_grad_state(model):
+    grad_state = {}
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            grad_state[name.replace("_orig_mod.", "")] = param.grad.detach().cpu().clone()
+    return grad_state or None
+
+def restore_model_grad_state(model, grad_state, device):
+    if not grad_state:
+        return False
+    restored = 0
+    clean_grad_state = {str(k).replace("_orig_mod.", ""): v for k, v in grad_state.items()}
+    for name, param in model.named_parameters():
+        clean_name = name.replace("_orig_mod.", "")
+        grad = clean_grad_state.get(clean_name)
+        if grad is None:
+            continue
+        param.grad = grad.to(device=device, dtype=param.dtype)
+        restored += 1
+    if restored:
+        print(f"INFO: Restored {restored} pending gradient tensor(s) for accumulation parity.")
+    return restored > 0
+
+def capture_rng_state():
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.random.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        try:
+            state["cuda_all"] = torch.cuda.get_rng_state_all()
+        except Exception:
+            pass
+    return state
+
+def restore_rng_state(state):
+    if not state:
+        return
+    try:
+        if "python" in state:
+            random.setstate(state["python"])
+        if "numpy" in state:
+            np.random.set_state(state["numpy"])
+        if "torch" in state:
+            torch.random.set_rng_state(state["torch"])
+        if torch.cuda.is_available() and "cuda_all" in state:
+            torch.cuda.set_rng_state_all(state["cuda_all"])
+        print("INFO: Restored RNG state from checkpoint.")
+    except Exception as exc:
+        print(f"Warning: Could not restore RNG state: {exc}")
+
+def _capture_loader_component_state(component):
+    if component is None:
+        return None
+    state = {"class": component.__class__.__name__}
+    found = False
+    for attr in ("seed", "epoch"):
+        if hasattr(component, attr):
+            try:
+                state[attr] = int(getattr(component, attr))
+                found = True
+            except Exception:
+                pass
+    generator = getattr(component, "generator", None)
+    if isinstance(generator, torch.Generator):
+        try:
+            state["generator_state"] = generator.get_state()
+            found = True
+        except Exception:
+            pass
+    return state if found else None
+
+def capture_dataloader_state(dataloader):
+    if dataloader is None:
+        return None
+    state = {}
+    for name in ("batch_sampler", "sampler", "dataset"):
+        component_state = _capture_loader_component_state(getattr(dataloader, name, None))
+        if component_state:
+            state[name] = component_state
+    return state or None
+
+def _restore_loader_component_state(component, state):
+    if component is None or not state:
+        return
+    for attr in ("seed", "epoch"):
+        if attr in state and hasattr(component, attr):
+            try:
+                setattr(component, attr, int(state[attr]))
+            except Exception:
+                pass
+    generator = getattr(component, "generator", None)
+    if isinstance(generator, torch.Generator) and "generator_state" in state:
+        try:
+            generator.set_state(state["generator_state"])
+        except Exception:
+            pass
+
+def restore_dataloader_state(dataloader, state):
+    if dataloader is None or not state:
+        return
+    for name in ("batch_sampler", "sampler", "dataset"):
+        _restore_loader_component_state(getattr(dataloader, name, None), state.get(name))
+    print("INFO: Restored dataloader sampler state from checkpoint.")
+
+def build_training_checkpoint(
+    model,
+    optimizer,
+    scheduler,
+    scaler,
+    args,
+    dataloader,
+    completed_epoch: int,
+    mid_epoch_step: int = 0,
+    running_states=None,
+):
+    _sanitize_model_nonfinite_(model, log_prefix="pre-checkpoint model")
+    _clamp_model_finite_magnitude_(
+        model,
+        getattr(args, 'startup_weight_max_abs', 100.0),
+        log_prefix="pre-checkpoint model",
+    )
+    grad_state = capture_model_grad_state(model)
+    checkpoint = {
+        "checkpoint_version": 2,
+        "checkpoint_kind": "training",
+        "completed_epoch": int(completed_epoch),
+        "mid_epoch_step": int(mid_epoch_step or 0),
+        "model_state_dict": sanitize_model_state_dict(model, reset_transient_ltm=False),
+        "optimizer_state_dict": optimizer.state_dict() if optimizer else None,
+        "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
+        "scaler_state_dict": scaler.state_dict() if scaler else None,
+        "config": dict(model.config),
+        "rng_state": capture_rng_state(),
+        "data_state": capture_dataloader_state(dataloader),
+        "grad_state_dict": grad_state,
+        "grad_accumulation_active": bool(grad_state),
+        "ltm_scheduler_state": capture_ltm_lr_scheduler_state(args),
+        "training_complete": False,
+    }
+    if running_states is not None:
+        checkpoint["running_states"] = _state_to_cpu(running_states)
+    return checkpoint
+
+def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, running_states, collect_metrics=True):
+    """Training step with temporal chunking to match original hierarchos.py."""
+    args._optimizer_step_was_taken = False
+    args._train_step_had_backward = False
+    args._train_step_had_nonfinite = False
+    device = next(model.parameters()).device
+    set_model_training_step(model, getattr(args, '_current_global_step', step))
     _nb = (device.type == 'cuda')  # non_blocking for async CUDA transfer
-    full_input_ids = cpu_input_ids.to(device, non_blocking=_nb)
-    full_attention_mask = cpu_attention_mask
-    if full_attention_mask is not None: full_attention_mask = full_attention_mask.to(device, non_blocking=_nb)
-    full_labels = cpu_labels.to(device, non_blocking=_nb)
+    full_input_ids = batch['input_ids']
+    full_attention_mask = batch.get('attention_mask')
+    full_labels = batch['labels']
+    full_rosa_ids = batch.get('rosa_ids')
+    full_input_ids, full_labels, full_attention_mask = trim_trailing_padding(
+        full_input_ids, full_labels, full_attention_mask
+    )
+    if full_rosa_ids is not None:
+        full_rosa_ids = full_rosa_ids[:, :full_input_ids.shape[1]].contiguous()
+    chunk_size = getattr(args, 'training_chunk_size', 128)
+    padding_metric_steps = int(getattr(args, 'padding_metric_steps', 0) or 0)
+    collect_padding_metrics = (
+        collect_metrics
+        and bool(getattr(args, 'padding_metrics', True))
+        and (padding_metric_steps < 0 or step < padding_metric_steps)
+    )
+    padding_stats = None
+    if collect_padding_metrics:
+        pre_static_tokens = int(full_input_ids.numel())
+        pre_static_seq_len = int(full_input_ids.shape[1]) if full_input_ids.ndim == 2 else 0
+        if isinstance(full_attention_mask, torch.Tensor):
+            real_tokens = int(full_attention_mask.sum().item())
+        else:
+            real_tokens = pre_static_tokens
+    if (
+        device.type == 'cuda'
+        and getattr(args, 'compile', False)
+        and getattr(args, 'compile_pad_to_chunk_size', True)
+    ):
+        pre_pad_seq_len = full_input_ids.shape[1]
+        full_input_ids, full_labels, full_attention_mask = pad_training_batch_to_multiple(
+            full_input_ids,
+            full_labels,
+            full_attention_mask,
+            multiple=chunk_size,
+            pad_token_id=getattr(args, 'pad_token_id', 0),
+        )
+        if full_rosa_ids is not None and full_input_ids.shape[1] > pre_pad_seq_len:
+            pad_cols = full_input_ids.shape[1] - pre_pad_seq_len
+            rosa_sentinel = int(getattr(model.config, 'vocab_size', getattr(args, 'vocab_size', 0)))
+            rosa_pad = full_rosa_ids.new_full((full_rosa_ids.shape[0], pad_cols), rosa_sentinel)
+            full_rosa_ids = torch.cat([full_rosa_ids, rosa_pad], dim=1).contiguous()
+    if collect_padding_metrics:
+        total_tokens = int(full_input_ids.numel())
+        padded_seq_len = int(full_input_ids.shape[1]) if full_input_ids.ndim == 2 else 0
+        padding_tokens = max(0, total_tokens - real_tokens)
+        padding_stats = {
+            "token_efficiency": real_tokens / float(max(1, total_tokens)),
+            "padding_fraction": padding_tokens / float(max(1, total_tokens)),
+            "bucket_padding_tokens": max(0, pre_static_tokens - real_tokens),
+            "compile_padding_tokens": max(0, total_tokens - pre_static_tokens),
+            "seq_len": padded_seq_len,
+            "pre_static_seq_len": pre_static_seq_len,
+        }
     
     # --- [NEW] Track Sequence Poisoning (Parity Fix) ---
-    if torch.isnan(full_labels.float()).any():
+    if full_labels.is_floating_point() and torch.isnan(full_labels).any():
         print(f"\nCRITICAL: NaNs detected in labels at step {step}! Skipping batch.")
         optimizer.zero_grad(set_to_none=True)
         return None, running_states
     # --------------------------------------------------
     
+    B, T = full_input_ids.shape
     h_state, l_state, prev_ctx, target_ctx, drift_state, ltm_state = running_states
     
     autocast_device = 'cpu' if is_directml_device(device) else device.type
@@ -151,12 +983,29 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
         if drift_state is not None: drift_state = drift_state.detach()
         if ltm_state is not None: 
             ltm_state = tuple(s.detach() if isinstance(s, torch.Tensor) else s for s in ltm_state)
+
+    # Temporal chunking (critical for RWKV-based models). Build this on CPU before
+    # moving labels/masks to CUDA so per-chunk .item() accounting does not sync GPU.
+    if chunk_size <= 0 or chunk_size > T: chunk_size = T
+    chunk_plan = compute_chunk_training_weights(full_labels, full_attention_mask, chunk_size)
+    num_chunks = len(chunk_plan)
+
+    full_input_ids = full_input_ids.to(device, non_blocking=_nb)
+    if full_attention_mask is not None: full_attention_mask = full_attention_mask.to(device, non_blocking=_nb)
+    full_labels = full_labels.to(device, non_blocking=_nb)
+    if full_rosa_ids is not None: full_rosa_ids = full_rosa_ids.to(device, non_blocking=_nb)
     
-    total_loss = 0.0
-    total_ponder = 0.0
-    total_commit = 0.0
+    total_loss = torch.zeros((), device=device, dtype=torch.float32)
+    total_ponder = torch.zeros((), device=device, dtype=torch.float32)
+    total_commit = torch.zeros((), device=device, dtype=torch.float32)
+    has_ponder = False
+    has_commitment = False
     chunks_processed = 0
     final_outputs = None
+    fast_lm_loss = (
+        (device.type == 'cuda' and getattr(args, 'cuda_chunked_lm_loss', True))
+        or (device.type == 'cpu' and getattr(args, 'cpu_chunked_lm_loss', True))
+    )
     
     try:
         for chunk_idx, chunk_info in enumerate(chunk_plan):
@@ -175,13 +1024,17 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
             input_ids = full_input_ids[:, start_t:end_t]
             attention_mask = full_attention_mask[:, start_t:end_t] if full_attention_mask is not None else None
             labels = full_labels[:, start_t:end_t]
+            rosa_ids = full_rosa_ids[:, start_t:end_t] if full_rosa_ids is not None else None
             
             with autocast(device_type=autocast_device, dtype=amp_dtype, enabled=args.amp):
                 outputs = model(
                     input_ids=input_ids, attention_mask=attention_mask, labels=labels,
                     h_state=h_state, l_state=l_state, prev_context=prev_ctx,
                     target_context=target_ctx, drift_state=drift_state, ltm_memory_state=ltm_state,
-                    global_pos_offset=start_t
+                    global_pos_offset=start_t,
+                    return_logits=not fast_lm_loss,
+                    return_topk_values=False,
+                    rosa_ids=rosa_ids,
                 )
                 
                 # LTM fast-memory update needs gradients from the exact tensors used
@@ -195,44 +1048,87 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                 ce_loss = outputs['loss']
                 ponder_cost = outputs.get('ponder_cost')
                 commitment_cost = outputs.get('commitment_cost')
+
+                ce_valid = _component_is_finite(ce_loss)
+                ponder_valid = ponder_cost is None or _component_is_finite(ponder_cost)
+                commitment_valid = commitment_cost is None or _component_is_finite(commitment_cost)
+                if not (ce_valid and ponder_valid and commitment_valid):
+                    print(
+                        f"\nCRITICAL: Non-finite training loss at step {step+1}, "
+                        f"chunk {chunk_idx} ({start_t}:{end_t})."
+                    )
+                    if not ce_valid and ce_loss is not None:
+                        print("  " + _describe_tensor_issue("cross_entropy_loss", ce_loss))
+                    if not ponder_valid and ponder_cost is not None:
+                        print("  " + _describe_tensor_issue("ponder_cost", ponder_cost))
+                    if not commitment_valid and commitment_cost is not None:
+                        print("  " + _describe_tensor_issue("commitment_cost", commitment_cost))
+                    print("  Skipping this batch and clearing recurrent/LTM state before it can poison optimizer state.")
+                    args._train_step_had_nonfinite = True
+                    return None, _reset_after_nonfinite(optimizer, model)
+
+                ce_loss_for_backward = _cap_loss_component_for_backward(
+                    ce_loss,
+                    getattr(args, 'max_ce_loss_for_backward', 10.0),
+                )
                 
                 aux_loss = torch.zeros_like(ce_loss)
                 
                 # --- ACT Sensitivity: Adaptive Ponder Loss ---
                 if ponder_cost is not None:
                     ponder_weight = getattr(args, 'ponder_loss_weight', 0.01)
+                    ponder_cost_for_backward = _cap_loss_component_for_backward(
+                        ponder_cost,
+                        getattr(args, 'max_ponder_cost_for_backward', 0.0),
+                    )
                     
                     if getattr(args, 'encourage_thinking', False):
                         # RECOVERY MODE: Invert ponder penalty to REWARD thinking
                         # Negative weight means higher ponder = lower loss
-                        aux_loss = aux_loss - (abs(ponder_weight) * ponder_cost)
+                        aux_loss = aux_loss - (abs(ponder_weight) * ponder_cost_for_backward)
                     elif getattr(args, 'adaptive_ponder', False):
                         # ADAPTIVE MODE: Scale ponder target with loss
                         # Higher CE loss = more thinking needed
                         max_h_steps = getattr(args, 'max_h_steps', 5)
                         target_scale = getattr(args, 'ponder_target_scale', 0.5)
                         target_ponder = torch.clamp(ce_loss.detach() * target_scale, min=1.0, max=float(max_h_steps))
-                        ponder_diff = target_ponder - ponder_cost
+                        ponder_diff = target_ponder - ponder_cost_for_backward
                         # Penalize under-thinking (when ponder < target), ignore over-thinking
                         ponder_penalty = torch.relu(ponder_diff) * ponder_weight
                         aux_loss = aux_loss + ponder_penalty
                     else:
                         # STANDARD MODE: Original additive penalty (penalizes thinking)
-                        aux_loss = aux_loss + (ponder_weight * ponder_cost)
+                        aux_loss = aux_loss + (ponder_weight * ponder_cost_for_backward)
                 
                 if commitment_cost is not None:
-                    aux_loss = aux_loss + (getattr(args, 'commitment_loss_weight', 0.5) * commitment_cost)
+                    commitment_cost_for_backward = _cap_loss_component_for_backward(
+                        commitment_cost,
+                        getattr(args, 'max_commitment_cost_for_backward', 2.0),
+                    )
+                    aux_loss = aux_loss + (getattr(args, 'commitment_loss_weight', 0.5) * commitment_cost_for_backward)
 
                 # CE is already averaged over valid labels within this chunk.
                 # Weight it by supervised answer-token count so long masked
                 # prompts/tool traces do not dilute the actual learning signal.
-                chunk_loss = ((ce_loss * label_ratio) + (aux_loss * token_ratio)) / accumulation_steps
+                chunk_loss = ((ce_loss_for_backward * label_ratio) + (aux_loss * token_ratio)) / accumulation_steps
+
+                chunk_loss_valid = _component_is_finite(chunk_loss)
+                if not chunk_loss_valid:
+                    print(
+                        f"\nCRITICAL: Non-finite training loss at step {step+1}, "
+                        f"chunk {chunk_idx} ({start_t}:{end_t})."
+                    )
+                    print("  " + _describe_tensor_issue("chunk_loss", chunk_loss))
+                    print("  Skipping this batch and clearing recurrent/LTM state before it can poison optimizer state.")
+                    args._train_step_had_nonfinite = True
+                    return None, _reset_after_nonfinite(optimizer, model)
             
             # Backprop per chunk (TBPTT)
             # retain_grad() is now handled inside autocast block above (BUG #1 fix)
 
             if scaler is not None: scaler.scale(chunk_loss).backward()
             else: chunk_loss.backward()
+            args._train_step_had_backward = True
             
             # --- GRADIENT-BASED LTM UPDATE (Titans Parity) ---
             if outputs.get("raw_topk_vals") is not None:
@@ -255,15 +1151,20 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                     for t_val in outputs["raw_topk_vals"]:
                         t_val.grad = None
                     outputs["raw_topk_vals"] = None  # Free tensor references (BUG #3: memory leak fix)
+                    _clip_val = _positive_float(getattr(args, 'grad_clip', 1.0), 1.0)
+                    ltm_grads_tensor = torch.nan_to_num(ltm_grads_tensor, nan=0.0, posinf=_clip_val, neginf=-_clip_val)
+                    ltm_grads_tensor.clamp_(min=-_clip_val, max=_clip_val)
 
-                    if torch.isfinite(ltm_grads_tensor).all():
+                    if ltm_grads_tensor is not None:
                         # Direct tensor clipping (clip_grad_norm_ expects parameters with .grad,
                         # but ltm_grads_tensor IS the gradient data itself — no .grad attribute)
-                        _clip_val = getattr(args, 'grad_clip', 1.0)
                         if _clip_val > 0:
-                            _grad_norm = ltm_grads_tensor.norm()
-                            if _grad_norm > _clip_val:
-                                ltm_grads_tensor = ltm_grads_tensor * (_clip_val / (_grad_norm + 1e-8))
+                            _grad_norm = ltm_grads_tensor.float().norm()
+                            _clip_coef = torch.clamp(
+                                ltm_grads_tensor.new_tensor(float(_clip_val)) / (_grad_norm + 1e-8),
+                                max=1.0,
+                            )
+                            ltm_grads_tensor = ltm_grads_tensor * _clip_coef
                         
                         # Unpack current LTM state for the update
                         curr_ltm = outputs.get('ltm_memory_state')
@@ -279,7 +1180,7 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                         new_fast, new_mom = model.ltm.inner_update(
                             outputs["topk_idx"],
                             ltm_grads_tensor,
-                            current_lr=getattr(args, 'ltm_lr', 0.001),
+                            current_lr=get_current_ltm_lr(args),
                             source=2, # SRC_TRAINING_DATA
                             timestamp=float(end_t),
                             tokens_covered=end_t - start_t,
@@ -312,23 +1213,28 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                                  curr_ltm[5].detach() if len(curr_ltm) >= 6 and isinstance(curr_ltm[5], torch.Tensor) else None)
 
             # Update states for next chunk (TBPTT - detach to limit gradient flow)
+            recurrent_state_clamp = getattr(args, 'recurrent_state_clamp', 50.0)
+            context_state_clamp = getattr(args, 'context_state_clamp', 50.0)
+            drift_state_clamp = getattr(args, 'drift_state_clamp', 5.0)
             if outputs.get('h_state') is not None:
-                h_state = torch.clamp(outputs['h_state'].detach(), min=-50.0, max=50.0)
+                h_state = _detach_finite_clamp(outputs['h_state'], recurrent_state_clamp)
             if outputs.get('l_state') is not None:
-                l_state = torch.clamp(outputs['l_state'].detach(), min=-50.0, max=50.0)
+                l_state = _detach_finite_clamp(outputs['l_state'], recurrent_state_clamp)
             if outputs.get('prev_context') is not None:
-                prev_ctx = torch.clamp(outputs['prev_context'].detach(), min=-50.0, max=50.0)
+                prev_ctx = _detach_finite_clamp(outputs['prev_context'], context_state_clamp)
             if outputs.get('target_context') is not None:
-                target_ctx = torch.clamp(outputs['target_context'].detach(), min=-50.0, max=50.0)
+                target_ctx = _detach_finite_clamp(outputs['target_context'], context_state_clamp)
             if outputs.get('drift_state') is not None:
-                drift_state = torch.clamp(outputs['drift_state'].detach(), min=-5.0, max=5.0)
+                drift_state = _detach_finite_clamp(outputs['drift_state'], drift_state_clamp)
             
             # Accumulate for display
-            total_loss += ce_loss.item() * label_ratio
+            total_loss = total_loss + ce_loss.detach().float() * label_ratio
             if ponder_cost is not None: 
-                total_ponder += ponder_cost.item() * token_ratio
+                total_ponder = total_ponder + ponder_cost.detach().float() * token_ratio
+                has_ponder = True
             if commitment_cost is not None: 
-                total_commit += commitment_cost.item() * token_ratio
+                total_commit = total_commit + commitment_cost.detach().float() * token_ratio
+                has_commitment = True
             
             chunks_processed += 1
             # final_outputs = outputs # REMOVED: Memory Leak Fix
@@ -337,24 +1243,39 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
         if (step + 1) % accumulation_steps == 0:
             if scaler is not None:
                 scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(model.parameters(), getattr(args, 'grad_clip', 1.0))
+                grads_ok, grad_issue = _clip_gradients_and_check(model, getattr(args, 'grad_clip', 1.0))
+                if not grads_ok:
+                    print(f"\nCRITICAL: Non-finite gradient at step {step+1}. {grad_issue}")
+                    print("  Skipping optimizer step and clearing accumulated gradients.")
+                    args._train_step_had_nonfinite = True
+                    return None, _reset_after_nonfinite(optimizer, model)
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                nn.utils.clip_grad_norm_(model.parameters(), getattr(args, 'grad_clip', 1.0))
+                grads_ok, grad_issue = _clip_gradients_and_check(model, getattr(args, 'grad_clip', 1.0))
+                if not grads_ok:
+                    print(f"\nCRITICAL: Non-finite gradient at step {step+1}. {grad_issue}")
+                    print("  Skipping optimizer step and clearing accumulated gradients.")
+                    args._train_step_had_nonfinite = True
+                    return None, _reset_after_nonfinite(optimizer, model)
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+            args._optimizer_step_was_taken = True
         
         if chunks_processed == 0:
             return None, running_states
             
-        # Return averaged metrics for display
-        # Since we already weighted by chunk_ratio, these are correct averages
-        avg_outputs = {
-            'loss': torch.tensor(total_loss),
-            'ponder_cost': torch.tensor(total_ponder) if total_ponder > 0 else None,
-            'commitment_cost': torch.tensor(total_commit) if total_commit > 0 else None,
-        }
+        avg_outputs = None
+        if collect_metrics:
+            # Keep scalars on-device until the throttled progress update calls
+            # .item(); doing this every batch forces a CUDA sync on fast GPUs.
+            avg_outputs = {
+                'loss': total_loss.detach(),
+                'ponder_cost': total_ponder.detach() if has_ponder else None,
+                'commitment_cost': total_commit.detach() if has_commitment else None,
+            }
+            if padding_stats is not None:
+                avg_outputs.update(padding_stats)
         
         next_states = (h_state, l_state, prev_ctx, target_ctx, drift_state, ltm_state)
         return avg_outputs, next_states
@@ -377,6 +1298,21 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     if getattr(args, 'out_dir', None):
         os.makedirs(args.out_dir, exist_ok=True)
     config = AttrDict(vars(args))
+
+    prompt_completion_mode = (
+        getattr(args, 'alpaca', False)
+        or getattr(args, 'kayla', False)
+        or bool(getattr(args, 'prompt_column', None))
+        or bool(getattr(args, 'completion_column', None))
+    )
+    if prompt_completion_mode and not getattr(args, 'train_prompt_tokens', True):
+        print(
+            "WARNING: Prompt/instruction tokens are masked from CE loss. With TBPTT "
+            f"chunks of {getattr(args, 'training_chunk_size', 128)} and recurrent detach "
+            f"every {getattr(args, 'detach_every_n_steps', 32)} tokens, long prompt-only "
+            "chunks may not receive semantic answer-loss gradients. Use "
+            "--train-prompt-tokens if you want prompt tokens included in the LM objective."
+        )
 
     # Device stability
     if is_directml_device(device):
@@ -432,6 +1368,22 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
             config.amp_dtype = 'float16'
             print("INFO: Using float16 AMP with GradScaler.")
 
+        if getattr(args, 'cuda_chunked_lm_loss', True):
+            loss_chunk_rows = int(getattr(args, 'cuda_loss_chunk_rows', 0) or 0)
+            if loss_chunk_rows <= 0:
+                args._auto_cuda_loss_chunk_rows = True
+                config.cuda_loss_chunk_rows = 0
+                print("INFO: CUDA chunked LM loss enabled (startup auto rows from free VRAM and batch shape).")
+            else:
+                args._auto_cuda_loss_chunk_rows = False
+                config.cuda_loss_chunk_rows = loss_chunk_rows
+                print(f"INFO: CUDA chunked LM loss enabled ({loss_chunk_rows} fixed rows/chunk, logits omitted in train_step).")
+            config.cuda_loss_chunk_rows = loss_chunk_rows
+            config.cuda_chunked_lm_loss = True
+        else:
+            args._auto_cuda_loss_chunk_rows = False
+            config.cuda_chunked_lm_loss = False
+
         # Multi-GPU info
         num_gpus = torch.cuda.device_count()
         if num_gpus > 1:
@@ -441,11 +1393,17 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     model = None
     optimizer = None
     start_epoch = 0
+    start_step = 0
     scaler = None
     scheduler = None
     checkpoint = None
     # NOTE: use_amp MUST be read AFTER the CUDA block above, which may auto-enable AMP.
     use_amp = getattr(args, 'amp', False)
+    epoch_offset = (
+        int(getattr(args, 'base_completed_epoch', 0) or 0)
+        if getattr(args, 'model_path', None) and not getattr(args, 'resume_from_ckpt', None)
+        else 0
+    )
     
     # 1. Loading/Resuming Logic
     if args.resume_from_ckpt:
@@ -455,6 +1413,18 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         saved_config = checkpoint.get('config', {})
         model_config = AttrDict(saved_config)
         state_dict = sanitize_model_state_dict(checkpoint['model_state_dict'], reset_transient_ltm=False)
+        _reject_unsupported_rwkv_state_dict(state_dict, args.resume_from_ckpt)
+        load_cleaned = _sanitize_payload_nonfinite_(
+            state_dict,
+            "model_state_dict",
+            max_abs=getattr(args, 'grad_clip', 1.0),
+        )
+        if load_cleaned:
+            print(
+                f"WARNING: Sanitized {load_cleaned} non-finite checkpoint model_state_dict "
+                "value(s) before loading. Future checkpoints will be saved clean."
+            )
+        checkpoint['model_state_dict'] = state_dict
         
         # ARCH Detection (Safely handling compiled checkpoints with '_orig_mod.' prefix)
         state_dict_keys = set()
@@ -485,20 +1455,21 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
             key = 'qproj.weight' if 'qproj.weight' in state_dict else '_orig_mod.qproj.weight'
             model_config.ltm_key_dim = state_dict[key].shape[0]
 
-        # 4. Detect RNN hidden sizes (RWKV-style states)
-        if 'h_rnn.time_decay' in state_dict_keys:
-            key = 'h_rnn.time_decay' if 'h_rnn.time_decay' in state_dict else '_orig_mod.h_rnn.time_decay'
-            model_config.h_hidden = state_dict[key].shape[-1]
-        if 'l_rnn.time_decay' in state_dict_keys:
-            key = 'l_rnn.time_decay' if 'l_rnn.time_decay' in state_dict else '_orig_mod.l_rnn.time_decay'
-            model_config.l_hidden = state_dict[key].shape[-1]
+        # 4. Detect RNN hidden sizes and RWKV matrix-state head geometry.
+        if 'h_rnn.key.weight' in state_dict_keys:
+            model_config.h_hidden = state_dict['h_rnn.key.weight'].shape[0]
+        if 'l_rnn.key.weight' in state_dict_keys:
+            model_config.l_hidden = state_dict['l_rnn.key.weight'].shape[0]
+        if 'h_rnn.r_k' in state_dict_keys:
+            model_config.rwkv_head_size = state_dict['h_rnn.r_k'].shape[1]
 
         # ARCH defaults / Fallbacks
         arch_defaults = {
             'ltm_slots': 1024, 'ltm_key_dim': 128, 'ltm_val_dim': 128, 'ltm_topk': 4,
             'h_stride': 4, 'max_h_steps': 5, 'max_l_steps': 5,
-            'h_hidden': model_config.get('context_dim', 768),
-            'l_hidden': model_config.get('context_dim', 768)
+            'h_hidden': model_config.get('context_dim', 448),
+            'l_hidden': model_config.get('context_dim', 448),
+            'rwkv_head_size': getattr(args, 'rwkv_head_size', None),
         }
         for k, v in arch_defaults.items():
             if k not in model_config:
@@ -507,6 +1478,9 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         # Runtime overrides
         model_config.compile = args.compile
         model_config.max_length = args.max_length or model_config.get('max_length', 1024)
+        model_config.ltm_lr = getattr(args, 'ltm_lr', model_config.get('ltm_lr', 1e-3))
+        model_config.min_ltm_lr = getattr(args, 'min_ltm_lr', model_config.get('min_ltm_lr', None))
+        model_config.disable_ltm_lr_schedule = getattr(args, 'disable_ltm_lr_schedule', False)
 
         print(f"INFO: Final Adjusted ARCH: context_dim={model_config.context_dim}, persistent={model_config.get('persistent_dim', 128)}, ltm_val={model_config.get('ltm_val_dim', 128)}, h_hidden={model_config.h_hidden}, l_hidden={model_config.l_hidden}, vocab_size={model_config.vocab_size}")
         
@@ -519,6 +1493,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                 print(f"WARNING: Missing keys in checkpoint: {missing[:5]}{'...' if len(missing) > 5 else ''}")
             if unexpected:
                 print(f"WARNING: Unexpected keys in checkpoint: {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
+            _reject_rwkv_load_mismatch(missing, unexpected, args.resume_from_ckpt)
             if not missing and not unexpected:
                 print(f"INFO: Model state_dict loaded perfectly ({len(state_dict)} parameters).")
         except RuntimeError as e:
@@ -537,17 +1512,29 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                 else:
                     print("WARNING: h_halt_proj.bias not found, surgical fix skipped.")
         
-        if is_directml_device(device): optimizer = DirectMLAdamW(model.parameters(), lr=args.starting_lr)
-        elif device.type == 'cuda': optimizer = torch.optim.AdamW(model.parameters(), lr=args.starting_lr, fused=True)
-        else: optimizer = torch.optim.AdamW(model.parameters(), lr=args.starting_lr)
+        optimizer = build_hierarchos_optimizer(model, args, device)
         
         if not getattr(args, 'override_scheduling', False) and 'optimizer_state_dict' in checkpoint:
             try: optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             except: print("Warning: Could not load optimizer state.")
         
-        # Original script uses 'completed_epoch', modular uses 'epoch', check both for compatibility
-        start_epoch = checkpoint.get('completed_epoch', checkpoint.get('epoch', 0))
-        print(f"Successfully loaded model state. Resuming from epoch {start_epoch + 1}.")
+        # Original script uses 'completed_epoch', modular uses 'epoch', check both for compatibility.
+        start_epoch = int(checkpoint.get('completed_epoch', checkpoint.get('epoch', 0)) or 0)
+        start_step = int(checkpoint.get('mid_epoch_step', 0) or 0)
+        if start_step >= dataloader_len:
+            start_epoch += 1
+            start_step = 0
+        if start_epoch >= int(getattr(args, 'epochs', 0) or 0):
+            raise ValueError(
+                f"Checkpoint is already at completed_epoch={start_epoch}, but --epochs={args.epochs}. "
+                "--epochs is the total target epoch for --resume-from-ckpt; use a larger value "
+                "(for example 14 after an epoch-11 checkpoint for three more epochs), or use "
+                "--model-path for a three-epoch continuation from an inference export."
+            )
+        if start_step > 0:
+            print(f"Successfully loaded model state. Resuming from epoch {start_epoch + 1}, step {start_step}.")
+        else:
+            print(f"Successfully loaded model state. Resuming from epoch {start_epoch + 1}.")
         # BFloat16 does NOT use GradScaler — its dynamic range makes scaling unnecessary.
         # Only create scaler for float16 AMP.
         if use_amp and getattr(config, 'amp_dtype', 'float16') == 'float16':
@@ -559,12 +1546,34 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     elif args.model_path:
         print(f"Loading base model from: {args.model_path}")
         model, model_config = load_full_model_with_config(args.model_path, device)
+        loaded_config = dict(model_config)
+        runtime_config = AttrDict(loaded_config)
+        runtime_config.update(dict(config))
+        for key in (
+            'vocab_size',
+            'context_dim',
+            'persistent_dim',
+            'ltm_slots',
+            'ltm_key_dim',
+            'ltm_val_dim',
+            'ltm_topk',
+            'h_hidden',
+            'l_hidden',
+            'h_stride',
+            'max_h_steps',
+            'max_l_steps',
+            'use_deepembed',
+            'use_rosa',
+            'rosa_max_context',
+            'rwkv_head_size',
+        ):
+            if key in loaded_config:
+                runtime_config[key] = loaded_config[key]
+        model_config = runtime_config
         model_config.compile = args.compile
         model.config = model_config
         
-        if is_directml_device(device): optimizer = DirectMLAdamW(model.parameters(), lr=args.starting_lr)
-        elif device.type == 'cuda': optimizer = torch.optim.AdamW(model.parameters(), lr=args.starting_lr, fused=True)
-        else: optimizer = torch.optim.AdamW(model.parameters(), lr=args.starting_lr)
+        optimizer = build_hierarchos_optimizer(model, args, device)
         
         if use_amp and getattr(config, 'amp_dtype', 'float16') == 'float16': scaler = GradScaler()
     
@@ -572,9 +1581,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         print("Starting training from scratch.")
         if 'vocab_size' not in config: config.vocab_size = len(tokenizer)
         model = HierarchosCore(config).to(device)
-        if is_directml_device(device): optimizer = DirectMLAdamW(model.parameters(), lr=args.starting_lr)
-        elif device.type == 'cuda': optimizer = torch.optim.AdamW(model.parameters(), lr=args.starting_lr, fused=True)
-        else: optimizer = torch.optim.AdamW(model.parameters(), lr=args.starting_lr)
+        optimizer = build_hierarchos_optimizer(model, args, device)
         if use_amp and getattr(config, 'amp_dtype', 'float16') == 'float16': scaler = GradScaler()
 
     # --- [NEW] Sync LTM reference chunk size (Parity Fix) ---
@@ -586,6 +1593,11 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         if model.ltm.reference_chunk_len != training_chunk_size:
             print(f"INFO: Updating LTM reference chunk length from {model.ltm.reference_chunk_len} to {training_chunk_size}")
             model.ltm.reference_chunk_len = training_chunk_size
+        model.ltm.cpu_gather_retrieval = bool(getattr(args, 'ltm_cpu_gather_retrieval', True))
+        model.ltm.cpu_sparse_update = bool(getattr(args, 'ltm_cpu_sparse_update', True))
+    if hasattr(model, 'config'):
+        model.config.cpu_chunked_lm_loss = bool(getattr(args, 'cpu_chunked_lm_loss', True))
+        model.config.cpu_loss_chunk_rows = int(getattr(args, 'cpu_loss_chunk_rows', 0) or 0)
     # ----------------------------------------------------
 
     # --- Print Model Stats ---
@@ -603,8 +1615,12 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
 
     # Compile
     model.compile()
-
-    start_step = checkpoint.get('mid_epoch_step', 0) if checkpoint else 0
+    tune_cuda_loss_chunk_rows_once(
+        model,
+        args,
+        batch_size=getattr(args, 'batch_size', 1),
+        chunk_size=getattr(args, 'training_chunk_size', 128),
+    )
 
     # Scheduler
     # When override_scheduling is used during resume, calculate T_max based on REMAINING epochs
@@ -626,6 +1642,48 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         if args.resume_from_ckpt and not getattr(args, 'override_scheduling', False) and 'scheduler_state_dict' in checkpoint:
             try: scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             except: pass
+    configure_ltm_lr_schedule(
+        args,
+        num_update_steps,
+        checkpoint=checkpoint,
+        override_schedule=bool(getattr(args, 'override_scheduling', False)),
+        scheduler=scheduler,
+    )
+    if hasattr(model, 'config'):
+        model.config.ltm_lr = getattr(args, 'ltm_lr', getattr(model.config, 'ltm_lr', 1e-3))
+        model.config.min_ltm_lr = getattr(args, 'min_ltm_lr', getattr(model.config, 'min_ltm_lr', None))
+        model.config.disable_ltm_lr_schedule = getattr(args, 'disable_ltm_lr_schedule', False)
+    if checkpoint:
+        restore_dataloader_state(dataloader, checkpoint.get('data_state'))
+        restore_rng_state(checkpoint.get('rng_state'))
+        restore_model_grad_state(model, checkpoint.get('grad_state_dict'), device)
+        if checkpoint.get('running_states') is not None:
+            running_issue = _find_first_nonfinite_payload_tensor(checkpoint['running_states'], "running_states")
+            if running_issue:
+                cleaned = _sanitize_payload_nonfinite_(
+                    checkpoint['running_states'],
+                    "running_states",
+                    max_abs=getattr(args, 'grad_clip', 1.0),
+                )
+                print(f"WARNING: Sanitized saved running state before resume: {running_issue}")
+                print(f"WARNING: Repaired {cleaned} non-finite running-state value(s).")
+        if start_step > 0:
+            if checkpoint.get('data_state') is None:
+                print("Warning: Mid-epoch checkpoint has no dataloader state; resume will skip to the saved step but exact batch order may differ.")
+            if checkpoint.get('rng_state') is None:
+                print("Warning: Mid-epoch checkpoint has no RNG state; stochastic components may not be exactly replayed.")
+            if getattr(args, 'persist_state', False) and 'running_states' not in checkpoint:
+                print("Warning: Mid-epoch checkpoint has no running RWKV/LTM states while --persist-state is enabled; continuing with reset states.")
+
+    _sanitize_model_nonfinite_(model, log_prefix="startup model")
+    _clamp_model_finite_magnitude_(
+        model,
+        getattr(args, 'startup_weight_max_abs', 100.0),
+        log_prefix="startup model",
+    )
+    _sanitize_model_transient_state_(model, max_abs=getattr(args, 'grad_clip', 1.0))
+    _sanitize_optimizer_state_(optimizer)
+    _sanitize_gradient_nonfinite_(model, max_abs=1.0)
     # --- Evaluation Confirmation ---
     eval_tasks = getattr(args, 'eval_tasks', None)
     if eval_tasks:
@@ -634,22 +1692,18 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     
     # --- Training Loop ---
     for epoch in range(start_epoch, args.epochs):
+        absolute_epoch = epoch_offset + epoch
         model.train()
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}")
+        set_dataloader_epoch(dataloader, absolute_epoch)
+        if epoch_offset:
+            epoch_desc = f"Epoch {absolute_epoch+1} ({epoch+1}/{args.epochs} session)"
+        else:
+            epoch_desc = f"Epoch {epoch+1}/{args.epochs}"
+        pbar = tqdm(dataloader, desc=epoch_desc, total=dataloader_len)
         
-        # [NEW] Restore running_states if resuming mid-epoch
-        if epoch == start_epoch and checkpoint and 'running_states' in checkpoint:
-            _raw_states = checkpoint['running_states']
-            # Ensure tensors are on the correct device
-            running_states = []
-            for s in _raw_states:
-                if isinstance(s, torch.Tensor):
-                    running_states.append(s.to(device))
-                elif isinstance(s, tuple):
-                    running_states.append(tuple(ss.to(device) if isinstance(ss, torch.Tensor) else ss for ss in s))
-                else:
-                    running_states.append(s)
-            running_states = tuple(running_states)
+        # Restore recurrent/LTM states only for true mid-epoch checkpoints.
+        if epoch == start_epoch and start_step > 0 and checkpoint and 'running_states' in checkpoint:
+            running_states = _state_to_device(checkpoint['running_states'], device)
             print(f"INFO: Restored RNN/LTM running states from checkpoint on {device}.")
         else:
             running_states = (None, None, None, None, None, None)
@@ -660,6 +1714,9 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                 if step == start_step - 1: # Print only once when we are about to start processing
                     print(f"INFO: Resuming from mid-epoch step {start_step}...")
                 continue
+
+            if batch is None:
+                continue
             
             # --- FIXED: Sequence-Level State Reset ---
             # If not persisting across batches, we must start each sequence with a clean slate.
@@ -667,33 +1724,58 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
             if not getattr(args, 'persist_state', False):
                 running_states = (None, None, None, None, None, None)
 
-            outputs, running_states = train_step(model, batch, optimizer, scaler, args.accumulation_steps, step, args, running_states)
+            first_logged_step = start_step if epoch == start_epoch else 0
+            collect_metrics = should_update_progress(step, args, dataloader_len, first_logged_step)
+            args._current_global_step = absolute_epoch * dataloader_len + step
+            outputs, running_states = train_step(
+                model,
+                batch,
+                optimizer,
+                scaler,
+                args.accumulation_steps,
+                step,
+                args,
+                running_states,
+                collect_metrics=collect_metrics,
+            )
             if outputs:
                 postfix = {"loss": f"{outputs['loss'].item():.4f}"}
                 if outputs.get('ponder_cost') is not None:
                     postfix["ponder"] = f"{outputs['ponder_cost'].item():.2f}"
                 if outputs.get('commitment_cost') is not None:
                     postfix["commit"] = f"{outputs['commitment_cost'].item():.2e}"
+                if outputs.get('token_efficiency') is not None:
+                    postfix["tok_eff"] = f"{outputs['token_efficiency'] * 100.0:.1f}%"
+                    postfix["seq"] = int(outputs.get('seq_len', 0) or 0)
                 if scheduler:
                     postfix["lr"] = f"{scheduler.get_last_lr()[0]:.2e}"
+                postfix["ltm_lr"] = f"{get_current_ltm_lr(args):.2e}"
                 pbar.set_postfix(postfix)
 
-            if scheduler and (step + 1) % args.accumulation_steps == 0:
+            if scheduler and getattr(args, '_optimizer_step_was_taken', False):
                 scheduler.step()
+            if getattr(args, '_optimizer_step_was_taken', False):
+                advance_ltm_lr_schedule(args)
 
             # Periodic Checkpointing (Progress Protection)
             if args.save_steps > 0 and (step + 1) % args.save_steps == 0:
                 print(f"\n[Step {step+1}] Periodic Checkpoint: Saving to {args.out_dir}...")
-                save_checkpoint_safely({
-                    'completed_epoch': epoch, # Not yet completed
-                    'mid_epoch_step': step + 1,
-                    'model_state_dict': sanitize_model_state_dict(model),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-                    'scaler_state_dict': scaler.state_dict() if scaler else None,
-                    'config': dict(model.config),
-                    'running_states': running_states, # [NEW] Persist states for graceful resumption
-                }, os.path.join(args.out_dir, f"hierarchos_epoch_{epoch+1}_step_{step+1}.pt"))
+                save_training_checkpoint_if_finite(
+                    build_training_checkpoint(
+                        model,
+                        optimizer,
+                        scheduler,
+                        scaler,
+                        args,
+                        dataloader,
+                        completed_epoch=absolute_epoch,
+                        mid_epoch_step=step + 1,
+                        running_states=running_states,
+                    ),
+                    os.path.join(args.out_dir, f"hierarchos_epoch_{absolute_epoch+1}_step_{step+1}.pt"),
+                    model,
+                    optimizer,
+                )
             
             # --- STEP-BASED EVALUATION (runs every N steps) ---
             eval_steps = getattr(args, 'eval_steps', None)
@@ -718,7 +1800,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                         if eval_results:
                             print(format_results(eval_results, tasks=eval_tasks))
                             
-                            eval_path = os.path.join(args.out_dir, f"eval_epoch_{epoch+1}_step_{step+1}.json")
+                            eval_path = os.path.join(args.out_dir, f"eval_epoch_{absolute_epoch+1}_step_{step+1}.json")
                             from ..evaluation import save_results
                             save_results(eval_results, eval_path)
                         
@@ -729,14 +1811,21 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                     print(f"WARNING: Step-based evaluation failed: {e}")
                     model.train()
         
-        save_checkpoint_safely({
-            'completed_epoch': epoch + 1,
-            'model_state_dict': sanitize_model_state_dict(model),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-            'scaler_state_dict': scaler.state_dict() if scaler else None,
-            'config': dict(model.config),
-        }, os.path.join(args.out_dir, f"hierarchos_epoch_{epoch+1}.pt"))
+        save_training_checkpoint_if_finite(
+            build_training_checkpoint(
+                model,
+                optimizer,
+                scheduler,
+                scaler,
+                args,
+                dataloader,
+                completed_epoch=absolute_epoch + 1,
+                mid_epoch_step=0,
+            ),
+            os.path.join(args.out_dir, f"hierarchos_epoch_{absolute_epoch+1}.pt"),
+            model,
+            optimizer,
+        )
         
         # --- OPTIONAL EVALUATION (lm-evaluation-harness) ---
         eval_tasks = getattr(args, 'eval_tasks', None)
@@ -747,7 +1836,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                     from ..evaluation import run_eval, format_results, is_lm_eval_available
                     
                     if is_lm_eval_available():
-                        print(f"\n[Epoch {epoch+1}] Running evaluation on: {eval_tasks}")
+                        print(f"\n[Epoch {absolute_epoch+1}] Running evaluation on: {eval_tasks}")
                         model.eval()
                         
                         eval_results = run_eval(
@@ -764,7 +1853,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                             print(format_results(eval_results, tasks=eval_tasks))
                             
                             # Save results to file
-                            eval_path = os.path.join(args.out_dir, f"eval_epoch_{epoch+1}.json")
+                            eval_path = os.path.join(args.out_dir, f"eval_epoch_{absolute_epoch+1}.json")
                             from ..evaluation import save_results
                             save_results(eval_results, eval_path)
                         
@@ -790,13 +1879,18 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     # Clean state dict (remove _orig_mod. prefix from compiled models)
     clean_state_dict = sanitize_model_state_dict(model)
     
+    final_completed_epoch = epoch_offset + int(getattr(args, 'epochs', 0) or 0)
+    if hasattr(model, 'config'):
+        model.config.completed_epoch = final_completed_epoch
+    final_config = dict(model.config)
+    final_config['completed_epoch'] = final_completed_epoch
     final_checkpoint = {
         'model_state_dict': clean_state_dict,
-        'config': dict(model.config),
-        'completed_epoch': args.epochs,
+        'config': final_config,
+        'completed_epoch': final_completed_epoch,
         'training_complete': True,
     }
-    save_checkpoint_safely(final_checkpoint, final_model_path)
+    save_training_checkpoint_if_finite(final_checkpoint, final_model_path, model, optimizer=None)
     
     # Save tokenizer files into the directory (HuggingFace-style portability)
     try:
@@ -810,10 +1904,8 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     try:
         import json as json_module
         config_path = os.path.join(args.out_dir, "hierarchos_config.json")
-        config_to_save = dict(model.config)
-        config_to_save['completed_epoch'] = args.epochs
         with open(config_path, 'w') as f:
-            json_module.dump(config_to_save, f, indent=2, default=str)
+            json_module.dump(final_config, f, indent=2, default=str)
         print(f"Config saved to {config_path}")
     except Exception as e:
         print(f"Warning: Failed to save config JSON: {e}")
@@ -826,7 +1918,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         size_str = f"{model_size_bytes / 1e6:.2f} MB"
     
     print(f"Final model size: {size_str}")
-    print(f"Total epochs completed: {args.epochs}")
+    print(f"Total epochs completed: {final_completed_epoch}")
     print(f"\nTo use the model for inference, run:")
     print(f"  python hierarchos_cli.py chat --model-path \"{args.out_dir}\"")
     print("="*60 + "\n")
@@ -936,7 +2028,21 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
         print(f"Resuming LoRA finetune from: {args.resume_from_ckpt}")
         checkpoint = torch.load(args.resume_from_ckpt, map_location='cpu')
         if 'model_state_dict' in checkpoint:
-            model.load_state_dict(sanitize_model_state_dict(checkpoint['model_state_dict'], reset_transient_ltm=False), strict=False)
+            state_dict = sanitize_model_state_dict(checkpoint['model_state_dict'], reset_transient_ltm=False)
+            _reject_unsupported_rwkv_state_dict(state_dict, args.resume_from_ckpt)
+            load_cleaned = _sanitize_payload_nonfinite_(
+                state_dict,
+                "model_state_dict",
+                max_abs=getattr(args, 'grad_clip', 1.0),
+            )
+            if load_cleaned:
+                print(
+                    f"WARNING: Sanitized {load_cleaned} non-finite checkpoint model_state_dict "
+                    "value(s) before loading. Future checkpoints will be saved clean."
+                )
+            checkpoint['model_state_dict'] = state_dict
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            _reject_rwkv_load_mismatch(missing, unexpected, args.resume_from_ckpt)
         start_epoch = checkpoint.get('completed_epoch', 0)
         start_step = checkpoint.get('mid_epoch_step', 0)
         print(f"INFO: Resuming from epoch {start_epoch+1}, step {start_step}.")
@@ -946,9 +2052,9 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
     # Optimizer selection
     if is_directml_device(device):
         print("INFO: DirectML detected. Using optimized DirectMLAdamW optimizer.")
-        optimizer = DirectMLAdamW(model.parameters(), lr=args.starting_lr)
+        optimizer = build_hierarchos_optimizer(model, args, device)
     else:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.starting_lr)
+        optimizer = build_hierarchos_optimizer(model, args, device)
     
     if checkpoint and 'optimizer_state_dict' in checkpoint:
         try:
@@ -974,9 +2080,9 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
 
     # Scheduler setup
     scheduler = None
+    accumulation_steps = getattr(args, 'accumulation_steps', 1)
+    num_update_steps = (dataloader_len // accumulation_steps) * args.epochs if dataloader_len > 0 else 0
     if not getattr(args, 'disable_lr_schedule', False):
-        accumulation_steps = getattr(args, 'accumulation_steps', 1)
-        num_update_steps = (dataloader_len // accumulation_steps) * args.epochs if dataloader_len > 0 else 0
         if num_update_steps > 0:
             print(f"INFO: Cosine Annealing LR scheduler ENABLED. Total steps: {num_update_steps}, Max LR: {args.starting_lr}, Min LR: {args.min_lr}")
             scheduler = CosineAnnealingLR(optimizer, T_max=num_update_steps, eta_min=args.min_lr)
@@ -985,18 +2091,38 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                 except: pass
         else:
             print("Warning: Cannot enable LR schedule, dataset might be too small.")
+    configure_ltm_lr_schedule(
+        args,
+        num_update_steps,
+        checkpoint=checkpoint,
+        override_schedule=bool(getattr(args, 'override_scheduling', False)),
+        scheduler=scheduler,
+    )
+    if hasattr(model, 'config'):
+        model.config.ltm_lr = getattr(args, 'ltm_lr', getattr(model.config, 'ltm_lr', 1e-3))
+        model.config.min_ltm_lr = getattr(args, 'min_ltm_lr', getattr(model.config, 'min_ltm_lr', None))
+        model.config.disable_ltm_lr_schedule = getattr(args, 'disable_ltm_lr_schedule', False)
+
+    _sanitize_model_nonfinite_(model, log_prefix="fine-tune startup model")
+    _clamp_model_finite_magnitude_(
+        model,
+        getattr(args, 'startup_weight_max_abs', 100.0),
+        log_prefix="fine-tune startup model",
+    )
+    _sanitize_model_transient_state_(model, max_abs=getattr(args, 'grad_clip', 1.0))
+    _sanitize_optimizer_state_(optimizer)
+    _sanitize_gradient_nonfinite_(model, max_abs=1.0)
 
     optimizer.zero_grad(set_to_none=True)
     global_step = 0
-    accumulation_steps = getattr(args, 'accumulation_steps', 1)
     ponder_loss_weight = getattr(args, 'ponder_loss_weight', 0.01)
     commitment_loss_weight = getattr(args, 'commitment_loss_weight', 0.5)
     grad_clip = getattr(args, 'grad_clip', 1.0)
-    ltm_lr = getattr(args, 'ltm_lr', 0.001)
 
     for epoch in range(start_epoch, args.epochs):
         print(f"\n--- LoRA Finetune Epoch {epoch + 1} / {args.epochs} ---")
-        pbar = tqdm(dataloader, desc=f"Finetune Epoch {epoch + 1}")
+        set_dataloader_epoch(dataloader, epoch)
+        pbar = tqdm(dataloader, desc=f"Finetune Epoch {epoch + 1}", total=dataloader_len)
         total_loss = 0.0
         total_ponder_cost = 0.0
         total_commitment_cost = 0.0
@@ -1014,15 +2140,27 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
             if batch is None:
                 continue
 
-            input_ids = batch["input_ids"].to(device)
+            input_ids = batch["input_ids"]
             attention_mask = batch.get("attention_mask")
+            labels = batch["labels"]
+            rosa_ids = batch.get("rosa_ids")
+            input_ids, labels, attention_mask = trim_trailing_padding(
+                input_ids, labels, attention_mask
+            )
+            if rosa_ids is not None:
+                rosa_ids = rosa_ids[:, :input_ids.shape[1]].contiguous()
+            non_blocking = device.type == 'cuda'
+            input_ids = input_ids.to(device, non_blocking=non_blocking)
             if attention_mask is not None:
-                attention_mask = attention_mask.to(device)
-            labels = batch["labels"].to(device)
+                attention_mask = attention_mask.to(device, non_blocking=non_blocking)
+            labels = labels.to(device, non_blocking=non_blocking)
+            if rosa_ids is not None:
+                rosa_ids = rosa_ids.to(device, non_blocking=non_blocking)
+            set_model_training_step(model, epoch * dataloader_len + i)
 
             autocast_device_type = 'cpu' if is_directml_device(device) else device.type
             with autocast(device_type=autocast_device_type, dtype=amp_dtype, enabled=use_amp):
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels, rosa_ids=rosa_ids)
                 
                 # AMP FIX: Cast topk_vals to float32 before retain_grad (same fix as train path).
                 # Prevents masked_scatter_ dtype mismatch crash under BFloat16 AMP.
@@ -1042,18 +2180,43 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                 loss_accum = 0.0
 
                 if ce_valid:
-                    loss_accum = loss_accum + cross_entropy_loss
+                    loss_accum = loss_accum + _cap_loss_component_for_backward(
+                        cross_entropy_loss,
+                        getattr(args, 'max_ce_loss_for_backward', 10.0),
+                    )
                 elif i % accumulation_steps == 0:
                     print(f"\nWarning: CE loss is NaN/Inf at step {i+1}. Skipping.")
 
                 if pc_valid:
-                    loss_accum = loss_accum + (ponder_loss_weight * ponder_cost)
+                    loss_accum = loss_accum + (
+                        ponder_loss_weight
+                        * _cap_loss_component_for_backward(
+                            ponder_cost,
+                            getattr(args, 'max_ponder_cost_for_backward', 0.0),
+                        )
+                    )
                 
                 if cc_valid:
-                    loss_accum = loss_accum + (commitment_loss_weight * commitment_cost)
+                    loss_accum = loss_accum + (
+                        commitment_loss_weight
+                        * _cap_loss_component_for_backward(
+                            commitment_cost,
+                            getattr(args, 'max_commitment_cost_for_backward', 2.0),
+                        )
+                    )
 
                 if ce_valid:
                     combined_loss = loss_accum
+
+                combined_valid = combined_loss is not None and torch.isfinite(combined_loss).all()
+                if combined_loss is not None and not bool(combined_valid.item()):
+                    print(
+                        f"\nCRITICAL: Non-finite fine-tune loss at step {i+1}; "
+                        "skipping batch and clearing gradients."
+                    )
+                    print("  " + _describe_tensor_issue("combined_loss", combined_loss))
+                    combined_loss = None
+                    optimizer.zero_grad(set_to_none=True)
 
             if combined_loss is not None:
                 loss_to_backward = combined_loss / accumulation_steps
@@ -1093,13 +2256,26 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                             else:
                                 valid_update = False
 
-                        if valid_update and torch.isfinite(ltm_grads_copy).all():
-                            if grad_clip > 0:
-                                torch.nn.utils.clip_grad_norm_([ltm_grads_copy], grad_clip)
+                        if valid_update:
+                            ltm_clip = _positive_float(grad_clip, 1.0)
+                            ltm_grads_copy = torch.nan_to_num(
+                                ltm_grads_copy,
+                                nan=0.0,
+                                posinf=ltm_clip,
+                                neginf=-ltm_clip,
+                            )
+                            ltm_grads_copy.clamp_(min=-ltm_clip, max=ltm_clip)
+                            if ltm_clip > 0:
+                                ltm_norm = ltm_grads_copy.float().norm()
+                                clip_coef = torch.clamp(
+                                    ltm_grads_copy.new_tensor(float(ltm_clip)) / (ltm_norm + 1e-8),
+                                    max=1.0,
+                                )
+                                ltm_grads_copy = ltm_grads_copy * clip_coef
                             base_ltm.inner_update(
                                 outputs["topk_idx"],
                                 ltm_grads_copy,
-                                current_lr=ltm_lr,
+                                current_lr=get_current_ltm_lr(args),
                                 timestamp=float(i + 1),
                                 source=2  # SRC_TRAINING_DATA
                             )
@@ -1107,17 +2283,28 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                     # Optimizer step
                     if use_amp and scaler:
                         scaler.unscale_(optimizer)
-                        if grad_clip > 0:
-                            torch.nn.utils.clip_grad_norm_(filter(lambda p: p.requires_grad, model.parameters()), grad_clip)
+                        grads_ok, grad_issue = _clip_gradients_and_check(model, grad_clip)
+                        if not grads_ok:
+                            print(f"\nCRITICAL: Non-finite fine-tune gradient at step {i+1}. {grad_issue}")
+                            print("  Skipping optimizer step and clearing accumulated gradients.")
+                            _reset_after_nonfinite(optimizer, model)
+                            backward_called_in_cycle = False
+                            continue
                         scaler.step(optimizer)
                         scaler.update()
                     else:
-                        if grad_clip > 0:
-                            torch.nn.utils.clip_grad_norm_(filter(lambda p: p.requires_grad, model.parameters()), grad_clip)
+                        grads_ok, grad_issue = _clip_gradients_and_check(model, grad_clip)
+                        if not grads_ok:
+                            print(f"\nCRITICAL: Non-finite fine-tune gradient at step {i+1}. {grad_issue}")
+                            print("  Skipping optimizer step and clearing accumulated gradients.")
+                            _reset_after_nonfinite(optimizer, model)
+                            backward_called_in_cycle = False
+                            continue
                         optimizer.step()
 
                     if scheduler:
                         scheduler.step()
+                    advance_ltm_lr_schedule(args)
 
                     optimizer.zero_grad(set_to_none=True)
                     backward_called_in_cycle = False
@@ -1127,15 +2314,16 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                     if getattr(args, 'save_steps', 0) > 0 and (i + 1) % args.save_steps == 0:
                         ckpt_path = os.path.join(args.out_dir, f"hierarchos_finetune_epoch_{epoch+1}_step_{i+1}.pt")
                         print(f"\n[Step {i+1}] Periodic Checkpoint: Saving to {ckpt_path}...")
-                        save_checkpoint_safely({
+                        save_training_checkpoint_if_finite({
                             'completed_epoch': epoch,
                             'mid_epoch_step': i + 1,
                             'model_state_dict': sanitize_model_state_dict(model),
                             'optimizer_state_dict': optimizer.state_dict(),
                             'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
                             'scaler_state_dict': scaler.state_dict() if scaler else None,
+                            'ltm_scheduler_state': capture_ltm_lr_scheduler_state(args),
                             'config': dict(model.config),
-                        }, ckpt_path)
+                        }, ckpt_path, model, optimizer)
                 else:
                     print(f"\nWarning: Skipping optimizer step at batch {i+1} due to invalid loss.")
                     optimizer.zero_grad(set_to_none=True)
@@ -1151,7 +2339,8 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                 "loss": f"{avg_loss:.4f}",
                 "ponder": f"{avg_ponder:.2f}",
                 "commit": f"{avg_commit:.2e}",
-                "lr": f"{current_lr:.2e}"
+                "lr": f"{current_lr:.2e}",
+                "ltm_lr": f"{get_current_ltm_lr(args):.2e}"
             })
 
     # Save LoRA adapter

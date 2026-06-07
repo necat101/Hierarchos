@@ -43,7 +43,7 @@ def _fix_python_build_environment_windows():
 
         sysconfig.get_path = _patched_get_path
         sysconfig.get_paths = _patched_get_paths
-        print("INFO: Patched sysconfig to use short paths for includes.")
+        print("INFO: Patched sysconfig to use short paths for includes.", file=sys.stderr)
 
         # --- 2. Add 'libs' to LIB environment variable ---
         exec_prefix_short = get_short_path(sys.exec_prefix)
@@ -52,12 +52,12 @@ def _fix_python_build_environment_windows():
         if os.path.exists(libs_path):
             current_lib = os.environ.get('LIB', '')
             os.environ['LIB'] = f"{libs_path};{current_lib}"
-            print(f"INFO: Added '{libs_path}' to LIB environment variable.")
+            print(f"INFO: Added '{libs_path}' to LIB environment variable.", file=sys.stderr)
         else:
-            print(f"WARNING: Could not find libs path at '{libs_path}'")
+            print(f"WARNING: Could not find libs path at '{libs_path}'", file=sys.stderr)
 
     except Exception as e:
-        print(f"WARNING: Failed to setup Python build environment: {e}")
+        print(f"WARNING: Failed to setup Python build environment: {e}", file=sys.stderr)
 
 # Call it immediately on import
 _fix_python_build_environment_windows()
@@ -69,21 +69,91 @@ try:
 except ImportError:
     _HAS_DIRECTML = False
 
+def cuda_diagnostics():
+    """Return CUDA build/device information without requiring a CUDA GPU."""
+    info = {
+        "torch_version": getattr(torch, "__version__", "unknown"),
+        "cuda_built": bool(getattr(torch.version, "cuda", None)),
+        "cuda_version": getattr(torch.version, "cuda", None),
+        "cuda_available": False,
+        "device_count": 0,
+        "device_name": None,
+        "total_memory_mb": None,
+        "driver_error": None,
+    }
+    try:
+        info["cuda_available"] = bool(torch.cuda.is_available())
+        info["device_count"] = int(torch.cuda.device_count()) if info["cuda_available"] else 0
+        if info["device_count"] > 0:
+            props = torch.cuda.get_device_properties(0)
+            info["device_name"] = props.name
+            info["total_memory_mb"] = int(props.total_memory // (1024 * 1024))
+    except Exception as exc:
+        info["driver_error"] = str(exc)
+    return info
+
+def configure_torch_runtime(device=None):
+    """Enable conservative runtime optimizations for the selected device."""
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+
+    device_type = get_device_type(device) if device is not None else None
+    if device_type == "cuda":
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+        except Exception:
+            pass
+        try:
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+        except Exception:
+            pass
+
+    return cuda_diagnostics()
+
+def describe_device(device):
+    """Human-readable device string for logs and GUI status."""
+    device_type = get_device_type(device)
+    if device_type == "cuda" and torch.cuda.is_available():
+        try:
+            idx = device.index if isinstance(device, torch.device) and device.index is not None else torch.cuda.current_device()
+            props = torch.cuda.get_device_properties(idx)
+            total_gb = props.total_memory / (1024 ** 3)
+            return f"cuda:{idx} ({props.name}, {total_gb:.1f} GB VRAM)"
+        except Exception:
+            return "cuda"
+    if device_type == "dml":
+        return "DirectML"
+    return "cpu"
+
 def pick_device(args=None):
-    """Picks the best available device for PyTorch training."""
+    """Pick CUDA when available, otherwise keep the same package usable on CPU."""
     if args and hasattr(args, 'device') and args.device:
-        if args.device in ['dml', 'directml']:
+        requested = str(args.device).strip().lower()
+        if requested in ['dml', 'directml']:
             if _HAS_DIRECTML: 
-                print("INFO: User explicitly requested DirectML.")
+                print("INFO: User explicitly requested DirectML.", file=sys.stderr)
                 return torch_directml.device()
             else: 
-                print("Warning: DirectML requested but torch-directml not available. Falling back to auto-detect.")
-        elif args.device == 'cuda':
+                print("Warning: DirectML requested but torch-directml not available. Falling back to auto-detect.", file=sys.stderr)
+        elif requested in ['cuda', 'gpu']:
+            diag = cuda_diagnostics()
+            if not diag["cuda_built"]:
+                raise RuntimeError(
+                    "CUDA was requested, but this backend was built with CPU-only PyTorch. "
+                    "Rebuild the Windows backend with a CUDA PyTorch wheel."
+                )
             if torch.cuda.is_available(): 
                 return torch.device("cuda")
-            else: 
-                print("Warning: CUDA requested but not available. Falling back to auto-detect.")
-        elif args.device == 'cpu':
+            reason = diag.get("driver_error") or "no CUDA-capable NVIDIA device is visible to PyTorch"
+            raise RuntimeError(
+                "CUDA was requested, but CUDA is not available. "
+                f"PyTorch CUDA build: {diag.get('cuda_version') or 'none'}; reason: {reason}. "
+                "Use Auto/CPU on this machine, or install/update the NVIDIA driver."
+            )
+        elif requested == 'cpu':
             return torch.device("cpu")
     
     if torch.cuda.is_available():
@@ -127,16 +197,16 @@ def setup_msvc_environment():
 
     # Manual Fallback Prompt (Parity with original script)
     if vcvars_path is None:
-        print("\n" + "---" * 20)
-        print("MSVC 64-bit Compiler Setup (Manual Fallback)")
-        print("---" * 20)
-        print("Could not automatically find vcvars64.bat.")
+        print("\n" + "---" * 20, file=sys.stderr)
+        print("MSVC 64-bit Compiler Setup (Manual Fallback)", file=sys.stderr)
+        print("---" * 20, file=sys.stderr)
+        print("Could not automatically find vcvars64.bat.", file=sys.stderr)
         try:
             user_path = input("Enter full path to vcvars64.bat (or press Enter to skip): ").strip()
             if user_path and os.path.exists(user_path):
                 vcvars_path = user_path
         except EOFError: pass
-        print("---" * 20)
+        print("---" * 20, file=sys.stderr)
 
     if vcvars_path:
         try:
@@ -160,9 +230,9 @@ def setup_msvc_environment():
                         env_vars = json.loads(json_str)
                         for k in ['PATH', 'LIB', 'INCLUDE']:
                             if k in env_vars: os.environ[k] = env_vars[k]
-                        print("✅ INFO: MSVC environment loaded.")
+                        print("INFO: MSVC environment loaded.", file=sys.stderr)
         except Exception as e:
-            print(f"Warning: Failed to load MSVC environment: {e}")
+            print(f"Warning: Failed to load MSVC environment: {e}", file=sys.stderr)
 
 def set_threads(n: int):
     if n is None or n <= 0: return
@@ -170,9 +240,9 @@ def set_threads(n: int):
         import torch
         torch.set_num_threads(n)
         os.environ['OMP_NUM_THREADS'] = str(n)
-        print(f"INFO: Threads set to {n}")
+        print(f"INFO: Threads set to {n}", file=sys.stderr)
     except Exception as e:
-        print(f"Warning: Could not set thread count. {e}")
+        print(f"Warning: Could not set thread count. {e}", file=sys.stderr)
 
 def is_directml_device(device):
     """Check if a device is DirectML."""

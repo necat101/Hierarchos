@@ -17,6 +17,9 @@ import sys
 import signal
 import traceback
 import math
+import time
+import copy
+from datetime import datetime
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -25,6 +28,16 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from ..utils.device import is_directml_device
 from ..utils.checkpoint import load_full_model_with_config
+from .chat_state import (
+    CHAT_STATE_KIND,
+    CHAT_STATE_VERSION,
+    chat_state_config_signature,
+    clear_ltm_working_memory,
+    normalize_recurrent_state_for_model,
+    recurrent_state_metadata,
+    tensor_to_cpu,
+    validate_chat_state_payload_compatible,
+)
 
 # --- Signal Handling for Interrupt ---
 _interrupt_flag = False
@@ -97,12 +110,11 @@ def extract_correction_text(text: str):
 
 
 # --- Training-Parity Format Wrapper & Parser ---
-def wrap_for_hierarchos(raw_text, system_prompt=None):
+def wrap_for_hierarchos(raw_text, system_prompt=None, alpaca_mode=False):
     """Wraps user input into the exact format the model saw during training.
     
-    The training pipeline (process_text_sample in datasets.py) tokenizes JSONL
-    data as:  User: {instruction}\n\nAssistant: {output}<EOS>
-    This wrapper must produce the identical prompt prefix so the model sees
+    The training pipeline supports both Alpaca and User/Assistant prompt
+    formats. This wrapper must produce the matching prefix so the model sees
     in-distribution text at inference time.
     
     An optional system_prompt is prepended inside the User field to guide
@@ -110,7 +122,9 @@ def wrap_for_hierarchos(raw_text, system_prompt=None):
     """
     clean_text = raw_text.strip()
     if system_prompt:
-        return f"User: [{system_prompt}]\n{clean_text}\n\nAssistant: "
+        clean_text = f"[{system_prompt}]\n{clean_text}"
+    if alpaca_mode:
+        return f"### Instruction:\n{clean_text}\n\n### Response:\n"
     return f"User: {clean_text}\n\nAssistant: "
 
 
@@ -154,6 +168,221 @@ def parse_temperature_setting(raw_value: str) -> float:
     return stepped
 
 
+def _chat_state_config_signature(config, model=None):
+    return chat_state_config_signature(config, model)
+
+
+def _tensor_to_cpu(value):
+    return tensor_to_cpu(value)
+
+
+def _default_chat_state_path(model_path: str) -> str:
+    safe_model_name = os.path.basename(os.path.abspath(model_path).rstrip(os.sep)) or "model"
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    state_dir = os.path.abspath(os.path.join(os.getcwd(), "hierarchos_chat_states"))
+    os.makedirs(state_dir, exist_ok=True)
+    return os.path.join(state_dir, f"{safe_model_name}-{timestamp}.pt")
+
+
+def _normalize_chat_state_path(path: str) -> str:
+    return os.path.abspath(os.path.expanduser((path or "").strip().strip('"')))
+
+
+def save_hierarchical_chat_state(
+    path,
+    *,
+    config,
+    model=None,
+    model_path,
+    h_state,
+    l_state,
+    prev_context,
+    target_context,
+    drift_state,
+    ltm_state=None,
+    total_tokens_generated,
+):
+    """Save only tiny chat continuation tensors; never LTM/model weights."""
+    path = _normalize_chat_state_path(path)
+    if not path:
+        raise ValueError("No chat state path provided.")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    rosa_past_tokens = _rosa_past_tokens_from_ltm_state(ltm_state)
+    rosa_states = _rosa_states_from_ltm_state(ltm_state)
+    payload = {
+        "version": CHAT_STATE_VERSION,
+        "kind": CHAT_STATE_KIND,
+        "saved_at": time.time(),
+        "model_path": os.path.abspath(model_path) if model_path else None,
+        "config_signature": _chat_state_config_signature(config, model=model),
+        "total_tokens_generated": int(total_tokens_generated or 0),
+        "h_state": _tensor_to_cpu(h_state),
+        "l_state": _tensor_to_cpu(l_state),
+        "prev_context": _tensor_to_cpu(prev_context),
+        "target_context": _tensor_to_cpu(target_context),
+        "drift_state": _tensor_to_cpu(drift_state),
+        "rosa_past_tokens": rosa_past_tokens,
+        "rosa_states": rosa_states,
+    }
+    payload.update(
+        recurrent_state_metadata(
+            model=model,
+            config=config,
+            h_state=h_state,
+            l_state=l_state,
+        )
+    )
+    tmp_path = path + ".tmp"
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, path)
+    return path
+
+
+def load_hierarchical_chat_state(path, *, config, device, model=None):
+    """Load a tiny chat state file without restoring LTM working memory."""
+    path = _normalize_chat_state_path(path)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Chat state file not found: {path}")
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict) or payload.get("kind") != CHAT_STATE_KIND:
+        raise RuntimeError(f"Not a Hierarchos chat runtime state file: {path}")
+
+    validate_chat_state_payload_compatible(payload, config, model=model)
+
+    def tensor(name):
+        value = payload.get(name)
+        if torch.is_tensor(value):
+            return value.to(device)
+        return None
+    
+    h_state = tensor("h_state")
+    l_state = tensor("l_state")
+    if model is not None:
+        if h_state is not None:
+            h_state = normalize_recurrent_state_for_model(
+                h_state,
+                model,
+                "h_rnn",
+                device=device,
+            )
+        if l_state is not None:
+            l_state = normalize_recurrent_state_for_model(
+                l_state,
+                model,
+                "l_rnn",
+                device=device,
+            )
+
+    return {
+        "h_state": h_state,
+        "l_state": l_state,
+        "prev_context": tensor("prev_context"),
+        "target_context": tensor("target_context"),
+        "drift_state": tensor("drift_state"),
+        "rosa_past_tokens": payload.get("rosa_past_tokens").cpu()
+        if torch.is_tensor(payload.get("rosa_past_tokens"))
+        else None,
+        "rosa_states": copy.deepcopy(payload.get("rosa_states"))
+        if payload.get("rosa_states") is not None
+        else None,
+        "total_tokens_generated": int(payload.get("total_tokens_generated") or 0),
+    }
+
+
+def _rosa_past_tokens_from_ltm_state(ltm_state):
+    """Extract full ROSA token history from an LTM state tuple."""
+    if ltm_state is None or not isinstance(ltm_state, (tuple, list)) or len(ltm_state) < 3:
+        return None
+    return _tensor_to_cpu(ltm_state[2])
+
+
+def _rosa_states_from_ltm_state(ltm_state):
+    """Extract V8 ROSA automaton state from an LTM state tuple."""
+    if ltm_state is None or not isinstance(ltm_state, (tuple, list)) or len(ltm_state) < 4:
+        return None
+    rosa_states = ltm_state[3]
+    if rosa_states is None:
+        return None
+    try:
+        return copy.deepcopy(rosa_states)
+    except Exception:
+        return rosa_states
+
+
+def _chat_ltm_state_from_rosa_context(model, rosa_past_tokens, rosa_states=None):
+    """Rehydrate V8 ROSA continuation without restoring per-chat LTM fast buffers."""
+    if not torch.is_tensor(rosa_past_tokens) or not hasattr(model, "ltm"):
+        return None
+
+    ltm = model.ltm
+    fast_vals = getattr(ltm, "fast_vals", None)
+    mom_vals = getattr(ltm, "_mom_vals", None)
+    if not torch.is_tensor(fast_vals) or not torch.is_tensor(mom_vals):
+        return None
+
+    timestamps = getattr(ltm, "timestamps", None)
+    sources = getattr(ltm, "sources", None)
+    return (
+        fast_vals,
+        torch.zeros_like(mom_vals),
+        rosa_past_tokens.detach().cpu().clone(),
+        copy.deepcopy(rosa_states) if rosa_states is not None else None,
+        timestamps,
+        sources,
+    )
+
+
+def _chat_ltm_state_from_rosa_past(model, rosa_past_tokens):
+    return _chat_ltm_state_from_rosa_context(model, rosa_past_tokens, None)
+
+
+def _setting_value(settings, name, default):
+    if isinstance(settings, dict):
+        return settings.get(name, default)
+    return getattr(settings, name, default)
+
+
+def should_stop_generation_from_uncertainty(logits, response_ids, tokenizer=None, settings=None):
+    """Stop when the model has clearly fallen into high-entropy tail sampling."""
+    if logits is None:
+        return False
+    try:
+        if logits.dim() == 3:
+            logits = logits[:, -1, :]
+        logits = logits.float()
+        probs = F.softmax(logits, dim=-1)
+        if torch.isnan(probs).any() or torch.isinf(probs).any():
+            return True
+
+        generated_count = len(response_ids or [])
+        entropy_threshold = float(_setting_value(settings, "entropy_stop_threshold", 0.0) or 0.0)
+        min_tokens = int(_setting_value(settings, "entropy_stop_min_tokens", 3) or 0)
+        top_prob_ceiling = float(_setting_value(settings, "entropy_stop_top_prob", 0.05) or 0.0)
+        eos_prob_threshold = float(_setting_value(settings, "eos_stop_prob", 0.0) or 0.0)
+
+        top_prob = float(probs.max().item())
+        eos_id = getattr(tokenizer, "eos_token_id", None) if tokenizer is not None else None
+        if (
+            eos_id is not None
+            and 0 <= int(eos_id) < probs.shape[-1]
+            and eos_prob_threshold > 0
+            and generated_count >= 1
+        ):
+            eos_prob = float(probs[0, int(eos_id)].item())
+            if eos_prob >= eos_prob_threshold:
+                return True
+
+        if entropy_threshold <= 0 or generated_count < min_tokens:
+            return False
+
+        entropy = -((probs * torch.log(probs + 1e-10)).sum(-1)).item()
+        return entropy >= entropy_threshold and (
+            top_prob_ceiling <= 0 or top_prob <= top_prob_ceiling
+        )
+    except Exception:
+        return False
+
+
 # --- Simple Generation Helper ---
 def generate_sample(model, tokenizer, prompt, device, max_new_tokens=100, temperature=0.7, top_k=50, top_p=0.9):
     """Simple generation for testing/comparison."""
@@ -162,21 +391,34 @@ def generate_sample(model, tokenizer, prompt, device, max_new_tokens=100, temper
     model.suppress_hebbian = True
     tokens = tokenizer.encode(prompt, return_tensors="pt").to(device)
     h_state, l_state, p_ctx, t_ctx = None, None, None, None
+    drift_state = None
     ltm_state = None
+    total_tokens_generated = 0
 
     try:
         generated = tokens
         for _ in range(max_new_tokens):
             with torch.no_grad():
-                outputs = model(input_ids=tokens, h_state=h_state, l_state=l_state,
-                                prev_context=p_ctx, target_context=t_ctx, ltm_memory_state=ltm_state)
+                outputs = model(
+                    input_ids=tokens,
+                    h_state=h_state,
+                    l_state=l_state,
+                    prev_context=p_ctx,
+                    target_context=t_ctx,
+                    drift_state=drift_state,
+                    ltm_memory_state=ltm_state,
+                    global_pos_offset=total_tokens_generated,
+                    suppress_hebbian=True,
+                )
                 logits = outputs['logits'][:, -1, :] / max(temperature, 1e-6)
                 next_token = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
                 generated = torch.cat([generated, next_token], dim=1)
-                tokens = next_token
+                total_tokens_generated += int(tokens.shape[1])
                 h_state, l_state = outputs['h_state'], outputs['l_state']
                 p_ctx, t_ctx = outputs['prev_context'], outputs['target_context']
+                drift_state = outputs.get('drift_state', drift_state)
                 ltm_state = outputs.get('ltm_memory_state')
+                tokens = next_token
                 if next_token.item() == tokenizer.eos_token_id:
                     break
     finally:
@@ -245,6 +487,7 @@ def chat(args, device, tokenizer):
     if npz_files and _HAS_QUANTIZED:
         try:
             model, config = load_quantized(args.model_path, device=device)
+            clear_ltm_working_memory(model)
             if isinstance(model, QuantizedHierarchos):
                 is_quantized = True
                 print(f"Loaded quantized model with {model.qtype} weights.")
@@ -259,6 +502,7 @@ def chat(args, device, tokenizer):
     else:
         try:
             model, config = load_full_model_with_config(args.model_path, device)
+            clear_ltm_working_memory(model)
             print("Loaded full-precision model.")
         except Exception as e:
             print(f"Error loading model from {args.model_path}: {e}")
@@ -277,6 +521,7 @@ def chat(args, device, tokenizer):
         try:
             shadow_model, _ = load_full_model_with_config(shadow_model_path, device)
             shadow_model.ltm.load_state_dict(model.ltm.state_dict())
+            clear_ltm_working_memory(shadow_model)
             shadow_model.eval()
         except Exception as e:
             print(f"Error loading shadow model: {e}")
@@ -527,10 +772,14 @@ def chat(args, device, tokenizer):
 
         model_input = full_sequence.cpu() if is_quantized else full_sequence.to(device)
         rnn_device_local = "cpu" if is_quantized else device
-        local_h = torch.zeros(1, getattr(config, 'h_hidden', config.context_dim), 5, device=rnn_device_local)
-        local_l = torch.zeros(1, getattr(config, 'l_hidden', config.context_dim), 5, device=rnn_device_local)
-        local_h[:, :, 3] = -1e30
-        local_l[:, :, 3] = -1e30
+        if is_quantized or not hasattr(model, "h_rnn"):
+            local_h = torch.zeros(1, getattr(config, 'h_hidden', config.context_dim), 5, device=rnn_device_local)
+            local_l = torch.zeros(1, getattr(config, 'l_hidden', config.context_dim), 5, device=rnn_device_local)
+            local_h[:, :, 3] = -1e30
+            local_l[:, :, 3] = -1e30
+        else:
+            local_h = model.h_rnn.initial_state(1, device=rnn_device_local)
+            local_l = model.l_rnn.initial_state(1, device=rnn_device_local)
         local_prev = torch.zeros(1, config.context_dim, device=rnn_device_local)
         local_target = torch.zeros(1, config.context_dim, device=rnn_device_local)
 
@@ -598,10 +847,88 @@ def chat(args, device, tokenizer):
     print("Press Ctrl+C to stop generation at any time.")
     print("=" * 50)
 
+    resume_chat_state_path = getattr(args, "resume_chat_from_state_file", None)
+    requested_chat_state_path = resume_chat_state_path or getattr(args, "chat_state_file", None)
+    if requested_chat_state_path == "auto":
+        chat_state_path = _default_chat_state_path(args.model_path)
+    elif requested_chat_state_path:
+        chat_state_path = _normalize_chat_state_path(requested_chat_state_path)
+    else:
+        chat_state_path = None
+
+    if chat_state_path:
+        print(f"Chat hierarchical state file: {chat_state_path}")
+    else:
+        print("Chat hierarchical state autosave: disabled (you can save on exit)")
+
+    h_state = None
+    l_state = None
+    prev_context = None
+    target_context = None
+    drift_state = None
+    total_tokens_generated = 0
+
+    def save_chat_state_to(path, silent=True):
+        if not path:
+            return
+        if h_state is None or l_state is None:
+            return
+        try:
+            save_hierarchical_chat_state(
+                path,
+                config=config,
+                model=model,
+                model_path=args.model_path,
+                h_state=h_state,
+                l_state=l_state,
+                prev_context=prev_context,
+                target_context=target_context,
+                drift_state=drift_state,
+                ltm_state=ltm_state,
+                total_tokens_generated=total_tokens_generated,
+            )
+            if not silent:
+                print(f"Saved hierarchical chat state to {path}")
+        except Exception as exc:
+            print(f"WARNING: Could not save hierarchical chat state: {exc}")
+
+    def autosave_chat_state(silent=True):
+        save_chat_state_to(chat_state_path, silent=silent)
+
+    def prompt_save_chat_state_on_exit():
+        if h_state is None or l_state is None:
+            return
+
+        if chat_state_path:
+            save_chat_state_to(chat_state_path, silent=False)
+            return
+
+        suggested_path = _default_chat_state_path(args.model_path)
+        while True:
+            try:
+                response = input(
+                    f"Do you want to save the hierarchical chat state to '{suggested_path}'? (y/n): "
+                ).lower()
+                if response in ["y", "yes"]:
+                    save_chat_state_to(suggested_path, silent=False)
+                    break
+                if response in ["n", "no"]:
+                    print("Hierarchical chat state discarded. Exiting.")
+                    break
+                print("Invalid input.")
+            except EOFError:
+                print("\nEOF detected. Assuming 'no' for hierarchical state saving.")
+                break
+            except KeyboardInterrupt:
+                print("\nInterrupted. Hierarchical chat state will be discarded.")
+                break
+
     try:
         min_ts_filter = 0.0
         source_id_filter = None
-        system_prompt = None  # Optional system prompt prepended to User field
+        system_prompt = None  # Optional system prompt prepended inside the active training format
+        alpaca_chat_format = bool(getattr(config, "alpaca", False))
+        print(f"Chat prompt format: {'Alpaca ### Instruction/Response' if alpaca_chat_format else 'User/Assistant'}")
 
         # =================================================================
         # 6. STATE INITIALIZATION
@@ -611,10 +938,22 @@ def chat(args, device, tokenizer):
         l_hidden = getattr(config, 'l_hidden', config.context_dim)
         context_dim = config.context_dim
 
-        h_state = torch.zeros(1, h_hidden, 5, device=rnn_device)
-        h_state[:, :, 3] = -1e30  # PP init
-        l_state = torch.zeros(1, l_hidden, 5, device=rnn_device)
-        l_state[:, :, 3] = -1e30  # PP init
+        def _new_h_state():
+            if not is_quantized and hasattr(model, "h_rnn"):
+                return model.h_rnn.initial_state(1, device=rnn_device)
+            state = torch.zeros(1, h_hidden, 5, device=rnn_device)
+            state[:, :, 3] = -1e30
+            return state
+
+        def _new_l_state():
+            if not is_quantized and hasattr(model, "l_rnn"):
+                return model.l_rnn.initial_state(1, device=rnn_device)
+            state = torch.zeros(1, l_hidden, 5, device=rnn_device)
+            state[:, :, 3] = -1e30
+            return state
+
+        h_state = _new_h_state()
+        l_state = _new_l_state()
         
         prev_context = torch.zeros(1, context_dim, device=rnn_device)
         target_context = torch.zeros(1, context_dim, device=rnn_device)
@@ -623,10 +962,44 @@ def chat(args, device, tokenizer):
         
         total_tokens_generated = 0
 
+        if resume_chat_state_path:
+            try:
+                restored = load_hierarchical_chat_state(
+                    chat_state_path,
+                    config=config,
+                    device=rnn_device,
+                    model=model,
+                )
+                if restored["h_state"] is not None:
+                    h_state = restored["h_state"]
+                if restored["l_state"] is not None:
+                    l_state = restored["l_state"]
+                if restored["prev_context"] is not None:
+                    prev_context = restored["prev_context"]
+                if restored["target_context"] is not None:
+                    target_context = restored["target_context"]
+                if restored["drift_state"] is not None:
+                    drift_state = restored["drift_state"]
+                total_tokens_generated = restored["total_tokens_generated"]
+                ltm_state = _chat_ltm_state_from_rosa_context(
+                    model,
+                    restored.get("rosa_past_tokens"),
+                    restored.get("rosa_states"),
+                )
+                print(f"Resumed hierarchical chat state from {chat_state_path}")
+            except FileNotFoundError:
+                print(f"No state file found yet; a new one will be created at {chat_state_path}")
+            except Exception as exc:
+                print(f"WARNING: Could not resume chat state: {exc}")
+
         # --- Startup Diagnostic: Verify model produces reasonable predictions ---
         print("INFO: Running inference diagnostic...")
         try:
-            _diag_prompt = "User: Hello\n\nAssistant: "
+            _diag_prompt = wrap_for_hierarchos(
+                "Hello",
+                system_prompt=None,
+                alpaca_mode=alpaca_chat_format,
+            )
             _diag_ids = tokenizer.encode(_diag_prompt, return_tensors="pt").to(device)
             with torch.no_grad():
                 _diag_out = model(
@@ -729,6 +1102,11 @@ def chat(args, device, tokenizer):
                     print("Usage: /settings [temperature <0.00-1.00 in 0.05 increments>]")
                     continue
                 print(f"Current Settings:\n  Temperature: {args.temperature:.2f}\n  Top-K: {args.top_k}\n  Top-P: {args.top_p}")
+                if float(getattr(args, "entropy_stop_threshold", 0.0) or 0.0) > 0:
+                    print(
+                        f"  Entropy Stop: >= {args.entropy_stop_threshold:.2f} "
+                        f"after {getattr(args, 'entropy_stop_min_tokens', 3)} tokens"
+                    )
                 print(f"  System Prompt: {repr(system_prompt) if system_prompt else '(none)'}")
                 continue
 
@@ -754,16 +1132,15 @@ def chat(args, device, tokenizer):
 
             if prompt.startswith('/reset'):
                 print("Resetting all RNN and Hierarchical states...")
-                h_state.zero_()
-                h_state[:, :, 3] = -1e30
-                l_state.zero_()
-                l_state[:, :, 3] = -1e30
+                h_state = _new_h_state()
+                l_state = _new_l_state()
                 prev_context.zero_()
                 target_context.zero_()
                 drift_state.zero_()
                 ltm_state = None  # Reset ROSA automaton states too
                 total_tokens_generated = 0
-                print("State Reset complete. Model is now fresh.")
+                autosave_chat_state()
+                print("Hierarchical state reset complete. LTM memory was left unchanged.")
                 continue
 
             if prompt.startswith('/status'):
@@ -772,6 +1149,7 @@ def chat(args, device, tokenizer):
                 print(f"  Device: {device}")
                 print(f"  Quantized: {is_quantized}")
                 print(f"  LTM Learning: {'ACTIVE' if learning_enabled else 'OFF'}")
+                print(f"  Chat State File: {chat_state_path or '(disabled)'}")
                 continue
 
             # =================================================================
@@ -850,7 +1228,11 @@ def chat(args, device, tokenizer):
             # =================================================================
             # B. GENERATION LOGIC
             # =================================================================
-            prompt_format = wrap_for_hierarchos(prompt, system_prompt=system_prompt)
+            prompt_format = wrap_for_hierarchos(
+                prompt,
+                system_prompt=system_prompt,
+                alpaca_mode=alpaca_chat_format,
+            )
             prompt_ids = tokenizer.encode(prompt_format, return_tensors="pt").to(device)
             passive_learning = getattr(args, 'passive_learning', False)
             passive_response_learning = getattr(args, 'passive_response_learning', False)
@@ -1024,7 +1406,11 @@ def chat(args, device, tokenizer):
                             ltm_state = outputs.get('ltm_memory_state', ltm_state)
 
                         logits = outputs["logits"].to(device)
+                        total_tokens_generated += current_ids.shape[-1]
                         next_token_logits = logits[:, -1, :]
+
+                        if should_stop_generation_from_uncertainty(next_token_logits, response_ids, tokenizer, args):
+                            break
 
                         # Apply repetition penalty
                         rep_penalty = getattr(args, 'repetition_penalty', 1.2)
@@ -1073,7 +1459,6 @@ def chat(args, device, tokenizer):
                             print(_flush, end="", flush=True)
                             _display_buffer = _display_buffer[-2:]
                         current_ids = next_token_id
-                        total_tokens_generated += 1
 
             # Leave Hebbian writes suppressed between turns. They are opened
             # only inside the praise/validation feedback path above.
@@ -1151,6 +1536,8 @@ def chat(args, device, tokenizer):
                 fv_norm = ltm_state[0].float().norm().item()
                 print(f"[LTM State | fast_vals norm: {fv_norm:.6e} | momentum reset]")
 
+            autosave_chat_state()
+
     except KeyboardInterrupt:
         print("\n\n[Ctrl+C detected. Exiting chat.]")
 
@@ -1195,7 +1582,7 @@ def chat(args, device, tokenizer):
                                 print(f"Error saving model: {e}")
                             break
                         elif response in ["n", "no"]:
-                            print("Changes will be discarded. Exiting.")
+                            print("LTM changes will be discarded.")
                             break
                         else:
                             print("Invalid input.")
@@ -1208,3 +1595,5 @@ def chat(args, device, tokenizer):
 
         elif ltm_has_been_updated:
             print("\n[Warning] LTM was updated, but no valid save configuration was found. Changes lost.")
+
+        prompt_save_chat_state_on_exit()

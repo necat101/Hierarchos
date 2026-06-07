@@ -1,318 +1,124 @@
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-def _choose_head_size(n_embd: int, requested=None) -> int:
-    n_embd = int(n_embd)
-    if requested:
-        requested = int(requested)
-        if requested > 0 and n_embd % requested == 0:
-            return requested
-
-    preferred = 64
-    candidates = [
-        size
-        for size in range(1, min(n_embd, 128) + 1)
-        if n_embd % size == 0
-    ]
-    if not candidates:
-        return 1
-
-    real_matrix_heads = [size for size in candidates if size >= 16]
-    if real_matrix_heads:
-        candidates = real_matrix_heads
-
-    return min(candidates, key=lambda size: (abs(math.log(size / preferred)), size > preferred))
-
-
-def _rwkv_lora_rank(width: int, scale: float) -> int:
-    if width < 128:
-        return 8
-    return max(32, int(round((scale * math.sqrt(width)) / 32.0) * 32))
-
-
-def _ortho_init(tensor: torch.Tensor, scale: float) -> torch.Tensor:
-    with torch.no_grad():
-        shape = tensor.shape
-        if len(shape) == 2:
-            gain = math.sqrt(shape[0] / shape[1]) if shape[0] > shape[1] else 1.0
-            nn.init.orthogonal_(tensor, gain=gain * scale)
-        elif len(shape) == 3:
-            gain = math.sqrt(shape[1] / shape[2]) if shape[1] > shape[2] else 1.0
-            for i in range(shape[0]):
-                nn.init.orthogonal_(tensor[i], gain=gain * scale)
-        else:
-            raise ValueError(f"Unsupported orthogonal init shape: {shape}")
-    return tensor
-
+import math
 
 class RWKVCell(nn.Module):
-    """
-    RWKV7/Heron-style recurrent block for Hierarchos H/L modules.
-
-    Public interface intentionally stays compatible with the old Hierarchos cell:
-    forward(x, state, timestep=None, deepemb_vec=None) -> (x, state).
-
-    Packed state layout, shape [B, C, 3 + head_size]:
-      slot 0: previous time-mix input (LayerNorm output)
-      slot 1: previous channel-mix input (LayerNorm output)
-      slot 2: latest v_first value, reserved for stack-compatible checkpoints
-      slots 3: per-head matrix state reshaped as [B, C, head_size]
-    """
-
-    def __init__(self, n_embd, head_size=None, layer_id: int = 0, n_layer: int = 2):
+    def __init__(self, n_embd):
         super().__init__()
-        self.n_embd = int(n_embd)
-        self.head_size = _choose_head_size(self.n_embd, head_size)
-        self.n_head = self.n_embd // self.head_size
-        self.layer_id = int(layer_id)
-        self.n_layer = max(2, int(n_layer))
-        self.state_size = 3 + self.head_size
-        self.state_clamp = 50.0
-        self.allow_legacy_state_migration = True
-        self._compiled_impl = None
+        self.n_embd = n_embd
 
-        C = self.n_embd
-        H = self.n_head
-        N = self.head_size
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
 
-        self.ln1 = nn.LayerNorm(C)
-        self.ln2 = nn.LayerNorm(C)
+        decay_speed = torch.arange(0, n_embd) / n_embd
+        self.time_decay = nn.Parameter(-5 + 4 * decay_speed) 
+        self.time_first = nn.Parameter(torch.ones(n_embd) * 0.5)
+        
+        curve = torch.arange(0, n_embd) / n_embd
+        curve = torch.pow(curve, 0.5) 
 
-        with torch.no_grad():
-            ratio_0_to_1 = self.layer_id / max(1, self.n_layer - 1)
-            ratio_1_to_almost0 = 1.0 - (self.layer_id / self.n_layer)
-            ddd = torch.arange(C, dtype=torch.float32).view(1, C) / C
+        self.time_mix_k = nn.Parameter(curve.view(1, 1, n_embd))
+        self.time_mix_v = nn.Parameter(curve.view(1, 1, n_embd) + 0.1 * torch.randn(1, 1, n_embd)) 
+        self.time_mix_r = nn.Parameter(0.5 * curve.view(1, 1, n_embd)) 
 
-            self.x_r = nn.Parameter(1.0 - torch.pow(ddd, 0.2 * ratio_1_to_almost0))
-            self.x_w = nn.Parameter(1.0 - torch.pow(ddd, 0.9 * ratio_1_to_almost0))
-            self.x_k = nn.Parameter(1.0 - torch.pow(ddd, 0.7 * ratio_1_to_almost0))
-            self.x_v = nn.Parameter(1.0 - torch.pow(ddd, 0.7 * ratio_1_to_almost0))
-            self.x_a = nn.Parameter(1.0 - torch.pow(ddd, 0.9 * ratio_1_to_almost0))
-            self.x_g = nn.Parameter(1.0 - torch.pow(ddd, 0.2 * ratio_1_to_almost0))
+        self.key = nn.Linear(n_embd, n_embd, bias=False)
+        self.value = nn.Linear(n_embd, n_embd, bias=False)
+        self.receptance = nn.Linear(n_embd, n_embd, bias=False)
+        self.output = nn.Linear(n_embd, n_embd, bias=False)
 
-            linear = torch.arange(C, dtype=torch.float32) / max(1, C - 1) - 0.5
-            zigzag = torch.empty(C, dtype=torch.float32)
-            www = torch.empty(C, dtype=torch.float32)
-            for n in range(C):
-                if N > 1:
-                    z = ((n % N) - ((N - 1) / 2.0)) / ((N - 1) / 2.0)
-                else:
-                    z = 0.0
-                zigzag[n] = z * abs(z)
-                www[n] = -6 + 6 * (n / max(1, C - 1)) ** (1 + ratio_0_to_1 ** 0.3)
+        self.time_mix_k_cm = nn.Parameter(torch.ones(1, 1, n_embd) * 0.05)
+        self.time_mix_r_cm = nn.Parameter(torch.ones(1, 1, n_embd) * 0.05)
 
-            d_decay = _rwkv_lora_rank(C, 2.5)
-            self.w1 = nn.Parameter(torch.zeros(C, d_decay))
-            self.w2 = nn.Parameter(_ortho_init(torch.zeros(d_decay, C), 0.1))
-            self.w0 = nn.Parameter((www + 0.5 + zigzag * 2.5).view(1, C))
-
-            d_aaa = _rwkv_lora_rank(C, 2.5)
-            self.a1 = nn.Parameter(torch.zeros(C, d_aaa))
-            self.a2 = nn.Parameter(_ortho_init(torch.zeros(d_aaa, C), 0.1))
-            self.a0 = nn.Parameter((-0.19 + zigzag * 0.3 + linear * 0.4).view(1, C))
-
-            if self.layer_id > 0:
-                d_mv = _rwkv_lora_rank(C, 1.7)
-                self.v1 = nn.Parameter(torch.zeros(C, d_mv))
-                self.v2 = nn.Parameter(_ortho_init(torch.zeros(d_mv, C), 0.1))
-                self.v0 = nn.Parameter((0.73 - linear * 0.4).view(1, C))
-
-            d_gate = _rwkv_lora_rank(C, 5.0)
-            self.g1 = nn.Parameter(torch.zeros(C, d_gate))
-            self.g2 = nn.Parameter(_ortho_init(torch.zeros(d_gate, C), 0.1))
-
-            self.k_k = nn.Parameter((0.71 - linear * 0.1).view(1, C))
-            self.k_a = nn.Parameter(torch.ones(1, C) * 1.02)
-            self.r_k = nn.Parameter(torch.zeros(H, N) - 0.04)
-
-        self.receptance = nn.Linear(C, C, bias=False)
-        self.key = nn.Linear(C, C, bias=False)
-        self.value = nn.Linear(C, C, bias=False)
-        self.output = nn.Linear(C, C, bias=False)
-        self.ln_x = nn.GroupNorm(H, C, eps=64e-5)
-
-        self.x_k_cm = nn.Parameter(torch.zeros(1, C))
-        self.key_cm = nn.Linear(C, C * 4, bias=False)
-        self.value_cm = nn.Linear(C * 4, C, bias=False)
-
-        with torch.no_grad():
-            self.receptance.weight.data.uniform_(-0.5 / math.sqrt(C), 0.5 / math.sqrt(C))
-            self.key.weight.data.uniform_(-0.05 / math.sqrt(C), 0.05 / math.sqrt(C))
-            self.value.weight.data.uniform_(-0.5 / math.sqrt(C), 0.5 / math.sqrt(C))
-            init_scale = 0.01 / math.sqrt(C)
-            self.output.weight.data.uniform_(-init_scale, init_scale)
-            self.value_cm.weight.data.uniform_(-init_scale, init_scale)
-            nn.init.orthogonal_(self.key_cm.weight.data, gain=math.sqrt(4.0))
-
-    def initial_state(self, batch_size: int, device=None, dtype=torch.float32) -> torch.Tensor:
-        return torch.zeros(
-            int(batch_size),
-            self.n_embd,
-            self.state_size,
-            device=device,
-            dtype=dtype,
-        )
-
-    def _empty_state(self, batch_size: int, device=None, dtype=torch.float32) -> torch.Tensor:
-        return torch.empty(
-            int(batch_size),
-            self.n_embd,
-            self.state_size,
-            device=device,
-            dtype=dtype,
-        )
-
-    def state_hidden(self, state: torch.Tensor) -> torch.Tensor:
-        if state is None:
-            raise ValueError("state_hidden requires a non-None state")
-        if state.dim() == 4 and state.shape[0] == 1:
-            state = state.squeeze(0)
-        return state[:, :, 0]
-
-    def compile_forward(self, **compile_kwargs) -> None:
-        if not hasattr(torch, "compile"):
-            return
-        self.allow_legacy_state_migration = False
-        object.__setattr__(
-            self,
-            "_compiled_impl",
-            torch.compile(self._forward_impl, **compile_kwargs),
-        )
-
-    def _prepare_state(self, state: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        B = x.shape[0]
-        if state is None:
-            return self.initial_state(B, device=x.device, dtype=torch.float32)
-        if state.dim() == 4 and state.shape[0] == 1:
-            state = state.squeeze(0)
-        state = state.to(device=x.device, dtype=torch.float32)
-        if state.shape == (B, self.n_embd, self.state_size):
-            if not self.allow_legacy_state_migration:
-                return state
-            # Old scalar-WKV states also used 5 slots and stored pp=-1e30 in
-            # slot 3. For tiny head_size=2 this collides with the new packed
-            # shape, so treat that sentinel as a legacy state to migrate.
-            if state[:, :, 3:].numel() == 0 or state[:, :, 3:].amin() > -1e20:
-                return state
-
-        migrated = self.initial_state(B, device=x.device, dtype=torch.float32)
-        common_b = min(B, state.shape[0])
-        common_c = min(self.n_embd, state.shape[1])
-        if state.dim() == 3 and state.shape[-1] > 0:
-            migrated[:common_b, :common_c, 0] = state[:common_b, :common_c, 0]
-            if state.shape[-1] > 4:
-                migrated[:common_b, :common_c, 1] = state[:common_b, :common_c, 4]
-            elif state.shape[-1] > 1:
-                migrated[:common_b, :common_c, 1] = state[:common_b, :common_c, 1]
-        return migrated
-
-    def _mix(self, x: torch.Tensor, previous: torch.Tensor, coeff: torch.Tensor) -> torch.Tensor:
-        return x + (previous - x) * coeff.to(dtype=x.dtype, device=x.device)
+        self.key_cm = nn.Linear(n_embd, n_embd * 4, bias=False)
+        self.receptance_cm = nn.Linear(n_embd, n_embd, bias=False)
+        self.value_cm = nn.Linear(n_embd * 4, n_embd, bias=False)
 
     def forward(self, x, state, timestep=None, deepemb_vec=None):
-        if self._compiled_impl is not None:
-            return self._compiled_impl(x, state, timestep, deepemb_vec)
-        return self._forward_impl(x, state, timestep, deepemb_vec)
-
-    def _forward_impl(self, x, state, timestep=None, deepemb_vec=None):
-        if x.dim() == 3 and x.shape[0] == 1:
-            x = x.squeeze(0)
+        # Handle torch.compile artifacts
+        if x.dim() == 3 and x.shape[0] == 1: x = x.squeeze(0)
+        if state.dim() == 4 and state.shape[0] == 1: state = state.squeeze(0)
         if deepemb_vec is not None and deepemb_vec.dim() == 3 and deepemb_vec.shape[0] == 1:
             deepemb_vec = deepemb_vec.squeeze(0)
 
-        state = self._prepare_state(state, x)
-
-        detach_every_n_steps = getattr(self, "detach_every_n_steps", None)
+        # Truncated BPTT logic
+        detach_every_n_steps = getattr(self, 'detach_every_n_steps', None)
         if self.training and detach_every_n_steps is not None and timestep is not None:
             if timestep > 0 and timestep % detach_every_n_steps == 0:
                 state = state.detach()
 
-        B, C = x.shape
-        H, N = self.n_head, self.head_size
-        x_dtype = x.dtype
-        x_resid_tm = x
-
-        prev_tm = state[:, :, 0].to(dtype=x_dtype)
-        prev_cm = state[:, :, 1].to(dtype=x_dtype)
-        matrix_state = state[:, :, 3:].contiguous().view(B, H, N, N)
-
+        x_resid_tm = x 
         x_norm = self.ln1(x)
-        xr = self._mix(x_norm, prev_tm, self.x_r)
-        xw = self._mix(x_norm, prev_tm, self.x_w)
-        xk = self._mix(x_norm, prev_tm, self.x_k)
-        xv = self._mix(x_norm, prev_tm, self.x_v)
-        xa = self._mix(x_norm, prev_tm, self.x_a)
-        xg = self._mix(x_norm, prev_tm, self.x_g)
+        x_in = x_norm 
 
-        r = self.receptance(xr)
+        tm_k = self.time_mix_k.view(-1)
+        tm_v = self.time_mix_v.view(-1)
+        tm_r = self.time_mix_r.view(-1)
+        tm_k_cm = self.time_mix_k_cm.view(-1)
+        tm_r_cm = self.time_mix_r_cm.view(-1)
+
+        # Unbind state: Slot 0 (sx) is the previous timestep's input
+        sx, aa, bb, pp, sx_cm = state.unbind(dim=-1)
+        # State is kept in float32 for stability; cast shift-mixers to match input dtype
+        sx = sx.to(dtype=x.dtype)
+        sx_cm = sx_cm.to(dtype=x.dtype)
+
+        # Time mixing
+        xk = x_norm * tm_k + sx * (1 - tm_k)
+        xv = x_norm * tm_v + sx * (1 - tm_v)
+        xr = x_norm * tm_r + sx * (1 - tm_r)
+
+        r = torch.sigmoid(self.receptance(xr))
         k = self.key(xk)
+        k = torch.clamp(k, max=60) 
         v = self.value(xv)
-        if self.layer_id == 0:
-            v_first = v
-        else:
-            v_first = state[:, :, 2].to(dtype=x_dtype)
-            v = v + (v_first - v) * torch.sigmoid(
-                self.v0.to(x_dtype) + (xv @ self.v1.to(x_dtype)) @ self.v2.to(x_dtype)
-            )
-        a = torch.sigmoid(self.a0.to(x_dtype) + (xa @ self.a1.to(x_dtype)) @ self.a2.to(x_dtype))
-        g = torch.sigmoid(xg @ self.g1.to(x_dtype)) @ self.g2.to(x_dtype)
-        w = -F.softplus(-(self.w0.to(x_dtype) + torch.tanh(xw @ self.w1.to(x_dtype)) @ self.w2.to(x_dtype))) - 0.5
 
-        kk = k * self.k_k.to(x_dtype)
-        kk = F.normalize(kk.view(B, H, N), dim=-1, p=2.0).view(B, C)
-        k = k * (1 + (a - 1) * self.k_a.to(x_dtype))
-        state_a = -kk
-        state_b = kk * a
+        # WKV Calculation (Float32 Stability)
+        with torch.amp.autocast(device_type=x.device.type, enabled=False):
+            k_f, v_f, pp_f, aa_f, bb_f = k.float(), v.float(), pp.float(), aa.float(), bb.float()
+            time_first_f = self.time_first.float()
+            time_decay_f = self.time_decay.float()
 
-        autocast_device = x.device.type if x.device.type in ("cuda", "cpu") else "cpu"
-        with torch.amp.autocast(device_type=autocast_device, enabled=False):
-            r_f = r.float().view(B, H, N)
-            k_f = k.float().view(B, H, N)
-            v_f = v.float().view(B, H, N)
-            a_f = state_a.float().view(B, H, N)
-            b_f = state_b.float().view(B, H, N)
-            w_decay = torch.exp(-torch.exp(torch.clamp(w.float(), min=-60.0, max=30.0))).view(B, H, N)
-            state_f = matrix_state.float()
+            ww = time_first_f + k_f
+            ww = torch.clamp(ww, max=30.0)
+            pp_f = torch.clamp(pp_f, max=30.0)
+            
+            p = torch.maximum(pp_f, ww)
+            e1 = torch.exp(pp_f - p)
+            e2 = torch.exp(ww - p)
+            
+            wkv = (e1 * aa_f + e2 * v_f) / (e1 * bb_f + e2 + 1e-8)
+            wkv = wkv.to(dtype=x.dtype)
 
-            sa = torch.matmul(state_f, a_f.unsqueeze(-1)).squeeze(-1)
-            state_f = (
-                state_f * w_decay.unsqueeze(-2)
-                + sa.unsqueeze(-1) * b_f.unsqueeze(-2)
-                + v_f.unsqueeze(-1) * k_f.unsqueeze(-2)
-            )
-            tmix = torch.matmul(state_f, r_f.unsqueeze(-1)).squeeze(-1).reshape(B, C)
+            # Update State
+            ww = pp_f + time_decay_f
+            ww = torch.clamp(ww, max=30.0)
+            
+            p = torch.maximum(ww, k_f)
+            e1 = torch.exp(ww - p)
+            e2 = torch.exp(k_f - p)
+            aa = e1 * aa_f + e2 * v_f
+            bb = e1 * bb_f + e2
+            pp = p
 
-        tmix = self.ln_x(tmix.to(dtype=x_dtype))
-        bonus = (
-            (
-                r.view(B, H, N)
-                * k.view(B, H, N)
-                * self.r_k.to(dtype=x_dtype, device=x.device)
-            ).sum(dim=-1, keepdim=True)
-            * v.view(B, H, N)
-        ).view(B, C)
-        tmix = tmix + bonus
-        x = x_resid_tm + self.output(tmix * g)
-
+        x = x_resid_tm + self.output(r * wkv)
+        
+        # Channel mixing
         x_resid_cm = x
         x_norm2 = self.ln2(x)
-        xk_cm = self._mix(x_norm2, prev_cm, self.x_k_cm)
-        ffn = torch.square(torch.relu(self.key_cm(xk_cm)))
+        xk = x_norm2 * tm_k_cm + sx_cm * (1 - tm_k_cm)
+        xr = x_norm2 * tm_r_cm + sx_cm * (1 - tm_r_cm)
+        
+        r = torch.sigmoid(self.receptance_cm(xr))
+        key_out = self.key_cm(xk)
+        k = F.silu(key_out) * torch.relu(key_out)
+        
         if deepemb_vec is not None:
-            ffn = ffn * deepemb_vec.to(dtype=ffn.dtype, device=ffn.device)
-        x = x_resid_cm + self.value_cm(ffn)
+            k = k * deepemb_vec
+            
+        x = x_resid_cm + r * self.value_cm(k)
 
-        new_state = torch.cat([
-            x_norm.float().unsqueeze(-1),
-            x_norm2.float().unsqueeze(-1),
-            v_first.float().unsqueeze(-1),
-            state_f.reshape(B, C, N)
-        ], dim=-1)
-        if self.state_clamp is not None:
-            new_state = torch.clamp(new_state, min=-self.state_clamp, max=self.state_clamp)
+        new_state = torch.stack([x_in.float(), aa, bb, pp, x_norm2.float()], dim=-1)
+        new_state = torch.clamp(new_state, min=-50.0, max=50.0)
 
         return x, new_state

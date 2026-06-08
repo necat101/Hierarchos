@@ -1329,6 +1329,16 @@ def main():
         dest="train_prompt_tokens",
         help="Legacy SFT behavior: mask prompt/instruction tokens from CE loss.",
     )
+    train_group.add_argument(
+        "--allow-masked-active-labels",
+        action="store_false",
+        dest="strict_all_token_loss",
+        default=True,
+        help=(
+            "Disable the trainer fail-fast audit that rejects label=-100 on real "
+            "prompt/completion tokens when --train-prompt-tokens is active."
+        ),
+    )
     train_group.add_argument("--lora_r", type=int, default=8)
     train_group.add_argument("--lora_alpha", type=int, default=16)
     train_group.add_argument("--grad-clip", type=float, default=1.0)

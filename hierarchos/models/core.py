@@ -855,8 +855,19 @@ class HierarchosCore(nn.Module):
             logits = _finite_clamp(logits, 30.0)
 
             if labels is not None:
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
+                if labels.ndim != 2 or labels.shape[0] != logits.shape[0]:
+                    raise ValueError(
+                        f"labels shape {tuple(labels.shape)} is incompatible with "
+                        f"logits shape {tuple(logits.shape)}"
+                    )
+                if labels.shape[1] > logits.shape[1] + 1:
+                    raise ValueError(
+                        "labels may be at most one token longer than input_ids for "
+                        "chunk-boundary lookahead loss"
+                    )
+                loss_hidden_len = min(logits.shape[1], max(0, labels.shape[1] - 1))
+                shift_logits = logits[..., :loss_hidden_len, :].contiguous()
+                shift_labels = labels[..., 1:1 + loss_hidden_len].contiguous()
                 
                 valid_mask = shift_labels != -100
                 if not valid_mask.any():
@@ -931,8 +942,19 @@ class HierarchosCore(nn.Module):
         PyTorch's mean cross-entropy with ignore_index=-100, and the z-loss is
         averaged over the same valid-token rows as the dense path.
         """
-        shift_hidden = hidden[:, :-1, :].contiguous()
-        shift_labels = labels[:, 1:].contiguous()
+        if labels.ndim != 2 or labels.shape[0] != hidden.shape[0]:
+            raise ValueError(
+                f"labels shape {tuple(labels.shape)} is incompatible with "
+                f"hidden shape {tuple(hidden.shape)}"
+            )
+        if labels.shape[1] > hidden.shape[1] + 1:
+            raise ValueError(
+                "labels may be at most one token longer than hidden for "
+                "chunk-boundary lookahead loss"
+            )
+        loss_hidden_len = min(hidden.shape[1], max(0, labels.shape[1] - 1))
+        shift_hidden = hidden[:, :loss_hidden_len, :].contiguous()
+        shift_labels = labels[:, 1:1 + loss_hidden_len].contiguous()
         flat_hidden = shift_hidden.view(-1, hidden.shape[-1])
         flat_labels = shift_labels.view(-1)
 

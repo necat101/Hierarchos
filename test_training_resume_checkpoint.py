@@ -119,6 +119,36 @@ class _HighFiniteLossModel(_NaNLossModel):
         }
 
 
+class _BoundaryRecordingModel(_NaNLossModel):
+    def __init__(self):
+        super().__init__()
+        self.seen = []
+
+    def forward(self, **kwargs):
+        input_ids = kwargs["input_ids"]
+        labels = kwargs["labels"]
+        self.seen.append((
+            kwargs.get("global_pos_offset"),
+            input_ids.detach().cpu().clone(),
+            labels.detach().cpu().clone(),
+        ))
+        shifted_labels = labels[:, 1:]
+        has_supervision = (shifted_labels != -100).any()
+        loss = self.weight * (1.0 if bool(has_supervision.item()) else 0.0)
+        return {
+            "loss": loss,
+            "ponder_cost": torch.zeros((), device=self.weight.device),
+            "commitment_cost": torch.zeros((), device=self.weight.device),
+            "raw_topk_vals": None,
+            "ltm_memory_state": None,
+            "h_state": None,
+            "l_state": None,
+            "prev_context": None,
+            "target_context": None,
+            "drift_state": None,
+        }
+
+
 def test_training_checkpoint_preserves_resume_only_state():
     model = _FakeTrainModel()
     model.ltm.fast_vals.fill_(3.0)
@@ -712,6 +742,86 @@ def test_train_step_caps_finite_loss_explosion_for_backward():
     assert args._train_step_had_nonfinite is False
     assert torch.equal(model.weight.detach(), before)
     assert states == (None, None, None, None, None, None)
+
+
+def test_train_step_passes_one_token_label_lookahead_across_chunks():
+    model = _BoundaryRecordingModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    args = SimpleNamespace(
+        amp=False,
+        training_chunk_size=3,
+        compile=False,
+        pad_token_id=0,
+        padding_metrics=False,
+        cpu_chunked_lm_loss=False,
+        cuda_chunked_lm_loss=False,
+        grad_clip=1.0,
+    )
+    batch = {
+        "input_ids": torch.tensor([[10, 11, 12, 13, 14, 15, 16]], dtype=torch.long),
+        "labels": torch.tensor([[10, 11, 12, 13, 14, 15, 16]], dtype=torch.long),
+        "attention_mask": torch.ones(1, 7, dtype=torch.long),
+    }
+
+    outputs, _states = train_step(
+        model,
+        batch,
+        optimizer,
+        scaler=None,
+        accumulation_steps=1,
+        step=0,
+        args=args,
+        running_states=(None, None, None, None, None, None),
+    )
+
+    assert outputs is not None
+    assert [entry[0] for entry in model.seen] == [0, 3, 6]
+    assert [entry[1].shape[1] for entry in model.seen] == [3, 3, 1]
+    assert [entry[2].shape[1] for entry in model.seen] == [4, 4, 1]
+    assert model.seen[0][2].tolist() == [[10, 11, 12, 13]]
+    assert model.seen[1][2].tolist() == [[13, 14, 15, 16]]
+    assert model.seen[2][2].tolist() == [[16]]
+
+
+def test_train_step_rejects_masked_active_labels_for_alpaca_all_token_recovery():
+    model = _BoundaryRecordingModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    args = SimpleNamespace(
+        amp=False,
+        training_chunk_size=8,
+        compile=False,
+        pad_token_id=0,
+        padding_metrics=False,
+        cpu_chunked_lm_loss=False,
+        cuda_chunked_lm_loss=False,
+        grad_clip=1.0,
+        alpaca=True,
+        train_prompt_tokens=True,
+        strict_all_token_loss=True,
+    )
+    batch = {
+        "input_ids": torch.tensor([[10, 11, 12, 13]], dtype=torch.long),
+        "labels": torch.tensor([[10, -100, 12, 13]], dtype=torch.long),
+        "attention_mask": torch.ones(1, 4, dtype=torch.long),
+    }
+
+    try:
+        train_step(
+            model,
+            batch,
+            optimizer,
+            scaler=None,
+            accumulation_steps=1,
+            step=0,
+            args=args,
+            running_states=(None, None, None, None, None, None),
+        )
+    except RuntimeError as exc:
+        assert "All-token loss audit failed" in str(exc)
+    else:
+        raise AssertionError("masked active Alpaca labels should fail the recovery audit")
+
+    assert model.seen == []
 
 
 def test_ltm_transient_recovery_resets_fast_and_saturates_momentum():

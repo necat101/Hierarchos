@@ -406,10 +406,12 @@ def compute_chunk_training_weights(labels: torch.Tensor, attention_mask: torch.T
     """
     Build TBPTT chunk weights that match the causal objective.
 
-    CrossEntropy is averaged over valid shifted labels inside each chunk, so the
-    trainer must weight chunk CE by the number of supervised answer tokens, not
-    by raw chunk count or total padded length. Auxiliary costs are token-level
-    dynamics, so they use real attention-mask tokens instead.
+    CrossEntropy is averaged over valid shifted labels inside each chunk. Each
+    input chunk receives a one-token label lookahead so the last hidden state in
+    a chunk is trained to predict the first token of the next chunk. That keeps
+    the causal objective equivalent to full-sequence CE across TBPTT chunk
+    boundaries. Auxiliary costs are token-level dynamics, so they use real
+    attention-mask tokens instead.
     """
     B, T = labels.shape
     if chunk_size <= 0 or chunk_size > T:
@@ -421,10 +423,11 @@ def compute_chunk_training_weights(labels: torch.Tensor, attention_mask: torch.T
 
     for start_t in range(0, T, chunk_size):
         end_t = min(start_t + chunk_size, T)
-        chunk_labels = labels[:, start_t:end_t]
+        loss_label_start = start_t + 1
+        loss_label_end = min(end_t + 1, T)
 
-        if chunk_labels.shape[1] > 1:
-            valid_predictions = int((chunk_labels[:, 1:] != -100).sum().item())
+        if loss_label_end > loss_label_start:
+            valid_predictions = int((labels[:, loss_label_start:loss_label_end] != -100).sum().item())
         else:
             valid_predictions = 0
 
@@ -453,6 +456,90 @@ def compute_chunk_training_weights(labels: torch.Tensor, attention_mask: torch.T
         )
 
     return chunks
+
+
+def compute_supervision_coverage_stats(labels: torch.Tensor, attention_mask: torch.Tensor = None):
+    if labels is None or labels.ndim != 2:
+        return {
+            "active_tokens": 0,
+            "active_masked_labels": 0,
+            "shifted_active_predictions": 0,
+            "shifted_supervised_predictions": 0,
+            "active_label_coverage": 0.0,
+            "shifted_supervision_coverage": 0.0,
+        }
+
+    labels_cpu = labels.detach().cpu()
+    if attention_mask is not None and attention_mask.ndim == 2 and attention_mask.shape == labels.shape:
+        active_mask = attention_mask.detach().cpu().to(dtype=torch.bool)
+    else:
+        active_mask = torch.ones_like(labels_cpu, dtype=torch.bool)
+
+    active_tokens = int(active_mask.sum().item())
+    active_masked_labels = int(((labels_cpu == -100) & active_mask).sum().item())
+    active_label_coverage = (
+        (active_tokens - active_masked_labels) / float(active_tokens)
+        if active_tokens > 0 else 0.0
+    )
+
+    if labels_cpu.shape[1] > 1:
+        shifted_active = active_mask[:, 1:]
+        shifted_labels = labels_cpu[:, 1:]
+        shifted_active_predictions = int(shifted_active.sum().item())
+        shifted_supervised_predictions = int(((shifted_labels != -100) & shifted_active).sum().item())
+    else:
+        shifted_active_predictions = 0
+        shifted_supervised_predictions = 0
+
+    shifted_supervision_coverage = (
+        shifted_supervised_predictions / float(shifted_active_predictions)
+        if shifted_active_predictions > 0 else 0.0
+    )
+
+    return {
+        "active_tokens": active_tokens,
+        "active_masked_labels": active_masked_labels,
+        "shifted_active_predictions": shifted_active_predictions,
+        "shifted_supervised_predictions": shifted_supervised_predictions,
+        "active_label_coverage": active_label_coverage,
+        "shifted_supervision_coverage": shifted_supervision_coverage,
+    }
+
+
+def audit_supervision_coverage_once(args, labels: torch.Tensor, attention_mask: torch.Tensor = None, *, step: int = 0):
+    if getattr(args, "_supervision_audit_done", False):
+        return None
+    args._supervision_audit_done = True
+
+    stats = compute_supervision_coverage_stats(labels, attention_mask)
+    print(
+        "INFO: Supervision coverage audit "
+        f"(step {step + 1}): active_tokens={stats['active_tokens']}, "
+        f"active_label_coverage={stats['active_label_coverage']:.4f}, "
+        f"shifted_ce_coverage={stats['shifted_supervision_coverage']:.4f}, "
+        f"masked_active_labels={stats['active_masked_labels']}."
+    )
+
+    prompt_completion_mode = (
+        getattr(args, 'alpaca', False)
+        or getattr(args, 'kayla', False)
+        or bool(getattr(args, 'prompt_column', None))
+        or bool(getattr(args, 'completion_column', None))
+    )
+    if (
+        prompt_completion_mode
+        and getattr(args, 'train_prompt_tokens', True)
+        and getattr(args, 'strict_all_token_loss', True)
+        and stats["active_masked_labels"] > 0
+    ):
+        raise RuntimeError(
+            "All-token loss audit failed: real prompt/completion tokens still have "
+            "label=-100 even though train_prompt_tokens=True. This usually means "
+            "a stale masked HF token cache/PT shard cache, legacy pretokenized data, "
+            "or --mask-prompt-tokens. Refresh/delete the token cache or pass "
+            "--allow-masked-active-labels only for intentional legacy SFT."
+        )
+    return stats
 
 def compute_remaining_update_steps(dataloader_len: int, accumulation_steps: int, start_epoch: int,
                                    total_epochs: int, start_step: int = 0) -> int:
@@ -945,6 +1032,7 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
         optimizer.zero_grad(set_to_none=True)
         return None, running_states
     # --------------------------------------------------
+    audit_supervision_coverage_once(args, full_labels, full_attention_mask, step=step)
     
     B, T = full_input_ids.shape
     h_state, l_state, prev_ctx, target_ctx, drift_state, ltm_state = running_states
@@ -1023,7 +1111,8 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
             # Slice tensors for this chunk
             input_ids = full_input_ids[:, start_t:end_t]
             attention_mask = full_attention_mask[:, start_t:end_t] if full_attention_mask is not None else None
-            labels = full_labels[:, start_t:end_t]
+            loss_end_t = min(end_t + 1, T)
+            labels = full_labels[:, start_t:loss_end_t]
             rosa_ids = full_rosa_ids[:, start_t:end_t] if full_rosa_ids is not None else None
             
             with autocast(device_type=autocast_device, dtype=amp_dtype, enabled=args.amp):
@@ -1107,9 +1196,10 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                     )
                     aux_loss = aux_loss + (getattr(args, 'commitment_loss_weight', 0.5) * commitment_cost_for_backward)
 
-                # CE is already averaged over valid labels within this chunk.
-                # Weight it by supervised answer-token count so long masked
-                # prompts/tool traces do not dilute the actual learning signal.
+                # CE is already averaged over valid shifted labels within this
+                # chunk. Weight it by supervised token count so chunk boundaries
+                # and masked legacy labels cannot dilute the actual learning
+                # signal.
                 chunk_loss = ((ce_loss_for_backward * label_ratio) + (aux_loss * token_ratio)) / accumulation_steps
 
                 chunk_loss_valid = _component_is_finite(chunk_loss)

@@ -206,6 +206,27 @@ def test_training_checkpoint_repairs_nonfinite_model_before_snapshot():
     assert model.proj.weight.data.view(-1)[0].item() == 1.0
 
 
+def test_training_checkpoint_does_not_apply_startup_weight_clamp_mid_run():
+    model = _FakeTrainModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    model.proj.weight.data.view(-1)[0] = 123.0
+    args = SimpleNamespace(startup_weight_max_abs=100.0)
+
+    checkpoint = build_training_checkpoint(
+        model,
+        optimizer,
+        scheduler=None,
+        scaler=None,
+        args=args,
+        dataloader=None,
+        completed_epoch=0,
+        mid_epoch_step=1,
+    )
+
+    assert checkpoint["model_state_dict"]["proj.weight"].view(-1)[0].item() == 123.0
+    assert model.proj.weight.data.view(-1)[0].item() == 123.0
+
+
 def test_mid_epoch_checkpoint_preserves_v8_running_ltm_state():
     model = _FakeTrainModel()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)

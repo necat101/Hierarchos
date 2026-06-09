@@ -359,7 +359,7 @@ def save_training_checkpoint_if_finite(checkpoint_dict, path: str, model, optimi
     if isinstance(checkpoint_dict, dict) and model is not None and "model_state_dict" in checkpoint_dict:
         checkpoint_dict["model_state_dict"] = sanitize_model_state_dict(model, reset_transient_ltm=False)
     _sanitize_model_transient_state_(model, max_abs=max_abs)
-    _sanitize_gradient_nonfinite_(model, max_abs=1.0)
+    _sanitize_gradient_nonfinite_(model, max_abs=max_abs)
     _sanitize_optimizer_state_(optimizer)
     ltm_cleaned = _sanitize_ltm_payload_state_(checkpoint_dict, max_abs=max_abs)
     if ltm_cleaned:
@@ -936,11 +936,6 @@ def build_training_checkpoint(
     running_states=None,
 ):
     _sanitize_model_nonfinite_(model, log_prefix="pre-checkpoint model")
-    _clamp_model_finite_magnitude_(
-        model,
-        getattr(args, 'startup_weight_max_abs', 100.0),
-        log_prefix="pre-checkpoint model",
-    )
     grad_state = capture_model_grad_state(model)
     checkpoint = {
         "checkpoint_version": 2,
@@ -1773,7 +1768,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     )
     _sanitize_model_transient_state_(model, max_abs=getattr(args, 'grad_clip', 1.0))
     _sanitize_optimizer_state_(optimizer)
-    _sanitize_gradient_nonfinite_(model, max_abs=1.0)
+    _sanitize_gradient_nonfinite_(model, max_abs=getattr(args, 'grad_clip', 1.0))
     # --- Evaluation Confirmation ---
     eval_tasks = getattr(args, 'eval_tasks', None)
     if eval_tasks:
@@ -2201,7 +2196,7 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
     )
     _sanitize_model_transient_state_(model, max_abs=getattr(args, 'grad_clip', 1.0))
     _sanitize_optimizer_state_(optimizer)
-    _sanitize_gradient_nonfinite_(model, max_abs=1.0)
+    _sanitize_gradient_nonfinite_(model, max_abs=getattr(args, 'grad_clip', 1.0))
 
     optimizer.zero_grad(set_to_none=True)
     global_step = 0

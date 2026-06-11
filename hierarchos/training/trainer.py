@@ -313,16 +313,12 @@ def _sanitize_model_transient_state_(model, max_abs: float = 1.0) -> int:
 
 def _sanitize_gradient_nonfinite_(model, max_abs: float) -> int:
     cleaned = 0
-    clamped = 0
     max_abs = _positive_float(max_abs, 1.0)
     for param in model.parameters():
         if param.grad is not None:
             cleaned += _sanitize_tensor_nonfinite_(param.grad, nan=0.0, posinf=max_abs, neginf=-max_abs)
-            clamped += _clamp_tensor_finite_magnitude_(param.grad, max_abs)
     if cleaned:
         print(f"WARNING: Sanitized {cleaned} non-finite gradient value(s): NaN->0, +Inf->{max_abs:g}, -Inf->{-max_abs:g} before clipping.")
-    if clamped:
-        print(f"WARNING: Saturated {clamped} finite gradient value(s) to +/-{max_abs:g} before global clipping.")
     return cleaned
 
 def _find_first_nonfinite_gradient_tensor(model):

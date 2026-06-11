@@ -23,6 +23,7 @@ from hierarchos.training.trainer import (
     training_state_is_finite,
     _sanitize_model_nonfinite_,
     _sanitize_model_transient_state_,
+    _sanitize_gradient_nonfinite_,
     _clamp_model_finite_magnitude_,
     _clip_gradients_and_check,
 )
@@ -609,6 +610,24 @@ def test_clip_gradients_and_check_saturates_huge_finite_gradients():
     assert torch.isfinite(model.proj.bias.grad).all()
     assert model.proj.weight.grad.abs().max().item() <= 1.0
     assert model.proj.bias.grad.abs().max().item() <= 1.0
+
+
+def test_gradient_sanitizer_preserves_finite_gradients_for_global_norm_clip():
+    model = _FakeTrainModel()
+    finite_grad = torch.tensor([[2.0, -3.0], [0.5, 1.5]])
+    model.proj.weight.grad = finite_grad.clone()
+
+    cleaned = _sanitize_gradient_nonfinite_(model, max_abs=1.0)
+
+    assert cleaned == 0
+    torch.testing.assert_close(model.proj.weight.grad, finite_grad)
+
+    ok, total_norm = _clip_gradients_and_check(model, max_norm=1.0)
+
+    assert ok is True
+    assert total_norm.item() > 1.0
+    expected = finite_grad * (1.0 / (finite_grad.norm().item() + 1e-6))
+    torch.testing.assert_close(model.proj.weight.grad, expected)
 
 
 def test_model_nonfinite_sanitizer_repairs_parameters_and_buffers():

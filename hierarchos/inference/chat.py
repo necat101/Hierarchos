@@ -110,22 +110,45 @@ def extract_correction_text(text: str):
 
 
 # --- Training-Parity Format Wrapper & Parser ---
-def wrap_for_hierarchos(raw_text, system_prompt=None, alpaca_mode=False):
+def wrap_for_hierarchos(raw_text, system_prompt=None, alpaca_mode=False, input_context=None):
     """Wraps user input into the exact format the model saw during training.
     
     The training pipeline supports both Alpaca and User/Assistant prompt
     formats. This wrapper must produce the matching prefix so the model sees
     in-distribution text at inference time.
     
-    An optional system_prompt is prepended inside the User field to guide
-    behavior without introducing OOD formatting.
+    An optional system_prompt is prepended inside the current instruction to
+    guide behavior without introducing OOD formatting.
     """
     clean_text = raw_text.strip()
     if system_prompt:
         clean_text = f"[{system_prompt}]\n{clean_text}"
     if alpaca_mode:
-        return f"### Instruction:\n{clean_text}\n\n### Response:\n"
+        prompt = f"### Instruction:\n{clean_text}\n\n"
+        input_context = str(input_context or "").strip()
+        if input_context:
+            prompt += f"### Input:\n{input_context}\n\n"
+        return prompt + "### Response:\n"
     return f"User: {clean_text}\n\nAssistant: "
+
+
+def build_chat_input_context(turn_history, max_turns=4, max_chars=3000):
+    """Build Alpaca Input text from previous chat turns."""
+    try:
+        max_turns = int(max_turns)
+    except (TypeError, ValueError):
+        max_turns = 0
+    try:
+        max_chars = int(max_chars)
+    except (TypeError, ValueError):
+        max_chars = 0
+    if max_turns <= 0 or max_chars <= 0:
+        return ""
+    selected = list(turn_history[-max_turns:])
+    context = "\n\n".join(t.strip() for t in selected if str(t).strip()).strip()
+    if len(context) > max_chars:
+        context = context[-max_chars:].lstrip()
+    return context
 
 
 def clean_hierarchos_output(raw_generation):
@@ -927,8 +950,20 @@ def chat(args, device, tokenizer):
         min_ts_filter = 0.0
         source_id_filter = None
         system_prompt = None  # Optional system prompt prepended inside the active training format
-        alpaca_chat_format = bool(getattr(config, "alpaca", False))
-        print(f"Chat prompt format: {'Alpaca ### Instruction/Response' if alpaca_chat_format else 'User/Assistant'}")
+        alpaca_chat_format = bool(getattr(args, "alpaca", False) or getattr(config, "alpaca", False))
+        chat_input_history_turns = int(getattr(args, "chat_input_history_turns", 4) or 0)
+        chat_input_history_chars = int(getattr(args, "chat_input_history_chars", 3000) or 0)
+        chat_turn_history = []
+        if alpaca_chat_format:
+            if chat_input_history_turns > 0 and chat_input_history_chars > 0:
+                print(
+                    "Chat prompt format: Alpaca ### Instruction/Input/Response "
+                    f"(Input uses last {chat_input_history_turns} turn(s), capped at {chat_input_history_chars} chars)"
+                )
+            else:
+                print("Chat prompt format: Alpaca ### Instruction/Response")
+        else:
+            print("Chat prompt format: User/Assistant")
 
         # =================================================================
         # 6. STATE INITIALIZATION
@@ -1139,6 +1174,7 @@ def chat(args, device, tokenizer):
                 drift_state.zero_()
                 ltm_state = None  # Reset ROSA automaton states too
                 total_tokens_generated = 0
+                chat_turn_history.clear()
                 autosave_chat_state()
                 print("Hierarchical state reset complete. LTM memory was left unchanged.")
                 continue
@@ -1232,6 +1268,11 @@ def chat(args, device, tokenizer):
                 prompt,
                 system_prompt=system_prompt,
                 alpaca_mode=alpaca_chat_format,
+                input_context=build_chat_input_context(
+                    chat_turn_history,
+                    max_turns=chat_input_history_turns,
+                    max_chars=chat_input_history_chars,
+                ) if alpaca_chat_format else None,
             )
             prompt_ids = tokenizer.encode(prompt_format, return_tensors="pt").to(device)
             passive_learning = getattr(args, 'passive_learning', False)
@@ -1488,6 +1529,14 @@ def chat(args, device, tokenizer):
                 )
 
             if len(response_ids) > 0:
+                response_text = clean_hierarchos_output(
+                    tokenizer.decode(response_ids, skip_special_tokens=True)
+                )
+                if response_text:
+                    chat_turn_history.append(f"User: {prompt.strip()}\nAssistant: {response_text}")
+                    max_keep_turns = max(chat_input_history_turns, 1)
+                    if len(chat_turn_history) > max_keep_turns:
+                        del chat_turn_history[:-max_keep_turns]
                 pending_training_data = {
                     'prompt_ids': prompt_ids,
                     'response_ids': torch.tensor(response_ids, device=device)

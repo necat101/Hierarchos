@@ -478,6 +478,7 @@ class HierarchosCore(nn.Module):
         return_logits = kwargs.pop("return_logits", True)
         return_topk_values = kwargs.pop("return_topk_values", True)
         cached_rosa_ids = kwargs.pop("rosa_ids", None)
+        loss_weights = kwargs.pop("loss_weights", None)
         suppress_hebbian = kwargs.pop("suppress_hebbian", getattr(self, "suppress_hebbian", True))
         if allow_hebbian_update:
             suppress_hebbian = False
@@ -844,6 +845,7 @@ class HierarchosCore(nn.Module):
                 final,
                 labels,
                 getattr(self.config, 'z_loss_weight', 1e-4),
+                loss_weights=loss_weights,
             )
         else:
             logits = self.lm_head(final)
@@ -868,6 +870,18 @@ class HierarchosCore(nn.Module):
                 loss_hidden_len = min(logits.shape[1], max(0, labels.shape[1] - 1))
                 shift_logits = logits[..., :loss_hidden_len, :].contiguous()
                 shift_labels = labels[..., 1:1 + loss_hidden_len].contiguous()
+                shift_weights = None
+                if loss_weights is not None:
+                    loss_weights = loss_weights.to(device=device, dtype=torch.float32)
+                    if loss_weights.ndim != 2 or loss_weights.shape[0] != logits.shape[0]:
+                        raise ValueError(
+                            f"loss_weights shape {tuple(loss_weights.shape)} is incompatible with "
+                            f"logits shape {tuple(logits.shape)}"
+                        )
+                    if loss_weights.shape[1] < labels.shape[1]:
+                        pad_cols = labels.shape[1] - loss_weights.shape[1]
+                        loss_weights = F.pad(loss_weights, (0, pad_cols), value=0.0)
+                    shift_weights = loss_weights[..., 1:1 + loss_hidden_len].contiguous()
                 
                 valid_mask = shift_labels != -100
                 if not valid_mask.any():
@@ -875,9 +889,19 @@ class HierarchosCore(nn.Module):
                 else:
                     flat_logits = shift_logits.view(-1, self.config.vocab_size).float()
                     flat_labels = shift_labels.view(-1)
+                    flat_ce = F.cross_entropy(
+                        flat_logits,
+                        flat_labels,
+                        reduction="none",
+                        ignore_index=-100,
+                    )
+                    valid_weight = valid_mask.view(-1).float()
+                    if shift_weights is not None:
+                        valid_weight = valid_weight * shift_weights.view(-1).float()
+                    denom = valid_weight.sum().clamp_min(1e-8)
                     
-                    # Base CE Loss computes natively ignoring -100
-                    loss = F.cross_entropy(flat_logits, flat_labels)
+                    # Base CE loss, optionally weighted toward assistant response tokens.
+                    loss = (flat_ce * valid_weight).sum() / denom
                     
                     # Z-Loss Regularization built to prevent exploding logits
                     z_loss_weight = getattr(self.config, 'z_loss_weight', 1e-4)
@@ -889,9 +913,8 @@ class HierarchosCore(nn.Module):
                         # with "expected self and source to have same dtypes".
                         _zloss_device = device.type if device.type in ('cuda', 'cpu') else 'cpu'
                         with torch.amp.autocast(device_type=_zloss_device, enabled=False):
-                            valid_mask_flat = flat_labels != -100
-                            valid_logits = flat_logits[valid_mask_flat]
-                            z_loss = torch.logsumexp(valid_logits, dim=-1).pow(2).mean() * z_loss_weight
+                            row_z = torch.logsumexp(flat_logits, dim=-1).pow(2)
+                            z_loss = ((row_z * valid_weight).sum() / denom) * z_loss_weight
                         loss = loss + z_loss
 
         if labels is not None:
@@ -933,7 +956,8 @@ class HierarchosCore(nn.Module):
         }
 
     def _compute_cuda_chunked_lm_loss(self, hidden: torch.Tensor, labels: torch.Tensor,
-                                      z_loss_weight: float = 1e-4) -> torch.Tensor:
+                                      z_loss_weight: float = 1e-4,
+                                      loss_weights: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Memory-friendly supervised-row loss path for large vocabularies.
 
@@ -955,16 +979,34 @@ class HierarchosCore(nn.Module):
         loss_hidden_len = min(hidden.shape[1], max(0, labels.shape[1] - 1))
         shift_hidden = hidden[:, :loss_hidden_len, :].contiguous()
         shift_labels = labels[:, 1:1 + loss_hidden_len].contiguous()
+        shift_weights = None
+        if loss_weights is not None:
+            loss_weights = loss_weights.to(device=hidden.device, dtype=torch.float32)
+            if loss_weights.ndim != 2 or loss_weights.shape[0] != hidden.shape[0]:
+                raise ValueError(
+                    f"loss_weights shape {tuple(loss_weights.shape)} is incompatible with "
+                    f"hidden shape {tuple(hidden.shape)}"
+                )
+            if loss_weights.shape[1] < labels.shape[1]:
+                pad_cols = labels.shape[1] - loss_weights.shape[1]
+                loss_weights = F.pad(loss_weights, (0, pad_cols), value=0.0)
+            shift_weights = loss_weights[:, 1:1 + loss_hidden_len].contiguous()
         flat_hidden = shift_hidden.view(-1, hidden.shape[-1])
         flat_labels = shift_labels.view(-1)
 
         valid_mask = flat_labels != -100
         valid_hidden = flat_hidden[valid_mask]
         valid_labels = flat_labels[valid_mask]
+        valid_weights = None
+        if shift_weights is not None:
+            valid_weights = shift_weights.view(-1)[valid_mask].float()
         valid_count = valid_labels.shape[0]
         if valid_count == 0:
             return hidden.sum() * 0.0
-        denom = torch.tensor(float(valid_count), device=hidden.device, dtype=torch.float32)
+        if valid_weights is None:
+            denom = torch.tensor(float(valid_count), device=hidden.device, dtype=torch.float32)
+        else:
+            denom = valid_weights.sum().clamp_min(1e-8)
 
         if hidden.device.type == "cpu":
             chunk_rows = int(getattr(self.config, "cpu_loss_chunk_rows", 0) or 0)
@@ -980,13 +1022,21 @@ class HierarchosCore(nn.Module):
             end = min(start + chunk_rows, valid_count)
             chunk_hidden = valid_hidden[start:end]
             chunk_labels = valid_labels[start:end]
+            chunk_weights = valid_weights[start:end] if valid_weights is not None else None
             chunk_logits = torch.clamp(self.lm_head(chunk_hidden), min=-30.0, max=30.0).float()
 
-            total_ce = total_ce + F.cross_entropy(chunk_logits, chunk_labels, reduction="sum")
+            if chunk_weights is None:
+                total_ce = total_ce + F.cross_entropy(chunk_logits, chunk_labels, reduction="sum")
+            else:
+                chunk_ce = F.cross_entropy(chunk_logits, chunk_labels, reduction="none")
+                total_ce = total_ce + (chunk_ce * chunk_weights).sum()
 
             if z_loss_weight > 0:
                 row_z = torch.logsumexp(chunk_logits, dim=-1).pow(2)
-                total_z = total_z + row_z.sum()
+                if chunk_weights is None:
+                    total_z = total_z + row_z.sum()
+                else:
+                    total_z = total_z + (row_z * chunk_weights).sum()
 
         loss = total_ce / denom
         if z_loss_weight > 0:

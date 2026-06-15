@@ -197,6 +197,156 @@ def _as_long_tensor(value):
         return value.to(dtype=torch.long)
     return torch.tensor(value, dtype=torch.long)
 
+def _as_float_tensor(value):
+    if isinstance(value, torch.Tensor):
+        return value.to(dtype=torch.float32)
+    return torch.tensor(value, dtype=torch.float32)
+
+def _normalize_loss_weight_args(prompt_loss_weight: float = 1.0,
+                                response_loss_weight: float = 1.0,
+                                response_boundary_loss_weight: float = 1.0,
+                                response_boundary_tokens: int = 0):
+    try:
+        prompt_loss_weight = max(0.0, float(prompt_loss_weight))
+    except (TypeError, ValueError):
+        prompt_loss_weight = 1.0
+    try:
+        response_loss_weight = max(0.0, float(response_loss_weight))
+    except (TypeError, ValueError):
+        response_loss_weight = 1.0
+    try:
+        response_boundary_loss_weight = max(0.0, float(response_boundary_loss_weight))
+    except (TypeError, ValueError):
+        response_boundary_loss_weight = 1.0
+    try:
+        response_boundary_tokens = max(0, int(response_boundary_tokens))
+    except (TypeError, ValueError):
+        response_boundary_tokens = 0
+    return (
+        prompt_loss_weight,
+        response_loss_weight,
+        response_boundary_loss_weight,
+        response_boundary_tokens,
+    )
+
+def _uses_custom_loss_weights(prompt_loss_weight: float = 1.0,
+                              response_loss_weight: float = 1.0,
+                              response_boundary_loss_weight: float = 1.0,
+                              response_boundary_tokens: int = 0):
+    prompt_loss_weight, response_loss_weight, response_boundary_loss_weight, response_boundary_tokens = (
+        _normalize_loss_weight_args(
+            prompt_loss_weight,
+            response_loss_weight,
+            response_boundary_loss_weight,
+            response_boundary_tokens,
+        )
+    )
+    return (
+        abs(prompt_loss_weight - 1.0) > 1e-8
+        or abs(response_loss_weight - 1.0) > 1e-8
+        or (response_boundary_tokens > 0 and abs(response_boundary_loss_weight - 1.0) > 1e-8)
+    )
+
+def _prompt_response_loss_weights(prompt_len: int, response_len: int,
+                                  train_prompt_tokens: bool,
+                                  prompt_loss_weight: float = 1.0,
+                                  response_loss_weight: float = 1.0,
+                                  response_boundary_loss_weight: float = 1.0,
+                                  response_boundary_tokens: int = 0):
+    prompt_loss_weight, response_loss_weight, response_boundary_loss_weight, response_boundary_tokens = (
+        _normalize_loss_weight_args(
+            prompt_loss_weight,
+            response_loss_weight,
+            response_boundary_loss_weight,
+            response_boundary_tokens,
+        )
+    )
+    if not _uses_custom_loss_weights(
+        prompt_loss_weight,
+        response_loss_weight,
+        response_boundary_loss_weight,
+        response_boundary_tokens,
+    ):
+        return None
+    prompt_weight = prompt_loss_weight if train_prompt_tokens else 0.0
+    weights = [prompt_weight] * max(0, int(prompt_len))
+    response_weights = [response_loss_weight] * max(0, int(response_len))
+    # The final response position is EOS for prompt/completion rows. Do not
+    # boost EOS, or short arithmetic rescue examples teach "end immediately."
+    boundary = min(max(0, len(response_weights) - 1), response_boundary_tokens)
+    for idx in range(boundary):
+        response_weights[idx] = response_loss_weight * response_boundary_loss_weight
+    return weights + response_weights
+
+def _compose_prompt_response_sample(prompt_ids, response_ids, eos_token_id, max_length: int,
+                                    train_prompt_tokens: bool,
+                                    prompt_loss_weight: float = 1.0,
+                                    response_loss_weight: float = 1.0,
+                                    response_boundary_loss_weight: float = 1.0,
+                                    response_boundary_tokens: int = 0,
+                                    min_response_tokens: int = 1):
+    """
+    Compose prompt/completion rows while preserving supervised answer tokens.
+
+    Overlong instruction/input fields can otherwise fill the entire sequence and
+    leave only an EOS after the response marker. For small assistant models that
+    is especially harmful: it teaches "stop" where the answer should start.
+    """
+    try:
+        max_length = int(max_length)
+    except (TypeError, ValueError):
+        max_length = 0
+    try:
+        min_response_tokens = max(0, int(min_response_tokens or 0))
+    except (TypeError, ValueError):
+        min_response_tokens = 1
+
+    prompt_ids = list(prompt_ids)
+    response_ids = list(response_ids)
+    if eos_token_id is None:
+        eos_token_id = response_ids[-1] if response_ids else 0
+    eos_token_id = int(eos_token_id)
+    full_response_ids = response_ids + [eos_token_id]
+
+    if max_length > 0 and len(prompt_ids) + len(full_response_ids) > max_length:
+        if not full_response_ids:
+            return None
+
+        min_answer_tokens = min(min_response_tokens, len(response_ids))
+        min_response_total = min(max_length, min_answer_tokens + 1)
+        if min_response_total <= 0:
+            min_response_total = min(max_length, 1)
+        prompt_budget = max_length - min_response_total
+        if prompt_budget < 0:
+            return None
+        if len(prompt_ids) > prompt_budget:
+            # Preserve the prompt suffix because it contains the response marker.
+            prompt_ids = prompt_ids[-prompt_budget:] if prompt_budget > 0 else []
+
+        response_budget = max_length - len(prompt_ids)
+        if response_budget <= 0:
+            return None
+        if len(full_response_ids) > response_budget:
+            full_response_ids = full_response_ids[:response_budget]
+            full_response_ids[-1] = eos_token_id
+
+    ids = prompt_ids + full_response_ids
+    if not ids:
+        return None
+
+    prompt_labels = prompt_ids if train_prompt_tokens else ([-100] * len(prompt_ids))
+    labels = prompt_labels + full_response_ids
+    loss_weights = _prompt_response_loss_weights(
+        len(prompt_ids),
+        len(full_response_ids),
+        train_prompt_tokens,
+        prompt_loss_weight,
+        response_loss_weight,
+        response_boundary_loss_weight,
+        response_boundary_tokens,
+    )
+    return ids, labels, loss_weights
+
 def _sample_effective_length(item, fallback_length: Optional[int] = None):
     if item is None:
         return fallback_length or 1
@@ -633,6 +783,14 @@ class TokenizedBinaryDataset(Dataset):
         self.offsets = index["offsets"].to(dtype=torch.long).contiguous()
         self.lengths = index["lengths"].to(dtype=torch.long).contiguous()
         self.has_rosa_ids = bool(index.get("has_rosa_ids", False))
+        self.has_loss_weights = bool(index.get("has_loss_weights", False))
+        self.loss_weight_dtype = str(index.get("loss_weight_dtype", "float16"))
+        if self.loss_weight_dtype == "float32":
+            self._loss_weight_torch_dtype = torch.float32
+            self._loss_weight_bytes = 4
+        else:
+            self._loss_weight_torch_dtype = torch.float16
+            self._loss_weight_bytes = 2
         self.rosa_sentinel = int(index.get("rosa_sentinel", 0))
         if self.offsets.numel() != self.lengths.numel():
             raise ValueError("Token cache index offsets/lengths size mismatch")
@@ -687,6 +845,7 @@ class TokenizedBinaryDataset(Dataset):
             return None
 
         label_offset = offset + (stored_length * 4)
+        after_labels_offset = label_offset + (stored_length * 4)
         input_ids = torch.frombuffer(self._mmap, dtype=torch.int32, count=length, offset=offset)
         labels = torch.frombuffer(self._mmap, dtype=torch.int32, count=length, offset=label_offset)
         item = {
@@ -694,8 +853,17 @@ class TokenizedBinaryDataset(Dataset):
             "labels": labels,
             "_length": length,
         }
+        if self.has_loss_weights:
+            item["loss_weights"] = torch.frombuffer(
+                self._mmap,
+                dtype=self._loss_weight_torch_dtype,
+                count=length,
+                offset=after_labels_offset,
+            ).to(dtype=torch.float32)
         if self.has_rosa_ids:
-            rosa_offset = label_offset + (stored_length * 4)
+            rosa_offset = after_labels_offset
+            if self.has_loss_weights:
+                rosa_offset += stored_length * self._loss_weight_bytes
             item["rosa_ids"] = torch.frombuffer(
                 self._mmap,
                 dtype=torch.int32,
@@ -729,10 +897,25 @@ def process_text_sample(tokenizer, text_dict: dict, max_length: int, kayla_mode:
                          text_column: Optional[str] = None,
                          prompt_column: Optional[str] = None, completion_column: Optional[str] = None,
                          alpaca_mode: bool = False,
-                         train_prompt_tokens: bool = True):
+                         train_prompt_tokens: bool = True,
+                         prompt_loss_weight: float = 1.0,
+                         response_loss_weight: float = 1.0,
+                         response_boundary_loss_weight: float = 1.0,
+                         response_boundary_tokens: int = 0,
+                         min_response_tokens: int = 1,
+                         drop_empty_completions: bool = True):
     try:
         if not isinstance(text_dict, dict):
             return None
+        prompt_loss_weight, response_loss_weight, response_boundary_loss_weight, response_boundary_tokens = (
+            _normalize_loss_weight_args(
+                prompt_loss_weight,
+                response_loss_weight,
+                response_boundary_loss_weight,
+                response_boundary_tokens,
+            )
+        )
+        loss_weights = None
 
         text_column, prompt_column, completion_column = _resolve_text_sample_columns(
             text_dict,
@@ -747,10 +930,19 @@ def process_text_sample(tokenizer, text_dict: dict, max_length: int, kayla_mode:
             if not text.strip(): return None
             ids = tokenizer.encode(text) + [tokenizer.eos_token_id]
             labels = list(ids)
+            if _uses_custom_loss_weights(
+                prompt_loss_weight,
+                response_loss_weight,
+                response_boundary_loss_weight,
+                response_boundary_tokens,
+            ):
+                loss_weights = [response_loss_weight] * len(ids)
         elif prompt_column and completion_column:
             instruction = str(text_dict.get(prompt_column, ""))
             output = str(text_dict.get(completion_column, ""))
             inp = str(text_dict.get('input', "")).strip()
+            if drop_empty_completions and not output.strip():
+                return None
             if not instruction.strip() and not output.strip() and not inp:
                 return None
             if kayla_mode:
@@ -762,16 +954,40 @@ def process_text_sample(tokenizer, text_dict: dict, max_length: int, kayla_mode:
                 p_ids = tokenizer.encode(prompt_text)
                 t_ids = tokenizer.encode(thought_text, add_special_tokens=False)
                 r_ids = tokenizer.encode(response_text, add_special_tokens=False)
-                ids = p_ids + t_ids + r_ids + [tokenizer.eos_token_id]
-                prompt_labels = p_ids if train_prompt_tokens else ([-100] * len(p_ids))
-                labels = prompt_labels + t_ids + r_ids + [tokenizer.eos_token_id]
+                composed = _compose_prompt_response_sample(
+                    p_ids,
+                    t_ids + r_ids,
+                    tokenizer.eos_token_id,
+                    max_length,
+                    train_prompt_tokens,
+                    prompt_loss_weight,
+                    response_loss_weight,
+                    response_boundary_loss_weight,
+                    response_boundary_tokens,
+                    min_response_tokens,
+                )
+                if composed is None:
+                    return None
+                ids, labels, loss_weights = composed
             elif alpaca_mode or _is_alpaca_prompt_pair(prompt_column, completion_column):
                 prompt = _format_alpaca_prompt(instruction, inp)
                 p_ids = tokenizer.encode(prompt)
                 c_ids = tokenizer.encode(output, add_special_tokens=False)
-                ids = p_ids + c_ids + [tokenizer.eos_token_id]
-                prompt_labels = p_ids if train_prompt_tokens else ([-100] * len(p_ids))
-                labels = prompt_labels + c_ids + [tokenizer.eos_token_id]
+                composed = _compose_prompt_response_sample(
+                    p_ids,
+                    c_ids,
+                    tokenizer.eos_token_id,
+                    max_length,
+                    train_prompt_tokens,
+                    prompt_loss_weight,
+                    response_loss_weight,
+                    response_boundary_loss_weight,
+                    response_boundary_tokens,
+                    min_response_tokens,
+                )
+                if composed is None:
+                    return None
+                ids, labels, loss_weights = composed
             else:
                 if inp:
                     prompt = f"User: {inp}\n\nUser: {instruction}\n\nAssistant: "
@@ -779,16 +995,40 @@ def process_text_sample(tokenizer, text_dict: dict, max_length: int, kayla_mode:
                     prompt = f"User: {instruction}\n\nAssistant: "
                 p_ids = tokenizer.encode(prompt)
                 c_ids = tokenizer.encode(output, add_special_tokens=False)
-                ids = p_ids + c_ids + [tokenizer.eos_token_id]
-                prompt_labels = p_ids if train_prompt_tokens else ([-100] * len(p_ids))
-                labels = prompt_labels + c_ids + [tokenizer.eos_token_id]
+                composed = _compose_prompt_response_sample(
+                    p_ids,
+                    c_ids,
+                    tokenizer.eos_token_id,
+                    max_length,
+                    train_prompt_tokens,
+                    prompt_loss_weight,
+                    response_loss_weight,
+                    response_boundary_loss_weight,
+                    response_boundary_tokens,
+                    min_response_tokens,
+                )
+                if composed is None:
+                    return None
+                ids, labels, loss_weights = composed
         else: return None
-        if len(ids) > max_length: ids, labels = ids[:max_length-1] + [tokenizer.eos_token_id], labels[:max_length-1] + [tokenizer.eos_token_id]
-        return {
+        if len(ids) > max_length:
+            ids = ids[:max_length-1] + [tokenizer.eos_token_id]
+            labels = labels[:max_length-1] + [tokenizer.eos_token_id]
+            if loss_weights is not None:
+                eos_weight = loss_weights[-1] if loss_weights else 1.0
+                loss_weights = loss_weights[:max_length-1] + [eos_weight]
+        sample = {
             "input_ids": torch.tensor(ids, dtype=torch.long),
             "labels": torch.tensor(labels, dtype=torch.long),
             "_length": len(ids),
         }
+        if loss_weights is not None:
+            if len(loss_weights) < len(ids):
+                loss_weights = loss_weights + ([1.0] * (len(ids) - len(loss_weights)))
+            elif len(loss_weights) > len(ids):
+                loss_weights = loss_weights[:len(ids)]
+            sample["loss_weights"] = torch.tensor(loss_weights, dtype=torch.float32)
+        return sample
     except: return None
 
 def process_tokenized_sample(text_dict: dict, max_length: Optional[int] = None):
@@ -799,6 +1039,7 @@ def process_tokenized_sample(text_dict: dict, max_length: Optional[int] = None):
         input_ids = text_dict.get("input_ids")
         labels = text_dict.get("labels", input_ids)
         attention_mask = text_dict.get("attention_mask")
+        loss_weights = text_dict.get("loss_weights")
 
         if isinstance(input_ids, torch.Tensor):
             input_ids = input_ids.detach().cpu().tolist()
@@ -806,9 +1047,13 @@ def process_tokenized_sample(text_dict: dict, max_length: Optional[int] = None):
             labels = labels.detach().cpu().tolist()
         if isinstance(attention_mask, torch.Tensor):
             attention_mask = attention_mask.detach().cpu().tolist()
+        if isinstance(loss_weights, torch.Tensor):
+            loss_weights = loss_weights.detach().cpu().tolist()
 
         input_ids = [int(value) for value in input_ids]
         labels = [int(value) for value in labels]
+        if loss_weights is not None:
+            loss_weights = [float(value) for value in loss_weights]
         if not input_ids:
             return None
 
@@ -818,6 +1063,8 @@ def process_tokenized_sample(text_dict: dict, max_length: Optional[int] = None):
             labels = labels[:max_len]
             if attention_mask is not None:
                 attention_mask = attention_mask[:max_len]
+            if loss_weights is not None:
+                loss_weights = loss_weights[:max_len]
 
         if len(labels) < len(input_ids):
             labels = labels + ([-100] * (len(input_ids) - len(labels)))
@@ -832,6 +1079,11 @@ def process_tokenized_sample(text_dict: dict, max_length: Optional[int] = None):
                 attention_mask = attention_mask + ([1] * (len(input_ids) - len(attention_mask)))
             elif len(attention_mask) > len(input_ids):
                 attention_mask = attention_mask[:len(input_ids)]
+        if loss_weights is not None:
+            if len(loss_weights) < len(input_ids):
+                loss_weights = loss_weights + ([1.0] * (len(input_ids) - len(loss_weights)))
+            elif len(loss_weights) > len(input_ids):
+                loss_weights = loss_weights[:len(input_ids)]
 
         length = text_dict.get("_length", text_dict.get("length", text_dict.get("valid_length")))
         try:
@@ -843,12 +1095,15 @@ def process_tokenized_sample(text_dict: dict, max_length: Optional[int] = None):
             )
         length = max(1, min(len(input_ids), length))
 
-        return {
+        sample = {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "labels": torch.tensor(labels, dtype=torch.long),
             "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
             "_length": length,
         }
+        if loss_weights is not None:
+            sample["loss_weights"] = torch.tensor(loss_weights, dtype=torch.float32)
+        return sample
     except Exception:
         return None
 
@@ -858,7 +1113,13 @@ class OriginalJSONLDataset(Dataset):
                  prompt_column: Optional[str] = None,
                  completion_column: Optional[str] = None,
                  alpaca_mode: bool = False,
-                 train_prompt_tokens: bool = True):
+                 train_prompt_tokens: bool = True,
+                 prompt_loss_weight: float = 1.0,
+                 response_loss_weight: float = 1.0,
+                 response_boundary_loss_weight: float = 1.0,
+                 response_boundary_tokens: int = 0,
+                 min_response_tokens: int = 1,
+                 drop_empty_completions: bool = True):
         super().__init__()
         self.tokenizer, self.max_length, self.kayla_mode, self.samples = tokenizer, max_length, kayla_mode, []
         self.sample_lengths = []
@@ -876,6 +1137,12 @@ class OriginalJSONLDataset(Dataset):
                 completion_column=completion_column,
                 alpaca_mode=alpaca_mode,
                 train_prompt_tokens=train_prompt_tokens,
+                prompt_loss_weight=prompt_loss_weight,
+                response_loss_weight=response_loss_weight,
+                response_boundary_loss_weight=response_boundary_loss_weight,
+                response_boundary_tokens=response_boundary_tokens,
+                min_response_tokens=min_response_tokens,
+                drop_empty_completions=drop_empty_completions,
             )
             if processed:
                 self.samples.append(processed)
@@ -932,7 +1199,13 @@ class StreamingJSONLDataset(IterableDataset):
                  bucket_size: int = 0, batch_size: int = 1,
                  shuffle_buckets: bool = True,
                  alpaca_mode: bool = False,
-                 train_prompt_tokens: bool = True):
+                 train_prompt_tokens: bool = True,
+                 prompt_loss_weight: float = 1.0,
+                 response_loss_weight: float = 1.0,
+                 response_boundary_loss_weight: float = 1.0,
+                 response_boundary_tokens: int = 0,
+                 min_response_tokens: int = 1,
+                 drop_empty_completions: bool = True):
         super().__init__()
         self.path = path
         self.paths = _resolve_jsonl_paths(path)
@@ -944,6 +1217,12 @@ class StreamingJSONLDataset(IterableDataset):
         self.completion_column = completion_column
         self.alpaca_mode = alpaca_mode
         self.train_prompt_tokens = bool(train_prompt_tokens)
+        self.prompt_loss_weight = prompt_loss_weight
+        self.response_loss_weight = response_loss_weight
+        self.response_boundary_loss_weight = response_boundary_loss_weight
+        self.response_boundary_tokens = response_boundary_tokens
+        self.min_response_tokens = min_response_tokens
+        self.drop_empty_completions = bool(drop_empty_completions)
         self.bucket_size = max(0, int(bucket_size or 0))
         self.batch_size = max(1, int(batch_size))
         self.shuffle_buckets = bool(shuffle_buckets)
@@ -982,6 +1261,12 @@ class StreamingJSONLDataset(IterableDataset):
                     completion_column=self.completion_column,
                     alpaca_mode=self.alpaca_mode,
                     train_prompt_tokens=self.train_prompt_tokens,
+                    prompt_loss_weight=self.prompt_loss_weight,
+                    response_loss_weight=self.response_loss_weight,
+                    response_boundary_loss_weight=self.response_boundary_loss_weight,
+                    response_boundary_tokens=self.response_boundary_tokens,
+                    min_response_tokens=self.min_response_tokens,
+                    drop_empty_completions=self.drop_empty_completions,
                 )
             if processed is None:
                 continue
@@ -1046,7 +1331,13 @@ class HuggingFaceStreamingDataset(IterableDataset):
                  bucket_size: int = 0, batch_size: int = 1,
                  shuffle: bool = True, shuffle_buffer_size: int = 10000,
                  alpaca_mode: bool = False,
-                 train_prompt_tokens: bool = True):
+                 train_prompt_tokens: bool = True,
+                 prompt_loss_weight: float = 1.0,
+                 response_loss_weight: float = 1.0,
+                 response_boundary_loss_weight: float = 1.0,
+                 response_boundary_tokens: int = 0,
+                 min_response_tokens: int = 1,
+                 drop_empty_completions: bool = True):
         super().__init__()
         self.hf_dataset = hf_dataset
         self.tokenizer = tokenizer
@@ -1057,6 +1348,12 @@ class HuggingFaceStreamingDataset(IterableDataset):
         self.completion_column = completion_column
         self.alpaca_mode = alpaca_mode
         self.train_prompt_tokens = bool(train_prompt_tokens)
+        self.prompt_loss_weight = prompt_loss_weight
+        self.response_loss_weight = response_loss_weight
+        self.response_boundary_loss_weight = response_boundary_loss_weight
+        self.response_boundary_tokens = response_boundary_tokens
+        self.min_response_tokens = min_response_tokens
+        self.drop_empty_completions = bool(drop_empty_completions)
         self.bucket_size = max(0, int(bucket_size or 0))
         self.batch_size = max(1, int(batch_size))
         self.shuffle = bool(shuffle)
@@ -1095,6 +1392,12 @@ class HuggingFaceStreamingDataset(IterableDataset):
                 self.completion_column,
                 self.alpaca_mode,
                 self.train_prompt_tokens,
+                self.prompt_loss_weight,
+                self.response_loss_weight,
+                self.response_boundary_loss_weight,
+                self.response_boundary_tokens,
+                self.min_response_tokens,
+                self.drop_empty_completions,
             )
             if processed is None:
                 continue
@@ -1110,16 +1413,22 @@ class HuggingFaceStreamingDataset(IterableDataset):
             yield from _yield_length_bucket(bucket, self.batch_size, self.shuffle, generator)
 
 class HuggingFaceMapStyleDataset(Dataset):
-    def __init__(self, hf_dataset, tokenizer, max_length, kayla_mode=False, text_column=None, prompt_column=None, completion_column=None, alpaca_mode: bool = False, train_prompt_tokens: bool = True):
+    def __init__(self, hf_dataset, tokenizer, max_length, kayla_mode=False, text_column=None, prompt_column=None, completion_column=None, alpaca_mode: bool = False, train_prompt_tokens: bool = True, prompt_loss_weight: float = 1.0, response_loss_weight: float = 1.0, response_boundary_loss_weight: float = 1.0, response_boundary_tokens: int = 0, min_response_tokens: int = 1, drop_empty_completions: bool = True):
         super().__init__()
         self.hf_dataset, self.tokenizer, self.max_length, self.kayla_mode = hf_dataset, tokenizer, max_length, kayla_mode
         self.text_column, self.prompt_column, self.completion_column = text_column, prompt_column, completion_column
         self.alpaca_mode = alpaca_mode
         self.train_prompt_tokens = bool(train_prompt_tokens)
+        self.prompt_loss_weight = prompt_loss_weight
+        self.response_loss_weight = response_loss_weight
+        self.response_boundary_loss_weight = response_boundary_loss_weight
+        self.response_boundary_tokens = response_boundary_tokens
+        self.min_response_tokens = min_response_tokens
+        self.drop_empty_completions = bool(drop_empty_completions)
         self.sample_lengths = None
     def __len__(self): return len(self.hf_dataset)
     def __getitem__(self, idx):
-        return process_text_sample(self.tokenizer, self.hf_dataset[idx], self.max_length, self.kayla_mode, self.text_column, self.prompt_column, self.completion_column, self.alpaca_mode, self.train_prompt_tokens)
+        return process_text_sample(self.tokenizer, self.hf_dataset[idx], self.max_length, self.kayla_mode, self.text_column, self.prompt_column, self.completion_column, self.alpaca_mode, self.train_prompt_tokens, self.prompt_loss_weight, self.response_loss_weight, self.response_boundary_loss_weight, self.response_boundary_tokens, self.min_response_tokens, self.drop_empty_completions)
     def get_sample_lengths(self):
         if self.sample_lengths is not None:
             return self.sample_lengths
@@ -1143,6 +1452,12 @@ class HuggingFaceMapStyleDataset(Dataset):
                         self.completion_column,
                         self.alpaca_mode,
                         self.train_prompt_tokens,
+                        self.prompt_loss_weight,
+                        self.response_loss_weight,
+                        self.response_boundary_loss_weight,
+                        self.response_boundary_tokens,
+                        self.min_response_tokens,
+                        self.drop_empty_completions,
                     )
                     length = len(processed["input_ids"]) if processed is not None else None
             except Exception:
@@ -1160,6 +1475,8 @@ def _collate_training_batch(batch, pad_token_id):
     ids = torch.full((len(batch), ml), pad_token_id, dtype=torch.long)
     labels = torch.full((len(batch), ml), -100, dtype=torch.long)
     mask = torch.zeros((len(batch), ml), dtype=torch.long)
+    has_loss_weights = any("loss_weights" in item for item in batch)
+    loss_weights = torch.zeros((len(batch), ml), dtype=torch.float32) if has_loss_weights else None
     has_rosa_ids = any("rosa_ids" in item for item in batch)
     rosa_ids = None
     if has_rosa_ids:
@@ -1172,19 +1489,27 @@ def _collate_training_batch(batch, pad_token_id):
         item_labels = _as_long_tensor(item["labels"])
         item_mask = item.get("attention_mask")
         item_mask = _as_long_tensor(item_mask) if item_mask is not None else None
+        item_weights = item.get("loss_weights")
+        item_weights = _as_float_tensor(item_weights) if item_weights is not None else None
 
         sl = min(ml, item_ids.numel(), item_labels.numel())
         if item_mask is not None:
             sl = min(sl, item_mask.numel())
+        if item_weights is not None:
+            sl = min(sl, item_weights.numel())
         ids[i, :sl] = item_ids[:sl]
         labels[i, :sl] = item_labels[:sl]
         mask[i, :sl] = item_mask[:sl] if item_mask is not None else 1
+        if loss_weights is not None:
+            loss_weights[i, :sl] = item_weights[:sl] if item_weights is not None else 1.0
         if rosa_ids is not None:
             if "rosa_ids" not in item:
                 raise ValueError("Cannot mix cached-ROSA and live-ROSA samples in one batch")
             item_rosa = _as_long_tensor(item["rosa_ids"])
             rosa_ids[i, :min(sl, item_rosa.numel())] = item_rosa[:min(sl, item_rosa.numel())]
     batch_out = {"input_ids": ids, "labels": labels, "attention_mask": mask}
+    if loss_weights is not None:
+        batch_out["loss_weights"] = loss_weights
     if rosa_ids is not None:
         batch_out["rosa_ids"] = rosa_ids
     return batch_out
@@ -1200,7 +1525,13 @@ def create_dataloader_for_jsonl(path, tokenizer, max_length, batch_size, pad_tok
                                 use_length_bucketing=True, bucket_size=None,
                                 device=None, prefetch_factor=None,
                                 alpaca_mode: bool = False,
-                                train_prompt_tokens: bool = True):
+                                train_prompt_tokens: bool = True,
+                                prompt_loss_weight: float = 1.0,
+                                response_loss_weight: float = 1.0,
+                                response_boundary_loss_weight: float = 1.0,
+                                response_boundary_tokens: int = 0,
+                                min_response_tokens: int = 1,
+                                drop_empty_completions: bool = True):
     dataset = StreamingJSONLDataset(
         path,
         tokenizer,
@@ -1211,6 +1542,12 @@ def create_dataloader_for_jsonl(path, tokenizer, max_length, batch_size, pad_tok
         completion_column=completion_column,
         alpaca_mode=alpaca_mode,
         train_prompt_tokens=train_prompt_tokens,
+        prompt_loss_weight=prompt_loss_weight,
+        response_loss_weight=response_loss_weight,
+        response_boundary_loss_weight=response_boundary_loss_weight,
+        response_boundary_tokens=response_boundary_tokens,
+        min_response_tokens=min_response_tokens,
+        drop_empty_completions=drop_empty_completions,
         bucket_size=_streaming_bucket_size(batch_size, use_length_bucketing, bucket_size),
         batch_size=batch_size,
         shuffle_buckets=True,
@@ -1233,7 +1570,13 @@ def create_dataloader_for_hf_streaming(hf_dataset, tokenizer, max_length, batch_
                                        shuffle=True, shuffle_buffer_size=10000,
                                        device=None, prefetch_factor=None,
                                        alpaca_mode: bool = False,
-                                       train_prompt_tokens: bool = True):
+                                       train_prompt_tokens: bool = True,
+                                       prompt_loss_weight: float = 1.0,
+                                       response_loss_weight: float = 1.0,
+                                       response_boundary_loss_weight: float = 1.0,
+                                       response_boundary_tokens: int = 0,
+                                       min_response_tokens: int = 1,
+                                       drop_empty_completions: bool = True):
     dataset = HuggingFaceStreamingDataset(
         hf_dataset,
         tokenizer,
@@ -1244,6 +1587,12 @@ def create_dataloader_for_hf_streaming(hf_dataset, tokenizer, max_length, batch_
         completion_column=completion_column,
         alpaca_mode=alpaca_mode,
         train_prompt_tokens=train_prompt_tokens,
+        prompt_loss_weight=prompt_loss_weight,
+        response_loss_weight=response_loss_weight,
+        response_boundary_loss_weight=response_boundary_loss_weight,
+        response_boundary_tokens=response_boundary_tokens,
+        min_response_tokens=min_response_tokens,
+        drop_empty_completions=drop_empty_completions,
         bucket_size=_streaming_bucket_size(batch_size, use_length_bucketing, bucket_size),
         batch_size=batch_size,
         shuffle=shuffle,

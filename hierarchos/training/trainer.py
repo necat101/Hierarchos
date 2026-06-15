@@ -2,7 +2,7 @@ import os
 import torch
 import torch.nn as nn
 from torch.amp import GradScaler, autocast
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import LambdaLR
 import time
 import random
 from tqdm import tqdm
@@ -387,6 +387,9 @@ def _clip_gradients_and_check(model, max_norm: float):
         return False, issue
     return True, total_norm
 
+def _has_pending_gradients(model) -> bool:
+    return any(p.requires_grad and p.grad is not None for p in model.parameters())
+
 def set_model_training_step(model, step: int):
     setter = getattr(model, "set_training_step", None)
     if callable(setter):
@@ -398,16 +401,17 @@ def set_model_training_step(model, step: int):
     if callable(setter):
         setter(step)
 
-def compute_chunk_training_weights(labels: torch.Tensor, attention_mask: torch.Tensor = None, chunk_size: int = 128):
+def compute_chunk_training_weights(labels: torch.Tensor, attention_mask: torch.Tensor = None,
+                                   chunk_size: int = 128, loss_weights: torch.Tensor = None):
     """
     Build TBPTT chunk weights that match the causal objective.
 
     CrossEntropy is averaged over valid shifted labels inside each chunk. Each
     input chunk receives a one-token label lookahead so the last hidden state in
-    a chunk is trained to predict the first token of the next chunk. That keeps
-    the causal objective equivalent to full-sequence CE across TBPTT chunk
-    boundaries. Auxiliary costs are token-level dynamics, so they use real
-    attention-mask tokens instead.
+    a chunk is trained to predict the first token of the next chunk. When
+    loss_weights are present, CE chunks are aggregated by supervised weight
+    mass rather than raw label count. Auxiliary costs are token-level dynamics,
+    so they use real attention-mask tokens instead.
     """
     B, T = labels.shape
     if chunk_size <= 0 or chunk_size > T:
@@ -415,6 +419,7 @@ def compute_chunk_training_weights(labels: torch.Tensor, attention_mask: torch.T
 
     chunks = []
     total_valid_predictions = 0
+    total_prediction_weight = 0.0
     total_real_tokens = 0
 
     for start_t in range(0, T, chunk_size):
@@ -423,9 +428,16 @@ def compute_chunk_training_weights(labels: torch.Tensor, attention_mask: torch.T
         loss_label_end = min(end_t + 1, T)
 
         if loss_label_end > loss_label_start:
-            valid_predictions = int((labels[:, loss_label_start:loss_label_end] != -100).sum().item())
+            valid_mask = labels[:, loss_label_start:loss_label_end] != -100
+            valid_predictions = int(valid_mask.sum().item())
+            if loss_weights is not None:
+                weight_slice = loss_weights[:, loss_label_start:loss_label_end].float()
+                prediction_weight = float((weight_slice * valid_mask.float()).sum().item())
+            else:
+                prediction_weight = float(valid_predictions)
         else:
             valid_predictions = 0
+            prediction_weight = 0.0
 
         if attention_mask is not None:
             real_tokens = int(attention_mask[:, start_t:end_t].sum().item())
@@ -436,15 +448,17 @@ def compute_chunk_training_weights(labels: torch.Tensor, attention_mask: torch.T
             "start": start_t,
             "end": end_t,
             "valid_predictions": valid_predictions,
+            "prediction_weight": prediction_weight,
             "real_tokens": real_tokens,
         })
         total_valid_predictions += valid_predictions
+        total_prediction_weight += prediction_weight
         total_real_tokens += real_tokens
 
     for chunk in chunks:
         chunk["label_ratio"] = (
-            chunk["valid_predictions"] / float(total_valid_predictions)
-            if total_valid_predictions > 0 else 0.0
+            chunk["prediction_weight"] / float(total_prediction_weight)
+            if total_prediction_weight > 0 else 0.0
         )
         chunk["token_ratio"] = (
             chunk["real_tokens"] / float(total_real_tokens)
@@ -537,6 +551,28 @@ def audit_supervision_coverage_once(args, labels: torch.Tensor, attention_mask: 
         )
     return stats
 
+def compute_update_steps(dataloader_len: int, accumulation_steps: int) -> int:
+    """Count optimizer updates, including the final partial accumulation window."""
+    accumulation_steps = max(1, int(accumulation_steps))
+    dataloader_len = max(0, int(dataloader_len))
+    if dataloader_len <= 0:
+        return 0
+    return (dataloader_len + accumulation_steps - 1) // accumulation_steps
+
+def accumulation_divisor_for_step(step: int, dataloader_len: int, accumulation_steps: int) -> int:
+    """Scale loss by the real accumulation window size for this dataloader step."""
+    accumulation_steps = max(1, int(accumulation_steps))
+    dataloader_len = max(1, int(dataloader_len))
+    step = max(0, min(int(step), dataloader_len - 1))
+    window_start = (step // accumulation_steps) * accumulation_steps
+    window_end = min(window_start + accumulation_steps, dataloader_len)
+    return max(1, window_end - window_start)
+
+def should_step_accumulation(step: int, dataloader_len: int, accumulation_steps: int) -> bool:
+    accumulation_steps = max(1, int(accumulation_steps))
+    dataloader_len = max(1, int(dataloader_len))
+    return ((int(step) + 1) % accumulation_steps == 0) or (int(step) + 1 >= dataloader_len)
+
 def compute_remaining_update_steps(dataloader_len: int, accumulation_steps: int, start_epoch: int,
                                    total_epochs: int, start_step: int = 0) -> int:
     """Count optimizer updates that will actually run after an epoch/mid-epoch resume."""
@@ -544,11 +580,57 @@ def compute_remaining_update_steps(dataloader_len: int, accumulation_steps: int,
     dataloader_len = max(0, int(dataloader_len))
     start_step = max(0, min(int(start_step), dataloader_len))
     remaining_epochs_after_current = max(0, int(total_epochs) - int(start_epoch) - 1)
-    updates_per_full_epoch = dataloader_len // accumulation_steps
-    updates_already_done_this_epoch = start_step // accumulation_steps
+    updates_per_full_epoch = compute_update_steps(dataloader_len, accumulation_steps)
+    if start_step >= dataloader_len:
+        updates_already_done_this_epoch = updates_per_full_epoch
+    else:
+        updates_already_done_this_epoch = start_step // accumulation_steps
     updates_left_this_epoch = max(0, updates_per_full_epoch - updates_already_done_this_epoch)
     remaining_updates = updates_left_this_epoch + (remaining_epochs_after_current * updates_per_full_epoch)
     return max(1, remaining_updates)
+
+def resolve_lr_warmup_steps(args, num_update_steps: int) -> int:
+    total_steps = max(1, int(num_update_steps or 1))
+    max_warmup = max(0, total_steps - 1)
+    try:
+        explicit_steps = int(getattr(args, 'warmup_steps', 0) or 0)
+    except (TypeError, ValueError):
+        explicit_steps = 0
+    if explicit_steps > 0:
+        return min(explicit_steps, max_warmup)
+
+    warmup_ratio = _nonnegative_float(getattr(args, 'warmup_ratio', 0.0), 0.0)
+    if warmup_ratio <= 0.0:
+        return 0
+    return min(int(math.ceil(total_steps * min(warmup_ratio, 1.0))), max_warmup)
+
+def build_lr_scheduler(optimizer, args, num_update_steps: int):
+    if getattr(args, 'disable_lr_schedule', False) or num_update_steps <= 0:
+        return None
+
+    total_steps = max(1, int(num_update_steps or 1))
+    max_lr = _positive_float(getattr(args, 'starting_lr', 1e-4), 1e-4)
+    min_lr = min(_nonnegative_float(getattr(args, 'min_lr', 0.0), 0.0), max_lr)
+    min_factor = min_lr / max_lr if max_lr > 0.0 else 0.0
+    warmup_steps = resolve_lr_warmup_steps(args, total_steps)
+
+    def lr_lambda(current_step: int):
+        current_step = max(0, int(current_step))
+        if warmup_steps > 0 and current_step < warmup_steps:
+            progress = (current_step + 1) / float(warmup_steps)
+            return min_factor + (1.0 - min_factor) * min(progress, 1.0)
+
+        decay_steps = max(1, total_steps - warmup_steps)
+        decay_step = min(max(0, current_step - warmup_steps), decay_steps)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * decay_step / float(decay_steps)))
+        return min_factor + (1.0 - min_factor) * cosine
+
+    scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
+    print(
+        f"INFO: Warmup+Cosine LR scheduler ENABLED. Total updates: {total_steps}, "
+        f"Warmup updates: {warmup_steps}, Max LR: {max_lr:.2e}, Min LR: {min_lr:.2e}"
+    )
+    return scheduler
 
 def _resolve_ltm_lr_bounds(args):
     max_lr = _positive_float(getattr(args, 'ltm_lr', 1e-3), 1e-3)
@@ -954,7 +1036,8 @@ def build_training_checkpoint(
         checkpoint["running_states"] = _state_to_cpu(running_states)
     return checkpoint
 
-def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, running_states, collect_metrics=True):
+def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, running_states,
+               collect_metrics=True, force_optimizer_step=False, accumulation_divisor=None):
     """Training step with temporal chunking to match original hierarchos.py."""
     args._optimizer_step_was_taken = False
     args._train_step_had_backward = False
@@ -966,11 +1049,15 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
     full_attention_mask = batch.get('attention_mask')
     full_labels = batch['labels']
     full_rosa_ids = batch.get('rosa_ids')
+    full_loss_weights = batch.get('loss_weights')
+    loss_divisor = max(1, int(accumulation_divisor or accumulation_steps or 1))
     full_input_ids, full_labels, full_attention_mask = trim_trailing_padding(
         full_input_ids, full_labels, full_attention_mask
     )
     if full_rosa_ids is not None:
         full_rosa_ids = full_rosa_ids[:, :full_input_ids.shape[1]].contiguous()
+    if full_loss_weights is not None:
+        full_loss_weights = full_loss_weights[:, :full_input_ids.shape[1]].contiguous()
     chunk_size = getattr(args, 'training_chunk_size', 128)
     padding_metric_steps = int(getattr(args, 'padding_metric_steps', 0) or 0)
     collect_padding_metrics = (
@@ -999,6 +1086,10 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
             multiple=chunk_size,
             pad_token_id=getattr(args, 'pad_token_id', 0),
         )
+        if full_loss_weights is not None and full_input_ids.shape[1] > pre_pad_seq_len:
+            pad_cols = full_input_ids.shape[1] - pre_pad_seq_len
+            weight_pad = full_loss_weights.new_zeros((full_loss_weights.shape[0], pad_cols))
+            full_loss_weights = torch.cat([full_loss_weights, weight_pad], dim=1).contiguous()
         if full_rosa_ids is not None and full_input_ids.shape[1] > pre_pad_seq_len:
             pad_cols = full_input_ids.shape[1] - pre_pad_seq_len
             rosa_sentinel = int(getattr(model.config, 'vocab_size', getattr(args, 'vocab_size', 0)))
@@ -1066,13 +1157,19 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
     # Temporal chunking (critical for RWKV-based models). Build this on CPU before
     # moving labels/masks to CUDA so per-chunk .item() accounting does not sync GPU.
     if chunk_size <= 0 or chunk_size > T: chunk_size = T
-    chunk_plan = compute_chunk_training_weights(full_labels, full_attention_mask, chunk_size)
+    chunk_plan = compute_chunk_training_weights(
+        full_labels,
+        full_attention_mask,
+        chunk_size,
+        loss_weights=full_loss_weights,
+    )
     num_chunks = len(chunk_plan)
 
     full_input_ids = full_input_ids.to(device, non_blocking=_nb)
     if full_attention_mask is not None: full_attention_mask = full_attention_mask.to(device, non_blocking=_nb)
     full_labels = full_labels.to(device, non_blocking=_nb)
     if full_rosa_ids is not None: full_rosa_ids = full_rosa_ids.to(device, non_blocking=_nb)
+    if full_loss_weights is not None: full_loss_weights = full_loss_weights.to(device, non_blocking=_nb)
     
     total_loss = torch.zeros((), device=device, dtype=torch.float32)
     total_ponder = torch.zeros((), device=device, dtype=torch.float32)
@@ -1105,6 +1202,7 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
             loss_end_t = min(end_t + 1, T)
             labels = full_labels[:, start_t:loss_end_t]
             rosa_ids = full_rosa_ids[:, start_t:end_t] if full_rosa_ids is not None else None
+            loss_weights = full_loss_weights[:, start_t:loss_end_t] if full_loss_weights is not None else None
             
             with autocast(device_type=autocast_device, dtype=amp_dtype, enabled=args.amp):
                 outputs = model(
@@ -1115,6 +1213,7 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                     return_logits=not fast_lm_loss,
                     return_topk_values=False,
                     rosa_ids=rosa_ids,
+                    loss_weights=loss_weights,
                 )
                 
                 # LTM fast-memory update needs gradients from the exact tensors used
@@ -1191,7 +1290,7 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                 # chunk. Weight it by supervised token count so chunk boundaries
                 # and masked legacy labels cannot dilute the actual learning
                 # signal.
-                chunk_loss = ((ce_loss_for_backward * label_ratio) + (aux_loss * token_ratio)) / accumulation_steps
+                chunk_loss = ((ce_loss_for_backward * label_ratio) + (aux_loss * token_ratio)) / loss_divisor
 
                 chunk_loss_valid = _component_is_finite(chunk_loss)
                 if not chunk_loss_valid:
@@ -1321,7 +1420,8 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
             # final_outputs = outputs # REMOVED: Memory Leak Fix
         
         # Optimizer step after all chunks
-        if (step + 1) % accumulation_steps == 0:
+        should_step_optimizer = ((step + 1) % accumulation_steps == 0) or bool(force_optimizer_step)
+        if should_step_optimizer and _has_pending_gradients(model):
             if scaler is not None:
                 scaler.unscale_(optimizer)
                 grads_ok, grad_issue = _clip_gradients_and_check(model, getattr(args, 'grad_clip', 1.0))
@@ -1342,6 +1442,8 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             args._optimizer_step_was_taken = True
+        elif should_step_optimizer:
+            optimizer.zero_grad(set_to_none=True)
         
         if chunks_processed == 0:
             return None, running_states
@@ -1394,6 +1496,32 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
             "chunks may not receive semantic answer-loss gradients. Use "
             "--train-prompt-tokens if you want prompt tokens included in the LM objective."
         )
+    if prompt_completion_mode:
+        if getattr(args, 'alpaca', False):
+            prompt_shape = "Alpaca ### Instruction/[optional ### Input]/### Response"
+        elif getattr(args, 'kayla', False):
+            prompt_shape = "Kayla Instruction/Feelings/Thought Process/Response"
+        else:
+            prompt_shape = "User/Assistant prompt-completion"
+        prompt_weight = float(getattr(args, 'prompt_loss_weight', 1.0) or 0.0)
+        response_weight = float(getattr(args, 'response_loss_weight', 1.0) or 0.0)
+        boundary_weight = float(getattr(args, 'response_boundary_loss_weight', 1.0) or 0.0)
+        boundary_tokens = int(getattr(args, 'response_boundary_tokens', 0) or 0)
+        if not getattr(args, 'train_prompt_tokens', True):
+            prompt_weight = 0.0
+        print(f"INFO: Training prompt shape: {prompt_shape}")
+        print(
+            "INFO: Token loss weights: "
+            f"prompt={prompt_weight:g}, response={response_weight:g}, "
+            f"response_boundary={boundary_weight:g}x first {boundary_tokens} non-EOS response token(s)"
+        )
+        print(
+            "INFO: Response data guardrails: "
+            f"drop_empty_completions={bool(getattr(args, 'drop_empty_completions', True))}, "
+            f"min_response_tokens={int(getattr(args, 'min_response_tokens', 1) or 0)}"
+        )
+        if bool(getattr(args, "assistant_recovery", False)):
+            print("INFO: Assistant recovery preset ACTIVE.")
 
     # Device stability
     if is_directml_device(device):
@@ -1716,10 +1844,10 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         )
         print(f"INFO: --override-scheduling: Calculating LR schedule for remaining work ({num_update_steps} update steps)")
     else:
-        num_update_steps = (dataloader_len // args.accumulation_steps) * args.epochs
+        num_update_steps = compute_update_steps(dataloader_len, args.accumulation_steps) * args.epochs
     
     if not getattr(args, 'disable_lr_schedule', False) and num_update_steps > 0:
-        scheduler = CosineAnnealingLR(optimizer, T_max=num_update_steps, eta_min=args.min_lr)
+        scheduler = build_lr_scheduler(optimizer, args, num_update_steps)
         if args.resume_from_ckpt and not getattr(args, 'override_scheduling', False) and 'scheduler_state_dict' in checkpoint:
             try: scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             except: pass
@@ -1808,6 +1936,8 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
             first_logged_step = start_step if epoch == start_epoch else 0
             collect_metrics = should_update_progress(step, args, dataloader_len, first_logged_step)
             args._current_global_step = absolute_epoch * dataloader_len + step
+            force_optimizer_step = should_step_accumulation(step, dataloader_len, args.accumulation_steps)
+            accumulation_divisor = accumulation_divisor_for_step(step, dataloader_len, args.accumulation_steps)
             outputs, running_states = train_step(
                 model,
                 batch,
@@ -1818,6 +1948,8 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                 args,
                 running_states,
                 collect_metrics=collect_metrics,
+                force_optimizer_step=force_optimizer_step,
+                accumulation_divisor=accumulation_divisor,
             )
             if outputs:
                 postfix = {"loss": f"{outputs['loss'].item():.4f}"}
@@ -2162,11 +2294,10 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
     # Scheduler setup
     scheduler = None
     accumulation_steps = getattr(args, 'accumulation_steps', 1)
-    num_update_steps = (dataloader_len // accumulation_steps) * args.epochs if dataloader_len > 0 else 0
+    num_update_steps = compute_update_steps(dataloader_len, accumulation_steps) * args.epochs if dataloader_len > 0 else 0
     if not getattr(args, 'disable_lr_schedule', False):
         if num_update_steps > 0:
-            print(f"INFO: Cosine Annealing LR scheduler ENABLED. Total steps: {num_update_steps}, Max LR: {args.starting_lr}, Min LR: {args.min_lr}")
-            scheduler = CosineAnnealingLR(optimizer, T_max=num_update_steps, eta_min=args.min_lr)
+            scheduler = build_lr_scheduler(optimizer, args, num_update_steps)
             if checkpoint and 'scheduler_state_dict' in checkpoint:
                 try: scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
                 except: pass
@@ -2225,11 +2356,14 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
             attention_mask = batch.get("attention_mask")
             labels = batch["labels"]
             rosa_ids = batch.get("rosa_ids")
+            loss_weights = batch.get("loss_weights")
             input_ids, labels, attention_mask = trim_trailing_padding(
                 input_ids, labels, attention_mask
             )
             if rosa_ids is not None:
                 rosa_ids = rosa_ids[:, :input_ids.shape[1]].contiguous()
+            if loss_weights is not None:
+                loss_weights = loss_weights[:, :input_ids.shape[1]].contiguous()
             non_blocking = device.type == 'cuda'
             input_ids = input_ids.to(device, non_blocking=non_blocking)
             if attention_mask is not None:
@@ -2237,11 +2371,19 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
             labels = labels.to(device, non_blocking=non_blocking)
             if rosa_ids is not None:
                 rosa_ids = rosa_ids.to(device, non_blocking=non_blocking)
+            if loss_weights is not None:
+                loss_weights = loss_weights.to(device, non_blocking=non_blocking)
             set_model_training_step(model, epoch * dataloader_len + i)
 
             autocast_device_type = 'cpu' if is_directml_device(device) else device.type
             with autocast(device_type=autocast_device_type, dtype=amp_dtype, enabled=use_amp):
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels, rosa_ids=rosa_ids)
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    rosa_ids=rosa_ids,
+                    loss_weights=loss_weights,
+                )
                 
                 # AMP FIX: Cast topk_vals to float32 before retain_grad (same fix as train path).
                 # Prevents masked_scatter_ dtype mismatch crash under BFloat16 AMP.
@@ -2300,7 +2442,8 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                     optimizer.zero_grad(set_to_none=True)
 
             if combined_loss is not None:
-                loss_to_backward = combined_loss / accumulation_steps
+                accumulation_divisor = accumulation_divisor_for_step(i, dataloader_len, accumulation_steps)
+                loss_to_backward = combined_loss / accumulation_divisor
 
                 if use_amp and scaler:
                     scaler.scale(loss_to_backward).backward()
@@ -2317,7 +2460,7 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                     total_commitment_cost += commitment_cost.item()
                 steps_in_epoch += 1
 
-            if (i + 1) % accumulation_steps == 0:
+            if should_step_accumulation(i, dataloader_len, accumulation_steps):
                 if backward_called_in_cycle:
                     # LTM Update
                     ltm_grads = None

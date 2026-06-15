@@ -1248,7 +1248,7 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
 
                 ce_loss_for_backward = _cap_loss_component_for_backward(
                     ce_loss,
-                    getattr(args, 'max_ce_loss_for_backward', 10.0),
+                    getattr(args, 'max_ce_loss_for_backward', 0.0),
                 )
                 
                 aux_loss = torch.zeros_like(ce_loss)
@@ -2405,7 +2405,7 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                 if ce_valid:
                     loss_accum = loss_accum + _cap_loss_component_for_backward(
                         cross_entropy_loss,
-                        getattr(args, 'max_ce_loss_for_backward', 10.0),
+                        getattr(args, 'max_ce_loss_for_backward', 0.0),
                     )
                 elif i % accumulation_steps == 0:
                     print(f"\nWarning: CE loss is NaN/Inf at step {i+1}. Skipping.")

@@ -1127,6 +1127,7 @@ _CONTINUATION_SKIP_CONFIG_KEYS = {
     "device",
     "refresh_hf_token_cache",
     "refresh_hf_shards",
+    "max_ce_loss_for_backward",
 }
 
 _CONTINUATION_SUMMARY_KEYS = (
@@ -1494,7 +1495,7 @@ def main():
     train_group.add_argument("--lora_alpha", type=int, default=16)
     train_group.add_argument("--grad-clip", type=float, default=1.0)
     train_group.add_argument("--startup-weight-max-abs", type=float, default=100.0, help="One-time startup clamp for finite model weights/buffers after checkpoint repair (0 disables).")
-    train_group.add_argument("--max-ce-loss-for-backward", type=float, default=10.0, help="Clamp finite CE loss used for backward to prevent explosion gradients (0 disables).")
+    train_group.add_argument("--max-ce-loss-for-backward", type=float, default=0.0, help="Clamp finite CE loss used for backward (0 disables; recommended for from-scratch training).")
     train_group.add_argument("--max-commitment-cost-for-backward", type=float, default=2.0, help="Clamp finite commitment cost used for backward to prevent auxiliary loss explosions (0 disables).")
     train_group.add_argument("--max-ponder-cost-for-backward", type=float, default=0.0, help="Clamp finite ponder cost used for backward (0 disables).")
     train_group.add_argument("--halt-logit-clamp", type=float, default=30.0, help="Forward-pass clamp for ACT halt logits after NaN/Inf repair.")

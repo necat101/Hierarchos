@@ -478,6 +478,7 @@ def _continuation_parser_and_args(model_path=None, resume_from_ckpt=None, epochs
         "assistant_recovery": False,
         "refresh_hf_token_cache": False,
         "refresh_hf_shards": False,
+        "max_ce_loss_for_backward": 0.0,
     }
     parser = argparse.ArgumentParser()
     for key, value in defaults.items():
@@ -569,6 +570,7 @@ def test_resume_hydration_does_not_persist_refresh_cache_flags(tmp_path):
             "hf_dataset": "netcat420/Experiment_0.1",
             "refresh_hf_token_cache": True,
             "refresh_hf_shards": True,
+            "max_ce_loss_for_backward": 10.0,
             "completed_epoch": 1,
         },
         "model_state_dict": {},
@@ -580,6 +582,7 @@ def test_resume_hydration_does_not_persist_refresh_cache_flags(tmp_path):
     assert args.hf_dataset == "netcat420/Experiment_0.1"
     assert args.refresh_hf_token_cache is False
     assert args.refresh_hf_shards is False
+    assert args.max_ce_loss_for_backward == 0.0
 
 
 def test_cli_resume_checkpoint_hydrates_config_without_base_epoch_offset():
@@ -928,6 +931,44 @@ def test_train_step_caps_finite_loss_explosion_for_backward():
     assert outputs["commitment_cost"].item() == 20.0
     assert args._train_step_had_nonfinite is False
     assert torch.equal(model.weight.detach(), before)
+    assert states == (None, None, None, None, None, None)
+
+
+def test_train_step_default_does_not_cap_random_vocab_ce():
+    model = _HighFiniteLossModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.0)
+    args = SimpleNamespace(
+        amp=False,
+        training_chunk_size=8,
+        compile=False,
+        pad_token_id=0,
+        padding_metrics=False,
+        cpu_chunked_lm_loss=False,
+        cuda_chunked_lm_loss=False,
+        grad_clip=10.0,
+        max_commitment_cost_for_backward=2.0,
+    )
+    batch = {
+        "input_ids": torch.ones(1, 4, dtype=torch.long),
+        "labels": torch.ones(1, 4, dtype=torch.long),
+    }
+
+    before = model.weight.detach().clone()
+    outputs, states = train_step(
+        model,
+        batch,
+        optimizer,
+        scaler=None,
+        accumulation_steps=1,
+        step=0,
+        args=args,
+        running_states=(None, None, None, None, None, None),
+    )
+
+    assert outputs is not None
+    assert outputs["loss"].item() == 20.0
+    assert args._train_step_had_nonfinite is False
+    assert not torch.equal(model.weight.detach(), before)
     assert states == (None, None, None, None, None, None)
 
 

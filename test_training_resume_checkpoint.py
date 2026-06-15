@@ -10,15 +10,19 @@ from torch.utils.data import DataLoader, TensorDataset
 from hierarchos.training.datasets import EpochShuffleSampler, LengthGroupedBatchSampler
 from hierarchos.training.trainer import (
     build_training_checkpoint,
+    build_lr_scheduler,
     capture_ltm_lr_scheduler_state,
     capture_dataloader_state,
+    accumulation_divisor_for_step,
     configure_ltm_lr_schedule,
+    compute_update_steps,
     compute_remaining_update_steps,
     get_current_ltm_lr,
     advance_ltm_lr_schedule,
     restore_dataloader_state,
     restore_model_grad_state,
     save_training_checkpoint_if_finite,
+    should_step_accumulation,
     train_step,
     training_state_is_finite,
     _sanitize_model_nonfinite_,
@@ -110,6 +114,22 @@ class _HighFiniteLossModel(_NaNLossModel):
             "loss": high_loss,
             "ponder_cost": torch.zeros((), device=self.weight.device),
             "commitment_cost": high_commitment,
+            "raw_topk_vals": None,
+            "ltm_memory_state": None,
+            "h_state": None,
+            "l_state": None,
+            "prev_context": None,
+            "target_context": None,
+            "drift_state": None,
+        }
+
+
+class _FiniteLinearLossModel(_NaNLossModel):
+    def forward(self, **kwargs):
+        return {
+            "loss": self.weight,
+            "ponder_cost": torch.zeros((), device=self.weight.device),
+            "commitment_cost": torch.zeros((), device=self.weight.device),
             "raw_topk_vals": None,
             "ltm_memory_state": None,
             "h_state": None,
@@ -271,6 +291,8 @@ def test_mid_epoch_checkpoint_preserves_v8_running_ltm_state():
 
 
 def test_remaining_update_steps_counts_mid_accumulation_boundaries():
+    assert compute_update_steps(dataloader_len=100, accumulation_steps=4) == 25
+    assert compute_update_steps(dataloader_len=101, accumulation_steps=4) == 26
     assert compute_remaining_update_steps(
         dataloader_len=100,
         accumulation_steps=4,
@@ -285,6 +307,63 @@ def test_remaining_update_steps_counts_mid_accumulation_boundaries():
         total_epochs=2,
         start_step=5,
     ) == 49
+    assert compute_remaining_update_steps(
+        dataloader_len=101,
+        accumulation_steps=4,
+        start_epoch=0,
+        total_epochs=1,
+        start_step=100,
+    ) == 1
+    assert compute_remaining_update_steps(
+        dataloader_len=101,
+        accumulation_steps=4,
+        start_epoch=0,
+        total_epochs=1,
+        start_step=101,
+    ) == 1
+    assert compute_remaining_update_steps(
+        dataloader_len=101,
+        accumulation_steps=4,
+        start_epoch=0,
+        total_epochs=2,
+        start_step=101,
+    ) == 26
+
+
+def test_accumulation_helpers_flush_tail_window():
+    assert accumulation_divisor_for_step(0, dataloader_len=5, accumulation_steps=4) == 4
+    assert accumulation_divisor_for_step(3, dataloader_len=5, accumulation_steps=4) == 4
+    assert accumulation_divisor_for_step(4, dataloader_len=5, accumulation_steps=4) == 1
+    assert should_step_accumulation(2, dataloader_len=5, accumulation_steps=4) is False
+    assert should_step_accumulation(3, dataloader_len=5, accumulation_steps=4) is True
+    assert should_step_accumulation(4, dataloader_len=5, accumulation_steps=4) is True
+
+
+def test_lr_scheduler_warms_up_then_cosine_decays():
+    model = _FakeTrainModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    args = SimpleNamespace(
+        disable_lr_schedule=False,
+        starting_lr=1e-3,
+        min_lr=1e-5,
+        warmup_steps=2,
+        warmup_ratio=0.0,
+    )
+
+    scheduler = build_lr_scheduler(optimizer, args, num_update_steps=10)
+
+    initial_lr = optimizer.param_groups[0]["lr"]
+    optimizer.step()
+    scheduler.step()
+    warmed_lr = optimizer.param_groups[0]["lr"]
+    for _ in range(9):
+        optimizer.step()
+        scheduler.step()
+    final_lr = optimizer.param_groups[0]["lr"]
+
+    assert 1e-5 < initial_lr < 1e-3
+    assert abs(warmed_lr - 1e-3) < 1e-12
+    assert abs(final_lr - 1e-5) < 1e-12
 
 
 def test_ltm_lr_cosine_schedule_decays_and_advances():
@@ -378,6 +457,8 @@ def _continuation_parser_and_args(model_path=None, resume_from_ckpt=None, epochs
         "batch_size": 64,
         "starting_lr": 1e-4,
         "min_lr": 1e-6,
+        "warmup_steps": 0,
+        "warmup_ratio": 0.0,
         "ltm_lr": 1e-3,
         "min_ltm_lr": None,
         "alpaca": False,
@@ -386,6 +467,15 @@ def _continuation_parser_and_args(model_path=None, resume_from_ckpt=None, epochs
         "force_compile": False,
         "amp": False,
         "train_prompt_tokens": True,
+        "prompt_loss_weight": 1.0,
+        "response_loss_weight": 1.0,
+        "response_boundary_loss_weight": 1.0,
+        "response_boundary_tokens": 0,
+        "min_response_tokens": 1,
+        "drop_empty_completions": True,
+        "ponder_loss_weight": 0.01,
+        "memory_gate_warmup_steps": 2000,
+        "assistant_recovery": False,
     }
     parser = argparse.ArgumentParser()
     for key, value in defaults.items():
@@ -433,6 +523,41 @@ def test_cli_model_path_continuation_hydrates_saved_training_config():
     assert args.train_prompt_tokens is True
     assert args.epochs == 3
     assert args.base_completed_epoch == 11
+
+
+def test_assistant_recovery_defaults_target_large_assistant_sft():
+    parser, args = _continuation_parser_and_args(epochs=3)
+    args.assistant_recovery = True
+
+    hierarchos_cli._apply_assistant_recovery_defaults(args, explicit_dests=set())
+
+    assert args.alpaca is True
+    assert args.epochs == 4
+    assert args.starting_lr == 6e-5
+    assert args.min_lr == 1e-6
+    assert args.warmup_ratio == 0.03
+    assert args.prompt_loss_weight == 0.10
+    assert args.response_loss_weight == 1.0
+    assert args.response_boundary_loss_weight == 2.0
+    assert args.response_boundary_tokens == 32
+    assert args.min_response_tokens == 16
+    assert args.ponder_loss_weight == 0.003
+    assert args.memory_gate_warmup_steps == 5000
+
+
+def test_assistant_recovery_respects_explicit_overrides():
+    parser, args = _continuation_parser_and_args(epochs=7)
+    args.assistant_recovery = True
+
+    hierarchos_cli._apply_assistant_recovery_defaults(
+        args,
+        explicit_dests={"epochs", "prompt_loss_weight", "warmup_ratio"},
+    )
+
+    assert args.epochs == 7
+    assert args.prompt_loss_weight == 1.0
+    assert args.warmup_ratio == 0.0
+    assert args.response_boundary_tokens == 32
 
 
 def test_cli_resume_checkpoint_hydrates_config_without_base_epoch_offset():
@@ -782,6 +907,63 @@ def test_train_step_caps_finite_loss_explosion_for_backward():
     assert args._train_step_had_nonfinite is False
     assert torch.equal(model.weight.detach(), before)
     assert states == (None, None, None, None, None, None)
+
+
+def test_train_step_flushes_tail_accumulation_with_real_divisor():
+    model = _FiniteLinearLossModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    args = SimpleNamespace(
+        amp=False,
+        training_chunk_size=8,
+        compile=False,
+        pad_token_id=0,
+        padding_metrics=False,
+        cpu_chunked_lm_loss=False,
+        cuda_chunked_lm_loss=False,
+        grad_clip=10.0,
+        max_ce_loss_for_backward=0.0,
+    )
+    batch = {
+        "input_ids": torch.ones(1, 4, dtype=torch.long),
+        "labels": torch.ones(1, 4, dtype=torch.long),
+    }
+
+    outputs, states = train_step(
+        model,
+        batch,
+        optimizer,
+        scaler=None,
+        accumulation_steps=4,
+        step=0,
+        args=args,
+        running_states=(None, None, None, None, None, None),
+        force_optimizer_step=False,
+        accumulation_divisor=2,
+    )
+
+    assert outputs is not None
+    assert states == (None, None, None, None, None, None)
+    assert args._optimizer_step_was_taken is False
+    assert model.weight.grad is not None
+    assert abs(model.weight.grad.item() - 0.5) < 1e-6
+
+    outputs, states = train_step(
+        model,
+        batch,
+        optimizer,
+        scaler=None,
+        accumulation_steps=4,
+        step=1,
+        args=args,
+        running_states=states,
+        force_optimizer_step=True,
+        accumulation_divisor=2,
+    )
+
+    assert outputs is not None
+    assert args._optimizer_step_was_taken is True
+    assert model.weight.grad is None
+    assert abs(model.weight.item() - 0.9) < 1e-6
 
 
 def test_train_step_passes_one_token_label_lookahead_across_chunks():

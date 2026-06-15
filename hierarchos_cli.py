@@ -43,7 +43,7 @@ from hierarchos import (
 )
 from hierarchos.utils.rosa import precompute_rosa_ids_for_chunks
 
-HF_CACHE_FORMATTER_VERSION = "alpaca-input-section-all-token-loss-v2"
+HF_CACHE_FORMATTER_VERSION = "alpaca-response-preserving-v4"
 
 
 def load_hf_dataset(dataset_name, dataset_config=None, split="train", streaming=False):
@@ -388,6 +388,34 @@ def resolve_length_bucket_size(length_bucket_size, device, batch_size, hf_token_
     return length_bucket_size, None
 
 
+def _loss_weight_kwargs(args):
+    return {
+        "prompt_loss_weight": float(getattr(args, "prompt_loss_weight", 1.0) or 0.0),
+        "response_loss_weight": float(getattr(args, "response_loss_weight", 1.0) or 0.0),
+        "response_boundary_loss_weight": float(getattr(args, "response_boundary_loss_weight", 1.0) or 0.0),
+        "response_boundary_tokens": int(getattr(args, "response_boundary_tokens", 0) or 0),
+    }
+
+
+def _response_quality_kwargs(args):
+    return {
+        "min_response_tokens": int(getattr(args, "min_response_tokens", 1) or 0),
+        "drop_empty_completions": bool(getattr(args, "drop_empty_completions", True)),
+    }
+
+
+def _uses_weighted_token_loss(args):
+    weights = _loss_weight_kwargs(args)
+    return (
+        abs(weights["prompt_loss_weight"] - 1.0) > 1e-8
+        or abs(weights["response_loss_weight"] - 1.0) > 1e-8
+        or (
+            weights["response_boundary_tokens"] > 0
+            and abs(weights["response_boundary_loss_weight"] - 1.0) > 1e-8
+        )
+    )
+
+
 def _hf_cache_key_payload(args, *, format_name, num_shards=None):
     payload = {
         "format": format_name,
@@ -406,6 +434,12 @@ def _hf_cache_key_payload(args, *, format_name, num_shards=None):
         "alpaca_input_field": "input",
         "alpaca_input_role": "previous_context",
         "train_prompt_tokens": bool(getattr(args, "train_prompt_tokens", True)),
+        "prompt_loss_weight": float(getattr(args, "prompt_loss_weight", 1.0) or 0.0),
+        "response_loss_weight": float(getattr(args, "response_loss_weight", 1.0) or 0.0),
+        "response_boundary_loss_weight": float(getattr(args, "response_boundary_loss_weight", 1.0) or 0.0),
+        "response_boundary_tokens": int(getattr(args, "response_boundary_tokens", 0) or 0),
+        "min_response_tokens": int(getattr(args, "min_response_tokens", 1) or 0),
+        "drop_empty_completions": bool(getattr(args, "drop_empty_completions", True)),
         "text_column": getattr(args, "text_column", None),
         "prompt_column": getattr(args, "prompt_column", None),
         "completion_column": getattr(args, "completion_column", None),
@@ -481,6 +515,8 @@ def _processed_sample_to_cached_item(processed, args=None, tokenizer=None):
         "attention_mask": torch.ones(input_ids.numel(), dtype=torch.uint8),
         "_length": length,
     }
+    if "loss_weights" in processed:
+        item["loss_weights"] = processed["loss_weights"].detach().cpu().to(dtype=torch.float32)
     if args is not None and tokenizer is not None and bool(getattr(args, "use_rosa", True)):
         rosa_sentinel = _tokenizer_vocab_size(tokenizer)
         item["rosa_ids"] = torch.tensor(
@@ -581,6 +617,8 @@ def materialize_hf_dataset_pt_cache(args, tokenizer, num_shards):
                 completion_column=getattr(args, "completion_column", None),
                 alpaca_mode=getattr(args, "alpaca", False),
                 train_prompt_tokens=getattr(args, "train_prompt_tokens", True),
+                **_loss_weight_kwargs(args),
+                **_response_quality_kwargs(args),
             )
             if processed is None:
                 skipped += 1
@@ -631,8 +669,12 @@ def materialize_hf_dataset_shards(args, tokenizer, num_shards):
 
 
 def _hf_token_cache_key(args):
-    payload = _hf_cache_key_payload(args, format_name="map-token-bin-v4")
+    payload = _hf_cache_key_payload(args, format_name=_hf_token_cache_format(args))
     return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+
+
+def _hf_token_cache_format(args):
+    return "map-token-bin-v5-weighted" if _uses_weighted_token_loss(args) else "map-token-bin-v4"
 
 
 def _legacy_hf_token_cache_key(args):
@@ -668,6 +710,8 @@ def materialize_hf_token_cache(args, tokenizer):
         or os.path.join(os.getcwd(), ".hierarchos_token_cache")
     )
     cache_key = _hf_token_cache_key(args)
+    cache_format = _hf_token_cache_format(args)
+    write_loss_weights = _uses_weighted_token_loss(args)
     cache_dir = os.path.join(cache_root, cache_key)
     legacy_cache_dir = os.path.join(cache_root, _legacy_hf_token_cache_key(args))
     success_path = os.path.join(cache_dir, "_SUCCESS")
@@ -696,7 +740,10 @@ def materialize_hf_token_cache(args, tokenizer):
         shutil.rmtree(cache_dir)
     os.makedirs(tmp_dir, exist_ok=True)
 
-    print("INFO: Building HF random-access token cache...")
+    if write_loss_weights:
+        print("INFO: Building weighted HF random-access token cache (fp16 per-token loss weights).")
+    else:
+        print("INFO: Building HF random-access token cache...")
     hf_dataset = load_hf_dataset(
         args.hf_dataset,
         args.hf_dataset_config,
@@ -747,6 +794,8 @@ def materialize_hf_token_cache(args, tokenizer):
                     completion_column=getattr(args, "completion_column", None),
                     alpaca_mode=getattr(args, "alpaca", False),
                     train_prompt_tokens=getattr(args, "train_prompt_tokens", True),
+                    **_loss_weight_kwargs(args),
+                    **_response_quality_kwargs(args),
                 )
             except Exception:
                 processed = None
@@ -772,6 +821,28 @@ def materialize_hf_token_cache(args, tokenizer):
             data_file.write(input_bytes)
             data_file.write(label_bytes)
             total_bytes += len(input_bytes) + len(label_bytes)
+            if write_loss_weights:
+                loss_weights = processed.get("loss_weights")
+                if loss_weights is None:
+                    loss_weights = torch.ones(length, dtype=torch.float16)
+                else:
+                    loss_weights = (
+                        loss_weights
+                        .detach()
+                        .cpu()
+                        .to(dtype=torch.float16)
+                        .contiguous()
+                    )
+                    if loss_weights.numel() != length:
+                        loss_weights = loss_weights[:length].contiguous()
+                        if loss_weights.numel() < length:
+                            loss_weights = torch.cat([
+                                loss_weights,
+                                torch.ones(length - loss_weights.numel(), dtype=torch.float16),
+                            ])
+                weight_bytes = loss_weights.numpy().tobytes()
+                data_file.write(weight_bytes)
+                total_bytes += len(weight_bytes)
             if precompute_rosa:
                 rosa_ids = torch.tensor(
                     precompute_rosa_ids_for_chunks(
@@ -791,12 +862,14 @@ def materialize_hf_token_cache(args, tokenizer):
         raise RuntimeError("HF token cache build produced no usable samples.")
 
     torch.save({
-        "format": "map-token-bin-v4",
+        "format": cache_format,
         "formatter": HF_CACHE_FORMATTER_VERSION,
         "cache_key": cache_key,
-        "cache_payload": _hf_cache_key_payload(args, format_name="map-token-bin-v4"),
+        "cache_payload": _hf_cache_key_payload(args, format_name=cache_format),
         "offsets": torch.tensor(offsets, dtype=torch.long),
         "lengths": torch.tensor(lengths, dtype=torch.int32),
+        "has_loss_weights": write_loss_weights,
+        "loss_weight_dtype": "float16" if write_loss_weights else None,
         "has_rosa_ids": precompute_rosa,
         "rosa_sentinel": int(rosa_sentinel),
         "rosa_max_context": int(rosa_max_context),
@@ -804,15 +877,17 @@ def materialize_hf_token_cache(args, tokenizer):
     }, os.path.join(tmp_dir, "index.pt"))
     with open(os.path.join(tmp_dir, "_SUCCESS"), "w", encoding="utf-8") as f:
         json.dump({
-            "format": "map-token-bin-v4",
+            "format": cache_format,
             "formatter": HF_CACHE_FORMATTER_VERSION,
             "cache_key": cache_key,
-            "cache_payload": _hf_cache_key_payload(args, format_name="map-token-bin-v4"),
+            "cache_payload": _hf_cache_key_payload(args, format_name=cache_format),
             "samples": len(lengths),
             "skipped": skipped,
             "bytes": total_bytes,
             "max_length": getattr(args, "max_length", 1024),
             "train_prompt_tokens": bool(getattr(args, "train_prompt_tokens", True)),
+            "has_loss_weights": write_loss_weights,
+            "loss_weight_dtype": "float16" if write_loss_weights else None,
             "has_rosa_ids": precompute_rosa,
             "rosa_max_context": int(rosa_max_context),
             "rosa_training_chunk_size": int(rosa_chunk_size),
@@ -843,6 +918,8 @@ def create_hf_training_dataloader(args, tokenizer, device):
             args.completion_column,
             getattr(args, "alpaca", False),
             getattr(args, "train_prompt_tokens", True),
+            **_loss_weight_kwargs(args),
+            **_response_quality_kwargs(args),
         )
         return create_map_style_dataloader(
             dataset,
@@ -930,6 +1007,8 @@ def create_hf_training_dataloader(args, tokenizer, device):
                 completion_column=args.completion_column,
                 alpaca_mode=getattr(args, "alpaca", False),
                 train_prompt_tokens=getattr(args, "train_prompt_tokens", True),
+                **_loss_weight_kwargs(args),
+                **_response_quality_kwargs(args),
                 use_length_bucketing=_length_bucketing_enabled(args),
                 bucket_size=getattr(args, "length_bucket_size", None),
                 shuffle_buffer_size=getattr(args, "hf_streaming_shuffle_buffer", 10000),
@@ -961,6 +1040,8 @@ def create_local_training_dataloader(args, tokenizer, device):
             completion_column=completion_column,
             alpaca_mode=getattr(args, "alpaca", False),
             train_prompt_tokens=getattr(args, "train_prompt_tokens", True),
+            **_loss_weight_kwargs(args),
+            **_response_quality_kwargs(args),
             use_length_bucketing=_length_bucketing_enabled(args),
             bucket_size=getattr(args, "length_bucket_size", None),
             device=device,
@@ -977,6 +1058,8 @@ def create_local_training_dataloader(args, tokenizer, device):
         completion_column=completion_column,
         alpaca_mode=getattr(args, "alpaca", False),
         train_prompt_tokens=getattr(args, "train_prompt_tokens", True),
+        **_loss_weight_kwargs(args),
+        **_response_quality_kwargs(args),
     )
     return create_map_style_dataloader(
         dataset,
@@ -1038,6 +1121,7 @@ _CONTINUATION_SKIP_CONFIG_KEYS = {
     "ckpt_tok_path",
     "completed_epoch",
     "training_complete",
+    "assistant_recovery",
     "amp_dtype",
     "vocab_size",
     "device",
@@ -1052,12 +1136,20 @@ _CONTINUATION_SUMMARY_KEYS = (
     "batch_size",
     "starting_lr",
     "min_lr",
+    "warmup_steps",
+    "warmup_ratio",
     "ltm_lr",
     "min_ltm_lr",
     "compile",
     "force_compile",
     "amp",
     "train_prompt_tokens",
+    "prompt_loss_weight",
+    "response_loss_weight",
+    "response_boundary_loss_weight",
+    "response_boundary_tokens",
+    "min_response_tokens",
+    "drop_empty_completions",
 )
 
 
@@ -1247,6 +1339,44 @@ def _validate_resume_epoch_target(args):
         sys.exit(1)
 
 
+def _set_default_if_not_explicit(args, explicit_dests, name, value, hydrated):
+    if name in explicit_dests:
+        return
+    setattr(args, name, value)
+    hydrated.append(f"{name}={value!r}")
+
+
+def _apply_assistant_recovery_defaults(args, explicit_dests):
+    if not bool(getattr(args, "assistant_recovery", False)):
+        return
+    if args.mode != "train":
+        print("WARNING: --assistant-recovery only affects train mode; ignoring for this mode.")
+        return
+    if getattr(args, "kayla", False):
+        print("ERROR: --assistant-recovery targets Alpaca instruction/input/output data and cannot be combined with --kayla.")
+        sys.exit(1)
+
+    applied = []
+    if "alpaca" not in explicit_dests:
+        args.alpaca = True
+        applied.append("alpaca=True")
+    _set_default_if_not_explicit(args, explicit_dests, "epochs", 4, applied)
+    _set_default_if_not_explicit(args, explicit_dests, "starting_lr", 6e-5, applied)
+    _set_default_if_not_explicit(args, explicit_dests, "min_lr", 1e-6, applied)
+    _set_default_if_not_explicit(args, explicit_dests, "warmup_ratio", 0.03, applied)
+    _set_default_if_not_explicit(args, explicit_dests, "ltm_lr", 3e-4, applied)
+    _set_default_if_not_explicit(args, explicit_dests, "min_ltm_lr", 1e-5, applied)
+    _set_default_if_not_explicit(args, explicit_dests, "prompt_loss_weight", 0.10, applied)
+    _set_default_if_not_explicit(args, explicit_dests, "response_loss_weight", 1.0, applied)
+    _set_default_if_not_explicit(args, explicit_dests, "response_boundary_loss_weight", 2.0, applied)
+    _set_default_if_not_explicit(args, explicit_dests, "response_boundary_tokens", 32, applied)
+    _set_default_if_not_explicit(args, explicit_dests, "min_response_tokens", 16, applied)
+    _set_default_if_not_explicit(args, explicit_dests, "ponder_loss_weight", 0.003, applied)
+    _set_default_if_not_explicit(args, explicit_dests, "memory_gate_warmup_steps", 5000, applied)
+    if applied:
+        print("INFO: Assistant recovery defaults applied: " + ", ".join(applied))
+
+
 def main():
     parser = argparse.ArgumentParser(description="hierarchos: A Hybrid Memory-Reasoning Architecture")
     parser.add_argument("mode", type=str, choices=["train", "finetune", "chat", "benchmark", "quantize", "merge-lora", "ckpt-2-inf"], help="Operation mode.")
@@ -1300,6 +1430,8 @@ def main():
     train_group.add_argument("--accumulation-steps", "--accumulation_steps", dest="accumulation_steps", type=int, default=1)
     train_group.add_argument("--starting-lr", type=float, default=1e-4)
     train_group.add_argument("--min-lr", type=float, default=1e-6)
+    train_group.add_argument("--warmup-steps", "--warmup_steps", dest="warmup_steps", type=int, default=0, help="Optimizer update steps spent linearly warming from --min-lr to --starting-lr. Overrides --warmup-ratio when >0.")
+    train_group.add_argument("--warmup-ratio", "--warmup_ratio", dest="warmup_ratio", type=float, default=0.0, help="Fraction of optimizer updates used for LR warmup before cosine decay.")
     train_group.add_argument("--disable-lr-schedule", action="store_true")
     train_group.add_argument("--ltm-lr", "--ltm_lr", dest="ltm_lr", type=float, default=1e-3, help="Maximum LTM inner-update learning rate.")
     train_group.add_argument("--min-ltm-lr", "--min_ltm_lr", dest="min_ltm_lr", type=float, default=None, help="Minimum LTM LR for cosine annealing. Defaults to --min-lr.")
@@ -1337,6 +1469,23 @@ def main():
         help=(
             "Disable the trainer fail-fast audit that rejects label=-100 on real "
             "prompt/completion tokens when --train-prompt-tokens is active."
+        ),
+    )
+    train_group.add_argument("--prompt-loss-weight", type=float, default=1.0, help="Per-token CE weight for prompt/instruction/input tokens when prompt tokens are trained.")
+    train_group.add_argument("--response-loss-weight", type=float, default=1.0, help="Per-token CE weight for completion/assistant response tokens.")
+    train_group.add_argument("--response-boundary-loss-weight", type=float, default=1.0, help="Multiplier for the first N response tokens after ### Response.")
+    train_group.add_argument("--response-boundary-tokens", type=int, default=0, help="Number of initial response tokens to multiply by --response-boundary-loss-weight.")
+    train_group.add_argument("--min-response-tokens", type=int, default=1, help="Minimum non-EOS assistant response tokens to keep when truncating prompt-completion rows.")
+    train_group.add_argument("--allow-empty-completions", dest="drop_empty_completions", action="store_false", help="Keep prompt-completion rows with blank completions instead of dropping them.")
+    train_group.set_defaults(drop_empty_completions=True)
+    train_group.add_argument(
+        "--assistant-recovery",
+        action="store_true",
+        help=(
+            "Apply large-assistant SFT defaults for Alpaca training: "
+            "4 epochs, warmup+cosine LR, response-weighted loss, boosted response-boundary tokens, "
+            "and response-preserving truncation. "
+            "Explicit CLI values still override the preset."
         ),
     )
     train_group.add_argument("--lora_r", type=int, default=8)
@@ -1511,6 +1660,8 @@ def main():
     chat_group.add_argument("--surprise-threshold", type=float, default=1.0, help="Passive learning only writes when loss <= this threshold (default: 1.0; lower is stricter).")
     chat_group.add_argument("--chat-state-file", type=str, nargs="?", const="auto", default=None, help="Autosave a new tiny model-neutral hierarchical chat state .pt file. Pass no value for an auto path.")
     chat_group.add_argument("--resume-chat-from-state-file", type=str, default=None, help="Resume and autosave a tiny model-neutral hierarchical chat state .pt file.")
+    chat_group.add_argument("--chat-input-history-turns", type=int, default=4, help="For Alpaca chat, put this many previous turns in the ### Input field (0 disables).")
+    chat_group.add_argument("--chat-input-history-chars", type=int, default=3000, help="Character cap for Alpaca chat ### Input previous-context text.")
     
     # --- Utility Arguments ---
     util_group = parser.add_argument_group('Utilities')
@@ -1525,6 +1676,7 @@ def main():
     args = parser.parse_args(normalized_argv)
     explicit_dests = _explicit_cli_dests(parser, normalized_argv)
     _hydrate_training_args_from_model_config(args, parser, explicit_dests)
+    _apply_assistant_recovery_defaults(args, explicit_dests)
     _validate_resume_epoch_target(args)
 
     if args.mode == "benchmark" and args.list_benchmarks:
@@ -1586,7 +1738,12 @@ def main():
             print(f"Scanning HF dataset: {args.hf_dataset}...")
             temp_ds = load_hf_dataset(args.hf_dataset, args.hf_dataset_config, split=args.hf_dataset_split)
             for sample in tqdm(temp_ds, desc="Scanning HF"):
-                processed = process_text_sample(tokenizer, sample, 9999, args.kayla, args.text_column, args.prompt_column, args.completion_column, args.alpaca)
+                processed = process_text_sample(
+                    tokenizer, sample, 9999, args.kayla,
+                    args.text_column, args.prompt_column, args.completion_column,
+                    args.alpaca, getattr(args, "train_prompt_tokens", True),
+                    **_loss_weight_kwargs(args), **_response_quality_kwargs(args),
+                )
                 if processed: max_found = max(max_found, len(processed['input_ids']))
         elif args.train and isinstance(args.train, str):
             jsonl_files = _jsonl_source_files(args.train)
@@ -1596,7 +1753,12 @@ def main():
                     with open(jsonl_path, 'r', encoding='utf-8') as f:
                         for line in tqdm(f, desc=f"Scanning {os.path.basename(jsonl_path)}"):
                             try:
-                                processed = process_text_sample(tokenizer, json.loads(line), 9999, args.kayla, args.text_column, args.prompt_column, args.completion_column, args.alpaca)
+                                processed = process_text_sample(
+                                    tokenizer, json.loads(line), 9999, args.kayla,
+                                    args.text_column, args.prompt_column, args.completion_column,
+                                    args.alpaca, getattr(args, "train_prompt_tokens", True),
+                                    **_loss_weight_kwargs(args), **_response_quality_kwargs(args),
+                                )
                                 if processed: max_found = max(max_found, len(processed['input_ids']))
                             except: continue
             else:
@@ -1606,13 +1768,23 @@ def main():
                         data = json.load(f)
                         if not isinstance(data, list): data = [data]
                         for obj in tqdm(data, desc="Scanning JSON"):
-                            processed = process_text_sample(tokenizer, obj, 9999, args.kayla, args.text_column, args.prompt_column, args.completion_column, args.alpaca)
+                            processed = process_text_sample(
+                                tokenizer, obj, 9999, args.kayla,
+                                args.text_column, args.prompt_column, args.completion_column,
+                                args.alpaca, getattr(args, "train_prompt_tokens", True),
+                                **_loss_weight_kwargs(args), **_response_quality_kwargs(args),
+                            )
                             if processed: max_found = max(max_found, len(processed['input_ids']))
                     except:
                         f.seek(0)
                         for line in tqdm(f, desc="Scanning JSONL"):
                             try:
-                                processed = process_text_sample(tokenizer, json.loads(line), 9999, args.kayla, args.text_column, args.prompt_column, args.completion_column, args.alpaca)
+                                processed = process_text_sample(
+                                    tokenizer, json.loads(line), 9999, args.kayla,
+                                    args.text_column, args.prompt_column, args.completion_column,
+                                    args.alpaca, getattr(args, "train_prompt_tokens", True),
+                                    **_loss_weight_kwargs(args), **_response_quality_kwargs(args),
+                                )
                                 if processed: max_found = max(max_found, len(processed['input_ids']))
                             except: continue
         if max_found > 0:

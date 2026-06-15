@@ -220,6 +220,53 @@ def test_alpaca_flag_defaults_instruction_output_columns():
     assert tokenizer.calls[1] == ("positive", False)
 
 
+def test_prompt_completion_drops_empty_outputs_by_default():
+    tokenizer = RecordingTokenizer()
+
+    assert process_text_sample(
+        tokenizer,
+        {"instruction": "Say something.", "output": ""},
+        max_length=128,
+        alpaca_mode=True,
+    ) is None
+
+    kept = process_text_sample(
+        tokenizer,
+        {"instruction": "Say something.", "output": ""},
+        max_length=128,
+        alpaca_mode=True,
+        drop_empty_completions=False,
+    )
+    assert kept is not None
+    assert kept["input_ids"][-1].item() == TinyTokenizer.eos_token_id
+
+
+def test_prompt_completion_truncation_preserves_response_tokens():
+    tokenizer = RecordingTokenizer()
+    output = "assistant answer"
+    output_ids = TinyTokenizer().encode(output, add_special_tokens=False)
+    processed = process_text_sample(
+        tokenizer,
+        {
+            "instruction": "Use the context.",
+            "input": "context " * 200,
+            "output": output,
+        },
+        max_length=len(output_ids) + 12,
+        alpaca_mode=True,
+        min_response_tokens=len(output_ids),
+    )
+
+    assert processed is not None
+    assert len(processed["input_ids"]) == len(output_ids) + 12
+    assert processed["input_ids"][-(len(output_ids) + 1):].tolist() == (
+        output_ids + [TinyTokenizer.eos_token_id]
+    )
+    assert processed["labels"][-(len(output_ids) + 1):].tolist() == (
+        output_ids + [TinyTokenizer.eos_token_id]
+    )
+
+
 def test_streaming_jsonl_dataloader_batches_without_materializing():
     tokenizer = TinyTokenizer()
     rows = [{"text": f"sample {idx}"} for idx in range(11)]
@@ -667,6 +714,8 @@ def test_hf_cache_keys_reject_legacy_masked_or_ambiguous_formatter_versions():
     assert payload["alpaca_input_field"] == "input"
     assert payload["alpaca_input_role"] == "previous_context"
     assert payload["train_prompt_tokens"] is True
+    assert payload["min_response_tokens"] == 1
+    assert payload["drop_empty_completions"] is True
 
 
 def test_hf_streaming_dataloader_batches():

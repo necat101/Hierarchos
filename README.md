@@ -346,6 +346,33 @@ python hierarchos_cli.py train \
 
 ## ⚠️ **HRM Convergence & Training Speed:** Higher `--max_h_steps` and `--max_l_steps` allow deeper reasoning but **significantly increase training time** per batch due to the iterative HRM process. Adjust based on your task and compute resources.
 
+### Assistant SFT Profile for 232M / ~1B Tokens
+
+For a 232M `448/448/448` assistant run on a large Alpaca-style instruction dataset, start with the assistant recovery preset and only override it after validation says to:
+
+```bash
+python hierarchos_cli.py train \
+    --hf_dataset "your_org/assistant_dataset" \
+    --hf_dataset_split "train" \
+    --alpaca \
+    --assistant-recovery \
+    --tokenizer-path "openai-community/gpt2" \
+    --out-dir "./hierarchos_232m_assistant" \
+    --context_dim 448 \
+    --h_hidden 448 \
+    --l_hidden 448 \
+    --rwkv-head-size 64 \
+    --max_length 1024 \
+    --batch_size 64 \
+    --accumulation-steps 1 \
+    --hf-token-cache \
+    --min-response-tokens 16 \
+    --save-steps 1000 \
+    --padding-metric-steps 50
+```
+
+`--assistant-recovery` keeps prompt tokens in the language-model objective but downweights them, weights assistant response tokens normally, boosts the first response tokens, uses warmup+cosine LR, lowers the ponder penalty, lengthens memory-gate warmup, and reserves answer tokens when overlong prompts are truncated. Blank completions are dropped by default; pass `--allow-empty-completions` only if empty answers are intentional labels. The default 4-epoch preset gives a 232.5M model about 17.2 training tokens per parameter on a 1B-token dataset, while a single epoch is only about 4.3 tokens per parameter.
+
 ### Workflow 2: Fine-Tuning with LoRA
 
 Adapt a pre-trained model using new data (any supported format).
@@ -667,8 +694,17 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.5 --top-
 | `--override-scheduling`        | `train`                             | **[If resuming]** Ignore checkpoint's schedule state and use new LR args.                                                                | `False`                 |
 | `--starting-lr`                | `train`, `finetune`                 | Max Learning Rate for the schedule, or fixed LR if schedule disabled.                                                                    | `1e-4`                  |
 | `--min-lr`                     | `train`, `finetune`                 | Minimum Learning Rate for cosine annealing schedule.                                                                                     | `1e-6`                  |
+| `--warmup-steps`               | `train`, `finetune`                 | Optimizer update steps spent linearly warming from `--min-lr` to `--starting-lr`; overrides `--warmup-ratio` when set.                  | `0`                     |
+| `--warmup-ratio`               | `train`, `finetune`                 | Fraction of optimizer updates used for LR warmup before cosine decay.                                                                    | `0.0`                   |
 | `--disable-lr-schedule`        | `train`, `finetune`                 | Use a fixed Learning Rate (`--starting-lr`) instead of cosine annealing.                                                                 | `False`                 |
-| `--ltm_lr`                     | `train`, `finetune`, `chat`         | Learning Rate for LTM "surprise" updates (or max LR for LTM schedule in chat).                                                         | `0.01`                  |
+| `--ltm_lr`                     | `train`, `finetune`, `chat`         | Learning Rate for LTM "surprise" updates (or max LR for LTM schedule in chat).                                                         | `1e-3`                  |
+| `--assistant-recovery`         | `train`                             | Apply the recommended large assistant SFT preset: Alpaca formatting, warmup+cosine schedule, response-weighted loss, and longer memory-gate warmup. | `False`                 |
+| `--prompt-loss-weight`         | `train`, `finetune`                 | Per-token CE weight for prompt/instruction/input tokens when prompt tokens are trained.                                                  | `1.0`                   |
+| `--response-loss-weight`       | `train`, `finetune`                 | Per-token CE weight for completion/assistant response tokens.                                                                            | `1.0`                   |
+| `--response-boundary-loss-weight` | `train`, `finetune`              | Multiplier for the first `--response-boundary-tokens` non-EOS response tokens.                                                           | `1.0`                   |
+| `--response-boundary-tokens`   | `train`, `finetune`                 | Number of initial assistant response tokens multiplied by `--response-boundary-loss-weight`.                                             | `0`                     |
+| `--min-response-tokens`        | `train`, `finetune`                 | Minimum non-EOS assistant response tokens kept when truncating prompt-completion rows.                                                   | `1`                     |
+| `--allow-empty-completions`    | `train`, `finetune`                 | Keep blank completion rows instead of dropping them. Use only when EOS-only answers are intended.                                        | `False`                 |
 | `--no-memory-token-routers`    | `train`, `finetune`                 | Disable lightweight per-token routers for ROSA/LTM gates and use scalar memory gates only.                                              | `False`                 |
 | `--memory-gate-warmup-steps`   | `train`, `finetune`                 | Training batches over which the ROSA/LTM gate floor decays to zero.                                                                     | `2000`                  |
 | `--memory-gate-warmup-floor`   | `train`, `finetune`                 | Initial soft minimum for ROSA/LTM gates during warmup.                                                                                  | `0.10`                  |

@@ -1,6 +1,18 @@
 -----
 
-# Hierarchos v0.19.3 (alpha): Progress Sync Throttling
+# Hierarchos v0.20 (alpha): Assistant SFT Safety Guardrails
+
+**v0.20 focus**: large assistant SFT runs now fail safer and resume cleaner. This release documents the response-preserving dataset path, weighted assistant-loss recipe, disabled CE-backward cap for from-scratch language training, and HF token-cache/resume guardrails.
+
+**hierarchos/training/trainer.py**: `--max-ce-loss-for-backward` now defaults to `0.0` (disabled). This prevents a finite-loss cap below random 50k-vocab CE from silently zeroing language-model gradients during early from-scratch training.
+
+**hierarchos/training/datasets.py**: prompt/completion examples now preserve assistant response tokens when overlong rows are truncated. Blank completions are dropped by default; `--allow-empty-completions` keeps them only when EOS-only answers are intentional labels.
+
+**hierarchos_cli.py**: assistant recovery applies the large-assistant SFT recipe: `prompt_loss_weight=0.10`, `response_loss_weight=1.0`, `response_boundary_loss_weight=2.0`, `response_boundary_tokens=32`, `min_response_tokens=16`, `warmup_ratio=0.03`, `starting_lr=6e-5`, `min_lr=1e-6`, `ltm_lr=3e-4`, `min_ltm_lr=1e-5`, `ponder_loss_weight=0.003`, and `memory_gate_warmup_steps=5000`.
+
+**HF token cache safety**: cache keys include formatting, prompt/response weights, `min_response_tokens`, empty-completion policy, ROSA settings, and chunk size. Resume hydration no longer persists one-shot rebuild flags like `--refresh-hf-token-cache`, nor stale CE-cap settings from older checkpoints.
+
+## Previous v0.19.3 Notes: Progress Sync Throttling
 
 **hierarchos/models/ltm.py** (line 122): CUDA LTM updates now aggregate only touched slots with torch.unique plus indexed writes, avoiding full dense [slots, val_dim] and [batch, slots, val_dim] scatter buffers.
 
@@ -19,6 +31,38 @@
 A novel AI architecture that synergistically integrates Google's Titans memory system with a Hierarchical Reasoning Model (HRM) and RWKV linear attention to move beyond the limitations of scale and take a decisive step on the path to AGI.
 
 -----
+
+### New in v0.20: Assistant SFT Safety Guardrails
+
+#### Large Assistant Training Safety
+- **CE Backward Cap Disabled by Default**: `--max-ce-loss-for-backward` now defaults to `0.0`. Leave it disabled for from-scratch language-model training; a finite cap below random-token CE can clamp the loss and silently remove the CE gradient early in training.
+- **Response-Preserving Truncation**: Alpaca prompt/completion rows now reserve assistant response tokens when an overlong row is truncated. `--min-response-tokens` defaults to `1`, and `--assistant-recovery` raises it to `16`.
+- **Blank Completion Guardrail**: Empty completions are dropped by default so EOS-only labels do not pollute assistant SFT. Use `--allow-empty-completions` only when blank answers are intentional supervised labels.
+- **Assistant Loss Weights**: The recovery preset trains prompt tokens at `0.10x`, response tokens at `1.0x`, and the first `32` response tokens at `2.0x`.
+- **Resume/Cache Hygiene**: HF token cache keys include loss-weight, formatting, chunking, and response-guardrail settings. Resume hydration no longer persists one-shot refresh flags or stale CE caps from older checkpoints.
+
+#### v0.20 Recovery Preset Values
+
+`--assistant-recovery` applies:
+
+```text
+epochs=4
+starting_lr=6e-5
+min_lr=1e-6
+warmup_ratio=0.03
+ltm_lr=3e-4
+min_ltm_lr=1e-5
+train_prompt_tokens=True
+prompt_loss_weight=0.10
+response_loss_weight=1.0
+response_boundary_loss_weight=2.0
+response_boundary_tokens=32
+min_response_tokens=16
+drop_empty_completions=True
+ponder_loss_weight=0.003
+memory_gate_warmup_steps=5000
+max_ce_loss_for_backward=0.0
+```
 
 ### 🚀 **New in v0.19.3: Progress Sync Throttling**
 
@@ -348,7 +392,7 @@ python hierarchos_cli.py train \
 
 ### Assistant SFT Profile for 232M / ~1B Tokens
 
-For a 232M `448/448/448` assistant run on a large Alpaca-style instruction dataset, start with the assistant recovery preset and only override it after validation says to:
+For a 232M `448/448/448` assistant run on a large Alpaca-style instruction dataset, start with the assistant recovery preset. Explicit CLI values override the preset, so a full-budget 10-epoch run can keep the v0.20 safety settings while setting `--epochs 10`:
 
 ```bash
 python hierarchos_cli.py train \
@@ -356,22 +400,24 @@ python hierarchos_cli.py train \
     --hf_dataset_split "train" \
     --alpaca \
     --assistant-recovery \
+    --epochs 10 \
     --tokenizer-path "openai-community/gpt2" \
     --out-dir "./hierarchos_232m_assistant" \
     --context_dim 448 \
     --h_hidden 448 \
     --l_hidden 448 \
     --rwkv-head-size 64 \
-    --max_length 1024 \
+    --max_length 8880 \
+    --training-chunk-size 256 \
     --batch_size 64 \
     --accumulation-steps 1 \
     --hf-token-cache \
-    --min-response-tokens 16 \
-    --save-steps 1000 \
+    --max-ce-loss-for-backward 0 \
+    --save-steps 600 \
     --padding-metric-steps 50
 ```
 
-`--assistant-recovery` keeps prompt tokens in the language-model objective but downweights them, weights assistant response tokens normally, boosts the first response tokens, uses warmup+cosine LR, lowers the ponder penalty, lengthens memory-gate warmup, and reserves answer tokens when overlong prompts are truncated. Blank completions are dropped by default; pass `--allow-empty-completions` only if empty answers are intentional labels. The default 4-epoch preset gives a 232.5M model about 17.2 training tokens per parameter on a 1B-token dataset, while a single epoch is only about 4.3 tokens per parameter.
+`--assistant-recovery` keeps prompt tokens in the language-model objective but downweights them to `0.10`, weights assistant response tokens at `1.0`, boosts the first `32` response tokens by `2.0x`, uses warmup+cosine LR, lowers the ponder penalty to `0.003`, lengthens memory-gate warmup to `5000` steps, and reserves at least `16` answer tokens when overlong prompts are truncated. Blank completions are dropped by default; pass `--allow-empty-completions` only if empty answers are intentional labels. Keep `--max-ce-loss-for-backward 0` for from-scratch LM training. The default 4-epoch preset gives a 232.5M model about 17.2 training tokens per parameter on a 1B-token dataset; `--epochs 10` is about 43 training tokens per parameter.
 
 ### Workflow 2: Fine-Tuning with LoRA
 
@@ -684,6 +730,7 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.5 --top-
 | `--accumulation-steps`         | `train`, `finetune`                 | Number of steps to accumulate gradients over (simulates larger batch size).                                                              | `1`                     |
 | `--gradient-checkpointing`     | `train`, `finetune`                 | **Enable gradient checkpointing to save VRAM (trades compute for memory).** | `False`                 |
 | `--grad-clip`                  | `train`, `finetune`                 | Gradient clipping value. Prevents gradient explosion (0 to disable).                                                                     | `1.0`                   |
+| `--max-ce-loss-for-backward`   | `train`, `finetune`                 | Optional finite cap on CE used for backward only. `0` disables the cap and is recommended for from-scratch LM/assistant SFT training.     | `0.0`                   |
 | `--ponder-loss-weight`         | `train`, `finetune`                 | Weight for the Ponder Cost auxiliary loss.                                                                                               | `0.01`                  |
 | `--encourage-thinking`         | `train`                             | **Invert ponder loss to REWARD thinking.** Useful for ACT recovery training.                                                              | `False`                 |
 | `--adaptive-ponder`            | `train`                             | **Scale ponder target with CE loss.** Harder content triggers more thinking.                                                              | `False`                 |
@@ -698,12 +745,14 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.5 --top-
 | `--warmup-ratio`               | `train`, `finetune`                 | Fraction of optimizer updates used for LR warmup before cosine decay.                                                                    | `0.0`                   |
 | `--disable-lr-schedule`        | `train`, `finetune`                 | Use a fixed Learning Rate (`--starting-lr`) instead of cosine annealing.                                                                 | `False`                 |
 | `--ltm_lr`                     | `train`, `finetune`, `chat`         | Learning Rate for LTM "surprise" updates (or max LR for LTM schedule in chat).                                                         | `1e-3`                  |
-| `--assistant-recovery`         | `train`                             | Apply the recommended large assistant SFT preset: Alpaca formatting, warmup+cosine schedule, response-weighted loss, and longer memory-gate warmup. | `False`                 |
+| `--assistant-recovery`         | `train`                             | Apply the v0.20 large-assistant SFT preset: Alpaca formatting, 4 epochs unless overridden, warmup+cosine LR, prompt/response weights `0.10/1.0`, `2.0x` first `32` response tokens, `16` reserved response tokens, `0.003` ponder weight, and `5000` memory-gate warmup steps. | `False`                 |
+| `--mask-prompt-tokens`         | `train`, `finetune`                 | Legacy SFT behavior: exclude prompt/instruction/input tokens from CE. By default, prompt tokens are trained and can be downweighted.      | `False`                 |
+| `--allow-masked-active-labels` | `train`, `finetune`                 | Disable the fail-fast audit that rejects masked labels on real prompt/completion tokens when prompt-token training is active.             | `False`                 |
 | `--prompt-loss-weight`         | `train`, `finetune`                 | Per-token CE weight for prompt/instruction/input tokens when prompt tokens are trained.                                                  | `1.0`                   |
-| `--response-loss-weight`       | `train`, `finetune`                 | Per-token CE weight for completion/assistant response tokens.                                                                            | `1.0`                   |
+| `--response-loss-weight`       | `train`, `finetune`                 | Per-token CE weight for completion/assistant response tokens. Response tokens are always the primary supervised target.                  | `1.0`                   |
 | `--response-boundary-loss-weight` | `train`, `finetune`              | Multiplier for the first `--response-boundary-tokens` non-EOS response tokens.                                                           | `1.0`                   |
 | `--response-boundary-tokens`   | `train`, `finetune`                 | Number of initial assistant response tokens multiplied by `--response-boundary-loss-weight`.                                             | `0`                     |
-| `--min-response-tokens`        | `train`, `finetune`                 | Minimum non-EOS assistant response tokens kept when truncating prompt-completion rows.                                                   | `1`                     |
+| `--min-response-tokens`        | `train`, `finetune`                 | Minimum non-EOS assistant response tokens kept when truncating prompt-completion rows. `--assistant-recovery` sets this to `16`.         | `1`                     |
 | `--allow-empty-completions`    | `train`, `finetune`                 | Keep blank completion rows instead of dropping them. Use only when EOS-only answers are intended.                                        | `False`                 |
 | `--no-memory-token-routers`    | `train`, `finetune`                 | Disable lightweight per-token routers for ROSA/LTM gates and use scalar memory gates only.                                              | `False`                 |
 | `--memory-gate-warmup-steps`   | `train`, `finetune`                 | Training batches over which the ROSA/LTM gate floor decays to zero.                                                                     | `2000`                  |
@@ -720,9 +769,12 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.5 --top-
 | `--prefetch-factor`            | `train`, `finetune`                 | Batches prefetched per DataLoader worker. Omit it to keep total queued batches tied to worker count.                                    | `None`                  |
 | `--progress-log-steps`         | `train`                             | Update tqdm scalar metrics every N steps to reduce CUDA sync overhead from progress logging (`1` = every step).                         | `25`                    |
 | `--hf-token-cache`             | `train`, `finetune`                 | Build/reuse a random-access binary token cache for HF datasets. Enabled by default; use `--no-hf-token-cache` to disable.               | `True`                  |
+| `--hf-token-cache-dir`         | `train`, `finetune`                 | Directory for random-access HF token caches. Cache keys include formatter, weights, response guardrails, chunking, and architecture settings. | `None`              |
+| `--refresh-hf-token-cache`     | `train`, `finetune`                 | Rebuild the random-access HF token cache once. This one-shot flag is not persisted by resume hydration.                                  | `False`                 |
 | `--pt-cache-size`              | `train`, `finetune`                 | Number of `.pt` chunk files to keep hot per worker when using `--pre_pt_dataset`.                                                       | `2`                     |
 | `--lora_r`                     | `finetune`                          | LoRA rank 'r'.                                                                                                                           | `8`                     |
-| `--lora_alpha`                 | `finetune`                          | LoRA alpha scaling factor.                                                                                                               | `16`                    |\n| `--finetune-unlock-percent`    | `finetune`                          | Target % of params to train (approx.). Overrides `--lora_r` if set.                                                                     | `None`                  |
+| `--lora_alpha`                 | `finetune`                          | LoRA alpha scaling factor.                                                                                                               | `16`                    |
+| `--finetune-unlock-percent`    | `finetune`                          | Target % of params to train (approx.). Overrides `--lora_r` if set.                                                                     | `None`                  |
 | `--kayla`                      | `train`, `finetune`                 | Enable Kayla-style instruction tuning format (with thought-process). **Ignored if using pre-chunked formats or --text\_column.** | `False`                 |
 | `--alpaca`                     | `train`, `finetune`                 | Enable Alpaca `instruction`/`input`/`output` formatting. Defaults prompt/completion columns to `instruction`/`output` and includes `input` as a `### Input:` context block. | `False`                 |
 | **Quantization/Inference** |                                     |                                                                                                                                          |                         |
@@ -809,6 +861,13 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
   * **DirectML/ZLUDA communities** for enabling AMD GPU acceleration on Windows.
 
 ## Changelog
+
+### v0.20 (alpha)
+
+  * **Assistant SFT Safety Guardrails**: Adds response-preserving truncation for prompt/completion rows, drops blank completions by default, and documents `--min-response-tokens` / `--allow-empty-completions`.
+  * **Loss-Cap Safety**: `--max-ce-loss-for-backward` now defaults to `0.0` so cold-start LM training is not clamped below random-token CE.
+  * **Weighted Assistant Recipe**: `--assistant-recovery` now documents the v0.20 recipe: prompt `0.10x`, response `1.0x`, first `32` response tokens `2.0x`, `16` reserved response tokens, `0.003` ponder loss, and `5000` memory-gate warmup steps.
+  * **HF Token Cache Hygiene**: Cache keys include formatting, loss weights, response guardrails, chunking, and architecture settings. Resume hydration no longer persists one-shot cache refresh flags or stale CE-cap values from older checkpoints.
 
 ### v0.19.3 (alpha)
 

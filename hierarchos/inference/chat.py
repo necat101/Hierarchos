@@ -124,10 +124,11 @@ def wrap_for_hierarchos(raw_text, system_prompt=None, alpaca_mode=False, input_c
     if system_prompt:
         clean_text = f"[{system_prompt}]\n{clean_text}"
     if alpaca_mode:
-        prompt = f"### Instruction:\n{clean_text}\n\n"
+        prompt = ""
         input_context = str(input_context or "").strip()
         if input_context:
-            prompt += f"### Input:\n{input_context}\n\n"
+            prompt += f"### Previous Context:\n{input_context}\n\n"
+        prompt += f"### Instruction:\n{clean_text}\n\n"
         return prompt + "### Response:\n"
     return f"User: {clean_text}\n\nAssistant: "
 
@@ -957,8 +958,8 @@ def chat(args, device, tokenizer):
         if alpaca_chat_format:
             if chat_input_history_turns > 0 and chat_input_history_chars > 0:
                 print(
-                    "Chat prompt format: Alpaca ### Instruction/Input/Response "
-                    f"(Input uses last {chat_input_history_turns} turn(s), capped at {chat_input_history_chars} chars)"
+                    "Chat prompt format: Alpaca ### Previous Context/Instruction/Response "
+                    f"(Previous Context uses last {chat_input_history_turns} turn(s), capped at {chat_input_history_chars} chars)"
                 )
             else:
                 print("Chat prompt format: Alpaca ### Instruction/Response")

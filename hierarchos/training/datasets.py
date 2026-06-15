@@ -441,9 +441,10 @@ def _is_alpaca_prompt_pair(prompt_column: Optional[str], completion_column: Opti
     )
 
 def _format_alpaca_prompt(instruction: str, inp: str) -> str:
-    prompt = f"### Instruction:\n{instruction}\n\n"
+    prompt = ""
     if inp:
-        prompt += f"### Input:\n{inp}\n\n"
+        prompt += f"### Previous Context:\n{inp}\n\n"
+    prompt += f"### Instruction:\n{instruction}\n\n"
     return prompt + "### Response:\n"
 
 def _estimate_text_token_length(text_dict: dict, max_length: int, kayla_mode: bool,

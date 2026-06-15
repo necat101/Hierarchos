@@ -20,6 +20,7 @@ from hierarchos.training.datasets import (
     create_dataloader_for_tokenized_cache,
     process_text_sample,
 )
+from hierarchos.inference.chat import wrap_for_hierarchos
 from hierarchos.training.trainer import pad_training_batch_to_multiple
 
 
@@ -149,7 +150,7 @@ def test_process_text_sample_autodetects_common_columns():
     assert not (instruct_sample["labels"] == -100).any()
 
 
-def test_alpaca_instruction_input_output_uses_input_section():
+def test_alpaca_instruction_input_output_uses_previous_context_section():
     tokenizer = RecordingTokenizer()
     processed = process_text_sample(
         tokenizer,
@@ -165,8 +166,8 @@ def test_alpaca_instruction_input_output_uses_input_section():
 
     assert processed is not None
     assert tokenizer.calls[0] == (
+        "### Previous Context:\nThe passage to summarize.\n\n"
         "### Instruction:\nSummarize the passage.\n\n"
-        "### Input:\nThe passage to summarize.\n\n"
         "### Response:\n",
         True,
     )
@@ -216,8 +217,62 @@ def test_alpaca_flag_defaults_instruction_output_columns():
     )
 
     assert processed is not None
-    assert "### Input:\nI love this.\n\n" in tokenizer.calls[0][0]
+    assert "### Previous Context:\nI love this.\n\n" in tokenizer.calls[0][0]
     assert tokenizer.calls[1] == ("positive", False)
+
+
+def test_alpaca_empty_input_omits_previous_context_section():
+    tokenizer = RecordingTokenizer()
+    processed = process_text_sample(
+        tokenizer,
+        {
+            "instruction": "Answer directly.",
+            "input": "   ",
+            "output": "Direct answer.",
+        },
+        max_length=256,
+        alpaca_mode=True,
+    )
+
+    assert processed is not None
+    assert tokenizer.calls[0] == (
+        "### Instruction:\nAnswer directly.\n\n"
+        "### Response:\n",
+        True,
+    )
+    assert "### Previous Context:" not in tokenizer.calls[0][0]
+    assert "User:" not in tokenizer.calls[0][0]
+
+
+def test_alpaca_chat_wrapper_uses_context_section_not_user_prompt():
+    prompt = wrap_for_hierarchos(
+        "Answer the latest request.",
+        alpaca_mode=True,
+        input_context="Earlier context.",
+    )
+
+    assert prompt == (
+        "### Previous Context:\nEarlier context.\n\n"
+        "### Instruction:\nAnswer the latest request.\n\n"
+        "### Response:\n"
+    )
+    assert "User:" not in prompt
+    assert prompt.index("### Previous Context:") < prompt.index("### Instruction:")
+
+
+def test_alpaca_chat_wrapper_empty_context_is_zero_shot():
+    prompt = wrap_for_hierarchos(
+        "Answer without prior context.",
+        alpaca_mode=True,
+        input_context="",
+    )
+
+    assert prompt == (
+        "### Instruction:\nAnswer without prior context.\n\n"
+        "### Response:\n"
+    )
+    assert "### Previous Context:" not in prompt
+    assert "User:" not in prompt
 
 
 def test_prompt_completion_drops_empty_outputs_by_default():
@@ -665,8 +720,8 @@ def test_hf_token_cache_preserves_alpaca_input_and_all_token_labels():
         hierarchos_cli.load_hf_dataset = original_loader
 
     expected_prompt = (
+        "### Previous Context:\nPrevious turn: the user asked about token caches.\n\n"
         "### Instruction:\nAnswer using the prior context.\n\n"
-        "### Input:\nPrevious turn: the user asked about token caches.\n\n"
         "### Response:\n"
     )
     expected_ids = (

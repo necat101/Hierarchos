@@ -43,7 +43,7 @@ from hierarchos import (
 )
 from hierarchos.utils.rosa import precompute_rosa_ids_for_chunks
 
-HF_CACHE_FORMATTER_VERSION = "alpaca-response-preserving-v4"
+HF_CACHE_FORMATTER_VERSION = "alpaca-previous-context-v5"
 
 
 def load_hf_dataset(dataset_name, dataset_config=None, split="train", streaming=False):
@@ -1663,8 +1663,8 @@ def main():
     chat_group.add_argument("--surprise-threshold", type=float, default=1.0, help="Passive learning only writes when loss <= this threshold (default: 1.0; lower is stricter).")
     chat_group.add_argument("--chat-state-file", type=str, nargs="?", const="auto", default=None, help="Autosave a new tiny model-neutral hierarchical chat state .pt file. Pass no value for an auto path.")
     chat_group.add_argument("--resume-chat-from-state-file", type=str, default=None, help="Resume and autosave a tiny model-neutral hierarchical chat state .pt file.")
-    chat_group.add_argument("--chat-input-history-turns", type=int, default=4, help="For Alpaca chat, put this many previous turns in the ### Input field (0 disables).")
-    chat_group.add_argument("--chat-input-history-chars", type=int, default=3000, help="Character cap for Alpaca chat ### Input previous-context text.")
+    chat_group.add_argument("--chat-input-history-turns", type=int, default=4, help="For Alpaca chat, put this many previous turns in the ### Previous Context field (0 disables).")
+    chat_group.add_argument("--chat-input-history-chars", type=int, default=3000, help="Character cap for Alpaca chat ### Previous Context text.")
     
     # --- Utility Arguments ---
     util_group = parser.add_argument_group('Utilities')

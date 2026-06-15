@@ -1498,7 +1498,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         )
     if prompt_completion_mode:
         if getattr(args, 'alpaca', False):
-            prompt_shape = "Alpaca ### Instruction/[optional ### Input]/### Response"
+            prompt_shape = "Alpaca [optional ### Previous Context]/### Instruction/### Response"
         elif getattr(args, 'kayla', False):
             prompt_shape = "Kayla Instruction/Feelings/Thought Process/Response"
         else:

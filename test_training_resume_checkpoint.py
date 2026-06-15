@@ -476,6 +476,8 @@ def _continuation_parser_and_args(model_path=None, resume_from_ckpt=None, epochs
         "ponder_loss_weight": 0.01,
         "memory_gate_warmup_steps": 2000,
         "assistant_recovery": False,
+        "refresh_hf_token_cache": False,
+        "refresh_hf_shards": False,
     }
     parser = argparse.ArgumentParser()
     for key, value in defaults.items():
@@ -558,6 +560,26 @@ def test_assistant_recovery_respects_explicit_overrides():
     assert args.prompt_loss_weight == 1.0
     assert args.warmup_ratio == 0.0
     assert args.response_boundary_tokens == 32
+
+
+def test_resume_hydration_does_not_persist_refresh_cache_flags(tmp_path):
+    ckpt_path = tmp_path / "hierarchos_epoch_1_step_600.pt"
+    torch.save({
+        "config": {
+            "hf_dataset": "netcat420/Experiment_0.1",
+            "refresh_hf_token_cache": True,
+            "refresh_hf_shards": True,
+            "completed_epoch": 1,
+        },
+        "model_state_dict": {},
+    }, ckpt_path)
+    parser, args = _continuation_parser_and_args(resume_from_ckpt=str(ckpt_path))
+
+    hierarchos_cli._hydrate_training_args_from_model_config(args, parser, explicit_dests=set())
+
+    assert args.hf_dataset == "netcat420/Experiment_0.1"
+    assert args.refresh_hf_token_cache is False
+    assert args.refresh_hf_shards is False
 
 
 def test_cli_resume_checkpoint_hydrates_config_without_base_epoch_offset():

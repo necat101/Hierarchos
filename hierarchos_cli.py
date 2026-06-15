@@ -1125,6 +1125,8 @@ _CONTINUATION_SKIP_CONFIG_KEYS = {
     "amp_dtype",
     "vocab_size",
     "device",
+    "refresh_hf_token_cache",
+    "refresh_hf_shards",
 }
 
 _CONTINUATION_SUMMARY_KEYS = (

@@ -80,7 +80,7 @@ class CMakeBuild(build_ext):
 # --- Main Setup ---
 setup(
     name='hierarchos_matmul',
-    version='0.19.2',
+    version='0.20.1',
     author='Makhi Burroughs', # Filled in
     author_email='saltpepper312@gmail.com', # Placeholder
     description='Custom C++ kernel with optional Vulkan support for the Hierarchos project',

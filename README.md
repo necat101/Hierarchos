@@ -1,8 +1,16 @@
 -----
 
-# Hierarchos v0.20 (alpha): Assistant SFT Safety Guardrails
+# Hierarchos v0.20.1 (alpha): Drift Clamp Rescue
 
-**v0.20 focus**: large assistant SFT runs now fail safer and resume cleaner. This release documents the response-preserving dataset path, weighted assistant-loss recipe, disabled CE-backward cap for from-scratch language training, and HF token-cache/resume guardrails.
+**v0.20.1 focus**: large assistant SFT recovery runs now have explicit drift/commit stabilization controls. This patch adds L2 drift-norm clamping, drift-delta scaling, and straight-through commitment-loss capping so runaway worker drift can still receive corrective gradient while the auxiliary loss value remains bounded.
+
+**hierarchos/models/core.py**: `--drift-norm-clamp` caps the worker drift vector's total L2 norm, while `--drift-delta-scale` scales each accumulated worker drift update. These are resume-safe runtime controls and do not require resetting learned `h_module` / `l_module` weights.
+
+**hierarchos/training/trainer.py**: commitment-cost capping now preserves gradient for the commitment penalty. This keeps `--max-commitment-cost-for-backward` numerically safe without making high raw commit drift gradient-dead above the cap.
+
+## Previous v0.20 Notes: Assistant SFT Safety Guardrails
+
+**v0.20 focus**: large assistant SFT runs fail safer and resume cleaner. This release documents the response-preserving dataset path, weighted assistant-loss recipe, disabled CE-backward cap for from-scratch language training, and HF token-cache/resume guardrails.
 
 **hierarchos/training/trainer.py**: `--max-ce-loss-for-backward` now defaults to `0.0` (disabled). This prevents a finite-loss cap below random 50k-vocab CE from silently zeroing language-model gradients during early from-scratch training.
 
@@ -31,6 +39,14 @@
 A novel AI architecture that synergistically integrates Google's Titans memory system with a Hierarchical Reasoning Model (HRM) and RWKV linear attention to move beyond the limitations of scale and take a decisive step on the path to AGI.
 
 -----
+
+### New in v0.20.1: Drift Clamp Rescue
+
+#### Commit/Drift Stabilization
+- **L2 Drift Norm Clamp**: `--drift-norm-clamp N` caps the worker drift state's total L2 norm. This is more targeted than per-element clamping when many small dimensions collectively create high commitment cost.
+- **Drift Delta Scaling**: `--drift-delta-scale F` scales each worker drift update before accumulation. Values such as `0.35-0.75` slow runaway drift while preserving the learned hierarchy.
+- **Straight-Through Commit Cap**: commitment auxiliary capping remains bounded in the forward loss, but high raw commit now still receives corrective gradient. This prevents over-cap commit drift from becoming invisible to the penalty.
+- **Recovery Guidance**: for commit/loss spikes, resume from a pre-spike checkpoint with lower `--starting-lr`, lower `--ltm-lr`, `--drift-norm-clamp 3.5-4.0`, `--drift-delta-scale 0.35-0.60`, and `--grad-clip 0.75-1.0` rather than resetting `h_module` weights.
 
 ### New in v0.20: Assistant SFT Safety Guardrails
 
@@ -419,6 +435,34 @@ python hierarchos_cli.py train \
 
 `--assistant-recovery` keeps prompt tokens in the language-model objective but downweights them to `0.10`, weights assistant response tokens at `1.0`, boosts the first `32` response tokens by `2.0x`, uses warmup+cosine LR, lowers the ponder penalty to `0.003`, lengthens memory-gate warmup to `5000` steps, and reserves at least `16` answer tokens when overlong prompts are truncated. Blank completions are dropped by default; pass `--allow-empty-completions` only if empty answers are intentional labels. Keep `--max-ce-loss-for-backward 0` for from-scratch LM training. The default 4-epoch preset gives a 232.5M model about 17.2 training tokens per parameter on a 1B-token dataset; `--epochs 10` is about 43 training tokens per parameter.
 
+#### v0.20.1 Commit/Drift Rescue Resume
+
+If a long assistant run develops the pattern `loss up + ponder up + commit up`, do not reset learned hierarchy weights first. Resume from a pre-spike checkpoint with a cooler schedule and bounded drift:
+
+```bash
+python hierarchos_cli.py train \
+    --resume-from-ckpt "./chatHRM/hierarchos_epoch_4_step_6600.pt" \
+    --epochs 8 \
+    --override-scheduling \
+    --starting-lr 4e-5 \
+    --min-lr 1e-9 \
+    --warmup-ratio 0.0 \
+    --ltm-lr 2e-5 \
+    --min-ltm-lr 1e-9 \
+    --adaptive-ponder \
+    --ponder-target-scale 0.65 \
+    --ponder-loss-weight 0.003 \
+    --commitment-loss-weight 0.5 \
+    --max-commitment-cost-for-backward 4.0 \
+    --drift-state-clamp 2.0 \
+    --drift-norm-clamp 4.0 \
+    --drift-delta-scale 0.50 \
+    --grad-clip 0.75 \
+    --save-steps 600
+```
+
+Keep the same dataset, tokenizer, architecture dimensions, Alpaca/assistant-recovery flags, response-loss weights, HF token cache, and compile flags from the original run. If the first rescue attempt still spends multiple checkpoint intervals above `loss=3.5` with commit above `25`, fall back to an earlier checkpoint and reduce `--starting-lr`, `--ltm-lr`, and `--drift-delta-scale` another step.
+
 ### Workflow 2: Fine-Tuning with LoRA
 
 Adapt a pre-trained model using new data (any supported format).
@@ -738,6 +782,9 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.5 --top-
 | `--reset-halt-bias`            | `train`                             | **SURGICAL FIX:** Reset `h_halt_proj.bias` to this value on checkpoint load (e.g., `-2.0` for ~12% halt prob).                            | `None`                  |
 | `--commitment-loss-weight`     | `train`, `finetune`                 | Weight for the commitment auxiliary loss to prevent posterior collapse.                                                                  | `0.5`                   |
 | `--commitment-threshold`       | `train`, `finetune`                 | Hinge loss threshold for drift penalty. Drift^2 below this is not penalized.                                                             | `0.05`                  |
+| `--drift-state-clamp`          | `train`, `finetune`                 | Per-element clamp for worker drift states. Useful as a hard finite-value guard during unstable resumes.                                  | `5.0`                   |
+| `--drift-norm-clamp`           | `train`, `finetune`                 | Optional L2 norm clamp for worker drift states. `0` disables it; use `3.5-4.0` for commit/drift rescue resumes.                         | `0.0`                   |
+| `--drift-delta-scale`          | `train`, `finetune`                 | Scale applied to each worker drift update before accumulation. Values below `1.0` slow runaway drift growth.                            | `1.0`                   |
 | `--override-scheduling`        | `train`                             | **[If resuming]** Ignore checkpoint's schedule state and use new LR args.                                                                | `False`                 |
 | `--starting-lr`                | `train`, `finetune`                 | Max Learning Rate for the schedule, or fixed LR if schedule disabled.                                                                    | `1e-4`                  |
 | `--min-lr`                     | `train`, `finetune`                 | Minimum Learning Rate for cosine annealing schedule.                                                                                     | `1e-6`                  |
@@ -861,6 +908,12 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
   * **DirectML/ZLUDA communities** for enabling AMD GPU acceleration on Windows.
 
 ## Changelog
+
+### v0.20.1 (alpha)
+
+  * **Drift Clamp Rescue**: Adds `--drift-norm-clamp` and `--drift-delta-scale` so commit/drift-heavy runs can be resumed with bounded worker drift instead of resetting learned hierarchy weights.
+  * **Straight-Through Commitment Cap**: Commitment-cost capping now keeps the forward auxiliary value bounded while preserving corrective gradient for over-cap raw commit drift.
+  * **Recovery Recipe**: Documents a cooler checkpoint-resume recipe for `loss up + ponder up + commit up` instability, including lower model/LTM LR, tighter drift bounds, and adaptive ponder scaling.
 
 ### v0.20 (alpha)
 

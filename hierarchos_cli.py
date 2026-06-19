@@ -1502,6 +1502,8 @@ def main():
     train_group.add_argument("--recurrent-state-clamp", type=float, default=50.0, help="Forward-pass clamp for H/L recurrent states after NaN/Inf repair.")
     train_group.add_argument("--context-state-clamp", type=float, default=50.0, help="Forward-pass clamp for manager context states after NaN/Inf repair.")
     train_group.add_argument("--drift-state-clamp", type=float, default=5.0, help="Forward-pass clamp for worker drift states after NaN/Inf repair.")
+    train_group.add_argument("--drift-norm-clamp", type=float, default=0.0, help="Optional L2 norm clamp for worker drift states (0 disables). Useful for commit/drift rescue resumes.")
+    train_group.add_argument("--drift-delta-scale", type=float, default=1.0, help="Scale applied to each worker drift update before accumulation. Values below 1 tame commit/drift growth.")
     train_group.add_argument("--activation-clamp", type=float, default=100.0, help="Forward-pass clamp for internal manager/worker activations after NaN/Inf repair.")
     train_group.add_argument("--ponder-loss-weight", type=float, default=0.01)
     train_group.add_argument("--commitment-loss-weight", type=float, default=0.5)

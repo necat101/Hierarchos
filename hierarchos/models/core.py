@@ -24,6 +24,13 @@ def _config_float(config, name: str, default: float) -> float:
         return default
     return value if math.isfinite(value) and value > 0.0 else default
 
+def _config_nonnegative_float(config, name: str, default: float) -> float:
+    try:
+        value = float(getattr(config, name, default))
+    except (TypeError, ValueError):
+        return default
+    return value if math.isfinite(value) and value >= 0.0 else default
+
 def _finite_clamp(tensor: torch.Tensor, max_abs: float, *, nan: float = 0.0) -> torch.Tensor:
     if tensor is None or not torch.is_tensor(tensor) or not tensor.is_floating_point():
         return tensor
@@ -33,6 +40,18 @@ def _finite_clamp(tensor: torch.Tensor, max_abs: float, *, nan: float = 0.0) -> 
         min=-max_abs,
         max=max_abs,
     )
+
+def _l2_norm_clamp(tensor: torch.Tensor, max_norm: float) -> torch.Tensor:
+    if (
+        tensor is None
+        or not torch.is_tensor(tensor)
+        or not tensor.is_floating_point()
+        or max_norm <= 0.0
+    ):
+        return tensor
+    norm = torch.linalg.vector_norm(tensor.float(), ord=2, dim=-1, keepdim=True)
+    scale = torch.clamp(tensor.new_tensor(float(max_norm)) / (norm.to(dtype=tensor.dtype) + 1e-6), max=1.0)
+    return tensor * scale
 
 def _quiet_torch_compile_logs():
     """Keep useful compiler warnings while hiding routine autotune chatter."""
@@ -103,6 +122,8 @@ class WorkerLoop:
         self.recurrent_state_clamp = _config_float(config, 'recurrent_state_clamp', 50.0)
         self.context_state_clamp = _config_float(config, 'context_state_clamp', 50.0)
         self.drift_state_clamp = _config_float(config, 'drift_state_clamp', 5.0)
+        self.drift_norm_clamp = _config_nonnegative_float(config, 'drift_norm_clamp', 0.0)
+        self.drift_delta_scale = _config_float(config, 'drift_delta_scale', 1.0)
         self.activation_clamp = _config_float(config, 'activation_clamp', 100.0)
         static_loop = getattr(config, 'compile_static_worker_loop', False)
         self.compile_static_worker_loop = bool(static_loop) if static_loop is not None else False
@@ -118,7 +139,7 @@ class WorkerLoop:
         enc = _finite_clamp(enc, self.activation_clamp)
         static_context = _finite_clamp(static_context, self.context_state_clamp)
         l_state = _finite_clamp(l_state, self.recurrent_state_clamp)
-        current_drift = _finite_clamp(initial_drift, self.drift_state_clamp)
+        current_drift = _l2_norm_clamp(_finite_clamp(initial_drift, self.drift_state_clamp), self.drift_norm_clamp)
         drift_costs = [] 
         current_enc = enc
 
@@ -141,8 +162,8 @@ class WorkerLoop:
                 l_out = _finite_clamp(l_out, self.activation_clamp)
                 shadow_l_state = _finite_clamp(shadow_l_state, self.recurrent_state_clamp)
                 
-                drift_delta = torch.tanh(self.context_drift_proj(l_out))
-                current_drift = _finite_clamp(current_drift + drift_delta, self.drift_state_clamp)
+                drift_delta = torch.tanh(self.context_drift_proj(l_out)) * self.drift_delta_scale
+                current_drift = _l2_norm_clamp(_finite_clamp(current_drift + drift_delta, self.drift_state_clamp), self.drift_norm_clamp)
                 dynamic_context = static_context + current_drift
                 l_input_vec = torch.cat([current_enc, dynamic_context], dim=-1)
                 l_input = _finite_clamp(self.l_input_proj(l_input_vec), self.recurrent_state_clamp)
@@ -167,8 +188,8 @@ class WorkerLoop:
                     l_out = _finite_clamp(l_out, self.activation_clamp)
                     candidate_shadow = _finite_clamp(candidate_shadow, self.recurrent_state_clamp)
 
-                    drift_delta = torch.tanh(self.context_drift_proj(l_out))
-                    candidate_drift = _finite_clamp(current_drift + drift_delta, self.drift_state_clamp)
+                    drift_delta = torch.tanh(self.context_drift_proj(l_out)) * self.drift_delta_scale
+                    candidate_drift = _l2_norm_clamp(_finite_clamp(current_drift + drift_delta, self.drift_state_clamp), self.drift_norm_clamp)
                     drift_sq = torch.sum(candidate_drift ** 2, dim=-1)
                     hinge_cost = torch.relu(drift_sq - self.commitment_threshold)
                     hinge_cost = torch.clamp(hinge_cost, max=100.0)
@@ -199,8 +220,8 @@ class WorkerLoop:
                 l_out = _finite_clamp(l_out, self.activation_clamp)
                 shadow_l_state = _finite_clamp(shadow_l_state, self.recurrent_state_clamp)
                 
-                drift_delta = torch.tanh(self.context_drift_proj(l_out))
-                current_drift = _finite_clamp(current_drift + drift_delta, self.drift_state_clamp)
+                drift_delta = torch.tanh(self.context_drift_proj(l_out)) * self.drift_delta_scale
+                current_drift = _l2_norm_clamp(_finite_clamp(current_drift + drift_delta, self.drift_state_clamp), self.drift_norm_clamp)
                 drift_sq = torch.sum(current_drift ** 2, dim=-1)
                 hinge_cost = torch.relu(drift_sq - self.commitment_threshold)
                 hinge_cost = torch.clamp(hinge_cost, max=100.0)
@@ -234,7 +255,8 @@ class WorkerLoop:
         elif len(drift_costs) > 0:
             commitment_cost = torch.stack(drift_costs, dim=0).mean(dim=0)
 
-        return final_enc, next_l_state, commitment_cost, _finite_clamp(current_drift, self.drift_state_clamp)
+        final_drift = _l2_norm_clamp(_finite_clamp(current_drift, self.drift_state_clamp), self.drift_norm_clamp)
+        return final_enc, next_l_state, commitment_cost, final_drift
 
 
 class HierarchosCore(nn.Module):
@@ -472,6 +494,7 @@ class HierarchosCore(nn.Module):
         recurrent_state_clamp = _config_float(self.config, 'recurrent_state_clamp', 50.0)
         context_state_clamp = _config_float(self.config, 'context_state_clamp', 50.0)
         drift_state_clamp = _config_float(self.config, 'drift_state_clamp', 5.0)
+        drift_norm_clamp = _config_nonnegative_float(self.config, 'drift_norm_clamp', 0.0)
         activation_clamp = _config_float(self.config, 'activation_clamp', 100.0)
         halt_logit_clamp = _config_float(self.config, 'halt_logit_clamp', 30.0)
         allow_hebbian_update = kwargs.pop("allow_hebbian_update", False)
@@ -776,11 +799,11 @@ class HierarchosCore(nn.Module):
             # 4. WORKER STEP
             # ==================================================================
             if t == 0 and drift_seed is not None:
-                initial_drift = _finite_clamp(drift_seed, drift_state_clamp)
+                initial_drift = _l2_norm_clamp(_finite_clamp(drift_seed, drift_state_clamp), drift_norm_clamp)
             elif self.context_drift_proj is not None:
                 prev_worker_h = self.l_rnn.state_hidden(l_state).to(device)
                 initial_drift = torch.tanh(self.context_drift_proj(prev_worker_h))
-                initial_drift = _finite_clamp(initial_drift, drift_state_clamp)
+                initial_drift = _l2_norm_clamp(_finite_clamp(initial_drift, drift_state_clamp), drift_norm_clamp)
             else:
                 initial_drift = torch.zeros(B, self.config.context_dim, device=device)
 
@@ -798,7 +821,7 @@ class HierarchosCore(nn.Module):
                 )
             enc = _finite_clamp(enc, activation_clamp)
             l_state = _finite_clamp(l_state, recurrent_state_clamp)
-            final_drift = _finite_clamp(final_drift, drift_state_clamp)
+            final_drift = _l2_norm_clamp(_finite_clamp(final_drift, drift_state_clamp), drift_norm_clamp)
             
             final_embs.append(enc)
             commitment_costs.append(cc)
@@ -937,7 +960,7 @@ class HierarchosCore(nn.Module):
         l_state = _finite_clamp(l_state, recurrent_state_clamp)
         prev_context = _finite_clamp(prev_context, context_state_clamp)
         target_context = _finite_clamp(target_context, context_state_clamp)
-        final_drift = _finite_clamp(final_drift, drift_state_clamp)
+        final_drift = _l2_norm_clamp(_finite_clamp(final_drift, drift_state_clamp), drift_norm_clamp)
 
         return {
             "loss": loss, 

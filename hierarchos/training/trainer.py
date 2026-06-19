@@ -206,11 +206,19 @@ def _nonnegative_float(value, default: float = 0.0) -> float:
         return default
     return value if math.isfinite(value) and value >= 0.0 else default
 
-def _cap_loss_component_for_backward(value: torch.Tensor, ceiling: float) -> torch.Tensor:
+def _cap_loss_component_for_backward(
+    value: torch.Tensor,
+    ceiling: float,
+    *,
+    preserve_gradient: bool = False,
+) -> torch.Tensor:
     ceiling = _positive_float(ceiling, 0.0)
     if ceiling <= 0.0 or not torch.is_tensor(value):
         return value
-    return torch.minimum(value, value.new_tensor(ceiling))
+    capped = torch.minimum(value, value.new_tensor(ceiling))
+    if preserve_gradient:
+        return value + (capped - value).detach()
+    return capped
 
 def _clamp_tensor_finite_magnitude_(tensor: torch.Tensor, max_abs: float) -> int:
     if not torch.is_tensor(tensor) or not tensor.is_floating_point():
@@ -1283,6 +1291,7 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                     commitment_cost_for_backward = _cap_loss_component_for_backward(
                         commitment_cost,
                         getattr(args, 'max_commitment_cost_for_backward', 2.0),
+                        preserve_gradient=True,
                     )
                     aux_loss = aux_loss + (getattr(args, 'commitment_loss_weight', 0.5) * commitment_cost_for_backward)
 
@@ -2425,6 +2434,7 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                         * _cap_loss_component_for_backward(
                             commitment_cost,
                             getattr(args, 'max_commitment_cost_for_backward', 2.0),
+                            preserve_gradient=True,
                         )
                     )
 

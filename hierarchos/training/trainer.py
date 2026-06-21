@@ -241,6 +241,82 @@ def _detach_finite_clamp(tensor: torch.Tensor, max_abs: float) -> torch.Tensor:
         max=max_abs,
     )
 
+def _detach_finite_l2_clamp(tensor: torch.Tensor, max_abs: float, max_norm: float) -> torch.Tensor:
+    detached = _detach_finite_clamp(tensor, max_abs)
+    max_norm = _nonnegative_float(max_norm, 0.0)
+    if max_norm <= 0.0 or not torch.is_tensor(detached) or not detached.is_floating_point():
+        return detached
+    norm = torch.linalg.vector_norm(detached.float(), ord=2, dim=-1, keepdim=True)
+    scale = torch.clamp(detached.new_tensor(max_norm) / (norm.to(dtype=detached.dtype) + 1e-6), max=1.0)
+    return detached * scale
+
+_RUNTIME_MODEL_CONFIG_KEYS = (
+    "ltm_lr",
+    "min_ltm_lr",
+    "disable_ltm_lr_schedule",
+    "ltm_score_grad_scale",
+    "halt_logit_clamp",
+    "recurrent_state_clamp",
+    "context_state_clamp",
+    "drift_state_clamp",
+    "drift_norm_clamp",
+    "drift_delta_scale",
+    "activation_clamp",
+    "commitment_loss_weight",
+    "max_commitment_cost_for_backward",
+    "commitment_threshold",
+    "l_conv_atol",
+    "detach_every_n_steps",
+    "h_halt_thresh",
+    "gradient_checkpointing",
+    "debug_numerics",
+    "isolate_batch_ltm",
+    "memory_gate_warmup_steps",
+    "memory_gate_warmup_floor",
+    "cuda_chunked_lm_loss",
+    "cuda_loss_chunk_rows",
+    "cpu_chunked_lm_loss",
+    "cpu_loss_chunk_rows",
+)
+
+def _apply_runtime_model_config_overrides(model_config, args):
+    for key in _RUNTIME_MODEL_CONFIG_KEYS:
+        if hasattr(args, key):
+            model_config[key] = getattr(args, key)
+    if hasattr(args, "compile_static_worker_loop") and getattr(args, "compile_static_worker_loop") is not None:
+        model_config.compile_static_worker_loop = getattr(args, "compile_static_worker_loop")
+    return model_config
+
+def _print_runtime_stability_config(model):
+    config = getattr(model, "config", None)
+    if config is None:
+        return
+    threshold = _nonnegative_float(getattr(config, "commitment_threshold", 0.05), 0.05)
+    norm_clamp = _nonnegative_float(getattr(config, "drift_norm_clamp", 0.0), 0.0)
+    print(
+        "INFO: Runtime stability config: "
+        f"drift_state_clamp={getattr(config, 'drift_state_clamp', 5.0)}, "
+        f"drift_norm_clamp={norm_clamp:g}, "
+        f"drift_delta_scale={getattr(config, 'drift_delta_scale', 1.0)}, "
+        f"commitment_threshold={threshold:g}, "
+        f"max_commitment_cost_for_backward={getattr(config, 'max_commitment_cost_for_backward', 'trainer-only')}"
+    )
+    if norm_clamp > 0.0:
+        max_commit = max(0.0, norm_clamp * norm_clamp - threshold)
+        print(f"INFO: Drift norm clamp invariant: raw/displayed commit should stay <= {max_commit:.4g}.")
+
+def _clamp_running_states_for_resume(running_states, args):
+    if not running_states or len(running_states) < 5:
+        return running_states
+    states = list(running_states)
+    if torch.is_tensor(states[4]):
+        states[4] = _detach_finite_l2_clamp(
+            states[4],
+            getattr(args, "drift_state_clamp", 5.0),
+            getattr(args, "drift_norm_clamp", 0.0),
+        )
+    return tuple(states)
+
 def _sanitize_optimizer_state_(optimizer) -> int:
     if optimizer is None:
         return 0
@@ -1405,6 +1481,7 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
             recurrent_state_clamp = getattr(args, 'recurrent_state_clamp', 50.0)
             context_state_clamp = getattr(args, 'context_state_clamp', 50.0)
             drift_state_clamp = getattr(args, 'drift_state_clamp', 5.0)
+            drift_norm_clamp = getattr(args, 'drift_norm_clamp', 0.0)
             if outputs.get('h_state') is not None:
                 h_state = _detach_finite_clamp(outputs['h_state'], recurrent_state_clamp)
             if outputs.get('l_state') is not None:
@@ -1414,7 +1491,7 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
             if outputs.get('target_context') is not None:
                 target_ctx = _detach_finite_clamp(outputs['target_context'], context_state_clamp)
             if outputs.get('drift_state') is not None:
-                drift_state = _detach_finite_clamp(outputs['drift_state'], drift_state_clamp)
+                drift_state = _detach_finite_l2_clamp(outputs['drift_state'], drift_state_clamp, drift_norm_clamp)
             
             # Accumulate for display
             total_loss = total_loss + ce_loss.detach().float() * label_ratio
@@ -1490,6 +1567,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     if getattr(args, 'out_dir', None):
         os.makedirs(args.out_dir, exist_ok=True)
     config = AttrDict(vars(args))
+    _apply_runtime_model_config_overrides(config, args)
 
     prompt_completion_mode = (
         getattr(args, 'alpaca', False)
@@ -1696,9 +1774,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         # Runtime overrides
         model_config.compile = args.compile
         model_config.max_length = args.max_length or model_config.get('max_length', 1024)
-        model_config.ltm_lr = getattr(args, 'ltm_lr', model_config.get('ltm_lr', 1e-3))
-        model_config.min_ltm_lr = getattr(args, 'min_ltm_lr', model_config.get('min_ltm_lr', None))
-        model_config.disable_ltm_lr_schedule = getattr(args, 'disable_ltm_lr_schedule', False)
+        _apply_runtime_model_config_overrides(model_config, args)
 
         print(f"INFO: Final Adjusted ARCH: context_dim={model_config.context_dim}, persistent={model_config.get('persistent_dim', 128)}, ltm_val={model_config.get('ltm_val_dim', 128)}, h_hidden={model_config.h_hidden}, l_hidden={model_config.l_hidden}, vocab_size={model_config.vocab_size}")
         
@@ -1789,6 +1865,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                 runtime_config[key] = loaded_config[key]
         model_config = runtime_config
         model_config.compile = args.compile
+        _apply_runtime_model_config_overrides(model_config, args)
         model.config = model_config
         
         optimizer = build_hierarchos_optimizer(model, args, device)
@@ -1814,8 +1891,12 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         model.ltm.cpu_gather_retrieval = bool(getattr(args, 'ltm_cpu_gather_retrieval', True))
         model.ltm.cpu_sparse_update = bool(getattr(args, 'ltm_cpu_sparse_update', True))
     if hasattr(model, 'config'):
+        _apply_runtime_model_config_overrides(model.config, args)
         model.config.cpu_chunked_lm_loss = bool(getattr(args, 'cpu_chunked_lm_loss', True))
         model.config.cpu_loss_chunk_rows = int(getattr(args, 'cpu_loss_chunk_rows', 0) or 0)
+        if hasattr(model, "refresh_runtime_config"):
+            model.refresh_runtime_config()
+        _print_runtime_stability_config(model)
     # ----------------------------------------------------
 
     # --- Print Model Stats ---
@@ -1921,7 +2002,10 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         
         # Restore recurrent/LTM states only for true mid-epoch checkpoints.
         if epoch == start_epoch and start_step > 0 and checkpoint and 'running_states' in checkpoint:
-            running_states = _state_to_device(checkpoint['running_states'], device)
+            running_states = _state_to_device(
+                _clamp_running_states_for_resume(checkpoint['running_states'], args),
+                device,
+            )
             print(f"INFO: Restored RNN/LTM running states from checkpoint on {device}.")
         else:
             running_states = (None, None, None, None, None, None)

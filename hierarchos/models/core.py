@@ -116,6 +116,10 @@ class WorkerLoop:
         self.l_input_proj = l_input_proj
         self.context_drift_proj = context_drift_proj
         self.l_to_out = l_to_out
+        self.refresh_runtime_config()
+
+    def refresh_runtime_config(self):
+        config = self.config
         self.max_l_steps = config.max_l_steps
         self.l_conv_atol = getattr(config, 'l_conv_atol', 0.01)
         self.commitment_threshold = getattr(config, 'commitment_threshold', 0.1)
@@ -267,6 +271,11 @@ class HierarchosCore(nn.Module):
     def reset_memory(self):
         """Resets the short-term 'fast' associative memory."""
         self.ltm.reset_working_memory()
+
+    def refresh_runtime_config(self):
+        if hasattr(self, "worker_loop_module"):
+            self.worker_loop_module.config = self.config
+            self.worker_loop_module.refresh_runtime_config()
 
     def set_training_step(self, step: int):
         if hasattr(self, "memory_gate_warmup_step"):

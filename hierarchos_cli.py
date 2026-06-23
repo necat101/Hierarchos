@@ -1494,6 +1494,7 @@ def main():
     train_group.add_argument("--lora_r", type=int, default=8)
     train_group.add_argument("--lora_alpha", type=int, default=16)
     train_group.add_argument("--grad-clip", type=float, default=1.0)
+    train_group.add_argument("--max-sanitized-gradient-values", type=int, default=0, help="Deprecated compatibility no-op. Optimizer steps now always reject NaN/Inf gradients; finite gradients are still clipped with --grad-clip.")
     train_group.add_argument("--startup-weight-max-abs", type=float, default=100.0, help="One-time startup clamp for finite model weights/buffers after checkpoint repair (0 disables).")
     train_group.add_argument("--max-ce-loss-for-backward", type=float, default=0.0, help="Clamp finite CE loss used for backward (0 disables; recommended for from-scratch training).")
     train_group.add_argument("--max-commitment-cost-for-backward", type=float, default=2.0, help="Clamp finite commitment cost used for backward to prevent auxiliary loss explosions (0 disables).")
@@ -1573,6 +1574,7 @@ def main():
     train_group.add_argument("--dataset-size", type=int, default=None, help="Force a specific dataset size (total samples) to calculate steps for the LR scheduler.")
     train_group.set_defaults(hf_token_cache=True)
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile (auto-enabled on CUDA).")
+    parser.add_argument("--no-compile", "--no_compile", dest="compile", action="store_false", help="Explicitly disable torch.compile, including CUDA auto-enable. Useful for stability diagnostics/rescue resumes.")
     parser.add_argument("--force-compile", action="store_true")
     parser.add_argument(
         "--compile-mode",

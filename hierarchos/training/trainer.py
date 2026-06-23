@@ -411,6 +411,29 @@ def _find_first_nonfinite_gradient_tensor(model):
             return _describe_tensor_issue(f"gradient {name}", param.grad)
     return None
 
+def _summarize_nonfinite_gradient_tensors(model, limit: int = 8):
+    rows = []
+    for name, param in model.named_parameters():
+        grad = param.grad
+        if grad is None or not torch.is_tensor(grad) or not grad.is_floating_point():
+            continue
+        detached = grad.detach()
+        nan_count = int(torch.isnan(detached).sum().item())
+        inf_count = int(torch.isinf(detached).sum().item())
+        total = nan_count + inf_count
+        if total > 0:
+            rows.append((total, nan_count, inf_count, name, tuple(detached.shape)))
+    if not rows:
+        return None
+    rows.sort(key=lambda item: item[0], reverse=True)
+    parts = []
+    for total, nan_count, inf_count, name, shape in rows[:max(1, int(limit or 1))]:
+        parts.append(
+            f"{name} shape={shape} nonfinite={total} "
+            f"(NaN={nan_count}, Inf={inf_count})"
+        )
+    return "; ".join(parts)
+
 def _manual_clip_grad_norm_(params, max_norm: float):
     norms = []
     for param in params:
@@ -456,18 +479,25 @@ def save_training_checkpoint_if_finite(checkpoint_dict, path: str, model, optimi
     save_checkpoint_safely(checkpoint_dict, path)
     return True
 
-def _clip_gradients_and_check(model, max_norm: float):
+def _clip_gradients_and_check(model, max_norm: float, max_sanitized_values: int = 0):
     params = [p for p in model.parameters() if p.requires_grad and p.grad is not None]
     if not params:
         return True, None
     max_norm = float(max_norm or 0.0)
-    _sanitize_gradient_nonfinite_(model, max_abs=max_norm)
-    total_norm = _manual_clip_grad_norm_(params, max_norm)
-    if torch.is_tensor(total_norm) and not bool(torch.isfinite(total_norm).all().item()):
-        _sanitize_gradient_nonfinite_(model, max_abs=max_norm)
-        total_norm = _manual_clip_grad_norm_(params, max_norm)
     issue = _find_first_nonfinite_gradient_tensor(model)
     if issue:
+        summary = _summarize_nonfinite_gradient_tensors(model)
+        if summary:
+            return False, f"{issue}. Top non-finite gradient tensors: {summary}"
+        return False, issue
+    total_norm = _manual_clip_grad_norm_(params, max_norm)
+    if torch.is_tensor(total_norm) and not bool(torch.isfinite(total_norm).all().item()):
+        return False, "gradient norm became non-finite during finite-gradient clipping"
+    issue = _find_first_nonfinite_gradient_tensor(model)
+    if issue:
+        summary = _summarize_nonfinite_gradient_tensors(model)
+        if summary:
+            return False, f"{issue}. Top non-finite gradient tensors: {summary}"
         return False, issue
     return True, total_norm
 
@@ -1510,7 +1540,11 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
         if should_step_optimizer and _has_pending_gradients(model):
             if scaler is not None:
                 scaler.unscale_(optimizer)
-                grads_ok, grad_issue = _clip_gradients_and_check(model, getattr(args, 'grad_clip', 1.0))
+                grads_ok, grad_issue = _clip_gradients_and_check(
+                    model,
+                    getattr(args, 'grad_clip', 1.0),
+                    getattr(args, 'max_sanitized_gradient_values', 0),
+                )
                 if not grads_ok:
                     print(f"\nCRITICAL: Non-finite gradient at step {step+1}. {grad_issue}")
                     print("  Skipping optimizer step and clearing accumulated gradients.")
@@ -1519,7 +1553,11 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                grads_ok, grad_issue = _clip_gradients_and_check(model, getattr(args, 'grad_clip', 1.0))
+                grads_ok, grad_issue = _clip_gradients_and_check(
+                    model,
+                    getattr(args, 'grad_clip', 1.0),
+                    getattr(args, 'max_sanitized_gradient_values', 0),
+                )
                 if not grads_ok:
                     print(f"\nCRITICAL: Non-finite gradient at step {step+1}. {grad_issue}")
                     print("  Skipping optimizer step and clearing accumulated gradients.")
@@ -1617,7 +1655,13 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         config.compile = False
         config.amp = False
 
-    if getattr(args, 'force_compile', False): 
+    _compile_was_explicitly_disabled = any(a in sys.argv for a in ('--no-compile', '--no_compile'))
+    if getattr(args, 'force_compile', False) and _compile_was_explicitly_disabled:
+        args.force_compile = False
+        args.compile = False
+        config.compile = False
+        print("WARNING: Both --force-compile and --no-compile were set; using --no-compile.")
+    elif getattr(args, 'force_compile', False):
         args.compile = True
         config.compile = True
 
@@ -1648,8 +1692,12 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
             config.amp = True
             print("INFO: AMP auto-enabled for CUDA training (use --no-amp to disable).")
 
-        # Auto-enable torch.compile on CUDA (no Windows CPU hang issue)
-        if not getattr(args, 'compile', False) and not getattr(args, 'force_compile', False):
+        # Auto-enable torch.compile on CUDA unless the user explicitly disables it.
+        if _compile_was_explicitly_disabled:
+            args.compile = False
+            config.compile = False
+            print("INFO: torch.compile explicitly disabled.")
+        elif not getattr(args, 'compile', False) and not getattr(args, 'force_compile', False):
             args.compile = True
             config.compile = True
             print("INFO: torch.compile auto-enabled for CUDA training.")
@@ -1935,6 +1983,11 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         print(f"INFO: --override-scheduling: Calculating LR schedule for remaining work ({num_update_steps} update steps)")
     else:
         num_update_steps = compute_update_steps(dataloader_len, args.accumulation_steps) * args.epochs
+        if args.resume_from_ckpt and not getattr(args, 'override_scheduling', False):
+            print(
+                "INFO: Resume scheduler using checkpoint/full-run schedule state. "
+                "Pass --override-scheduling to rebuild LR decay over only the remaining work."
+            )
     
     if not getattr(args, 'disable_lr_schedule', False) and num_update_steps > 0:
         scheduler = build_lr_scheduler(optimizer, args, num_update_steps)
@@ -2601,7 +2654,11 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                     # Optimizer step
                     if use_amp and scaler:
                         scaler.unscale_(optimizer)
-                        grads_ok, grad_issue = _clip_gradients_and_check(model, grad_clip)
+                        grads_ok, grad_issue = _clip_gradients_and_check(
+                            model,
+                            grad_clip,
+                            getattr(args, 'max_sanitized_gradient_values', 0),
+                        )
                         if not grads_ok:
                             print(f"\nCRITICAL: Non-finite fine-tune gradient at step {i+1}. {grad_issue}")
                             print("  Skipping optimizer step and clearing accumulated gradients.")
@@ -2611,7 +2668,11 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                         scaler.step(optimizer)
                         scaler.update()
                     else:
-                        grads_ok, grad_issue = _clip_gradients_and_check(model, grad_clip)
+                        grads_ok, grad_issue = _clip_gradients_and_check(
+                            model,
+                            grad_clip,
+                            getattr(args, 'max_sanitized_gradient_values', 0),
+                        )
                         if not grads_ok:
                             print(f"\nCRITICAL: Non-finite fine-tune gradient at step {i+1}. {grad_issue}")
                             print("  Skipping optimizer step and clearing accumulated gradients.")

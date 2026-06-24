@@ -445,6 +445,28 @@ def _manual_clip_grad_norm_(params, max_norm: float):
         total_norm = torch.stack(norms).norm(2)
     else:
         total_norm = torch.zeros(())
+    if torch.is_tensor(total_norm) and not bool(torch.isfinite(total_norm).all().item()):
+        # Fast fp32 norm can overflow when gradients are finite but huge. Fall back
+        # to a max-scaled norm so finite gradients still get clipped instead of
+        # being treated like NaN/Inf gradients.
+        max_abs = None
+        for param in params:
+            grad = param.grad.detach()
+            if grad.is_sparse:
+                grad = grad.coalesce()._values()
+            local_max = grad.float().abs().max()
+            max_abs = local_max if max_abs is None else torch.maximum(max_abs.to(local_max.device), local_max)
+        if max_abs is not None and bool(torch.isfinite(max_abs).all().item()) and float(max_abs.item()) > 0.0:
+            sum_sq = None
+            for param in params:
+                grad = param.grad.detach()
+                if grad.is_sparse:
+                    grad = grad.coalesce()._values()
+                scaled = grad.float() / max_abs.to(grad.device)
+                local_sq = scaled.pow(2).sum(dtype=torch.float64)
+                sum_sq = local_sq if sum_sq is None else sum_sq + local_sq.to(sum_sq.device)
+            if sum_sq is not None:
+                total_norm = max_abs.to(dtype=torch.float64) * torch.sqrt(sum_sq.to(max_abs.device))
     if max_norm > 0.0:
         if not bool(torch.isfinite(total_norm).all().item()):
             for param in params:

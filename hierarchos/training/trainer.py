@@ -842,6 +842,22 @@ def capture_ltm_lr_scheduler_state(args):
         "min_lr": float(getattr(args, '_ltm_lr_min', getattr(args, 'min_ltm_lr', 0.0) or 0.0)),
     }
 
+def capture_main_lr_scheduler_state(args, scheduler=None, num_update_steps: int = None):
+    if getattr(args, 'disable_lr_schedule', False):
+        return {"enabled": False}
+    total_steps = int(num_update_steps or getattr(args, '_main_lr_schedule_total_steps', 0) or 0)
+    step = int(getattr(scheduler, 'last_epoch', 0) or 0) if scheduler is not None else 0
+    return {
+        "enabled": scheduler is not None,
+        "step": max(0, step),
+        "total_steps": max(1, total_steps),
+        "max_lr": float(getattr(args, 'starting_lr', 1e-4)),
+        "min_lr": float(getattr(args, 'min_lr', 0.0)),
+        "warmup_steps": int(getattr(args, 'warmup_steps', 0) or 0),
+        "warmup_ratio": float(getattr(args, 'warmup_ratio', 0.0) or 0.0),
+        "override_scheduling": bool(getattr(args, 'override_scheduling', False)),
+    }
+
 def build_hierarchos_optimizer(model, args, device):
     """RWKV-style AdamW grouping: decay matrices/embeddings, never norms or scalars."""
     lr = args.starting_lr
@@ -1159,6 +1175,7 @@ def build_training_checkpoint(
         "model_state_dict": sanitize_model_state_dict(model, reset_transient_ltm=False),
         "optimizer_state_dict": optimizer.state_dict() if optimizer else None,
         "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
+        "lr_scheduler_state": capture_main_lr_scheduler_state(args, scheduler),
         "scaler_state_dict": scaler.state_dict() if scaler else None,
         "config": dict(model.config),
         "rng_state": capture_rng_state(),
@@ -1994,6 +2011,9 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     # Scheduler
     # When override_scheduling is used during resume, calculate T_max based on REMAINING epochs
     # so that the LR decays properly to min_lr by the final epoch.
+    full_run_update_steps = compute_update_steps(dataloader_len, args.accumulation_steps) * args.epochs
+    saved_main_lr_state = checkpoint.get('lr_scheduler_state') if isinstance(checkpoint, dict) else None
+    saved_ltm_lr_state = checkpoint.get('ltm_scheduler_state') if isinstance(checkpoint, dict) else None
     if getattr(args, 'override_scheduling', False) and args.resume_from_ckpt:
         num_update_steps = compute_remaining_update_steps(
             dataloader_len,
@@ -2003,13 +2023,33 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
             start_step,
         )
         print(f"INFO: --override-scheduling: Calculating LR schedule for remaining work ({num_update_steps} update steps)")
+    elif (
+        args.resume_from_ckpt
+        and isinstance(saved_main_lr_state, dict)
+        and saved_main_lr_state.get("enabled", True)
+        and int(saved_main_lr_state.get("total_steps", 0) or 0) > 0
+    ):
+        num_update_steps = max(1, int(saved_main_lr_state.get("total_steps", 1) or 1))
+        print(f"INFO: Continuing saved main LR schedule ({num_update_steps} total updates).")
+    elif (
+        args.resume_from_ckpt
+        and isinstance(saved_ltm_lr_state, dict)
+        and int(saved_ltm_lr_state.get("total_steps", 0) or 0) > 0
+        and int(saved_ltm_lr_state.get("total_steps", 0) or 0) != full_run_update_steps
+    ):
+        num_update_steps = max(1, int(saved_ltm_lr_state.get("total_steps", 1) or 1))
+        print(
+            "INFO: Main LR scheduler metadata missing; using saved LTM remaining-work "
+            f"schedule length as fallback ({num_update_steps} total updates)."
+        )
     else:
-        num_update_steps = compute_update_steps(dataloader_len, args.accumulation_steps) * args.epochs
+        num_update_steps = full_run_update_steps
         if args.resume_from_ckpt and not getattr(args, 'override_scheduling', False):
             print(
                 "INFO: Resume scheduler using checkpoint/full-run schedule state. "
                 "Pass --override-scheduling to rebuild LR decay over only the remaining work."
             )
+    args._main_lr_schedule_total_steps = int(num_update_steps)
     
     if not getattr(args, 'disable_lr_schedule', False) and num_update_steps > 0:
         scheduler = build_lr_scheduler(optimizer, args, num_update_steps)
@@ -2462,7 +2502,20 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
     # Scheduler setup
     scheduler = None
     accumulation_steps = getattr(args, 'accumulation_steps', 1)
-    num_update_steps = compute_update_steps(dataloader_len, accumulation_steps) * args.epochs if dataloader_len > 0 else 0
+    full_run_update_steps = compute_update_steps(dataloader_len, accumulation_steps) * args.epochs if dataloader_len > 0 else 0
+    saved_main_lr_state = checkpoint.get('lr_scheduler_state') if isinstance(checkpoint, dict) else None
+    if (
+        checkpoint
+        and not getattr(args, 'override_scheduling', False)
+        and isinstance(saved_main_lr_state, dict)
+        and saved_main_lr_state.get("enabled", True)
+        and int(saved_main_lr_state.get("total_steps", 0) or 0) > 0
+    ):
+        num_update_steps = max(1, int(saved_main_lr_state.get("total_steps", 1) or 1))
+        print(f"INFO: Continuing saved main LR schedule ({num_update_steps} total updates).")
+    else:
+        num_update_steps = full_run_update_steps
+    args._main_lr_schedule_total_steps = int(num_update_steps)
     if not getattr(args, 'disable_lr_schedule', False):
         if num_update_steps > 0:
             scheduler = build_lr_scheduler(optimizer, args, num_update_steps)
@@ -2721,6 +2774,7 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                             'model_state_dict': sanitize_model_state_dict(model),
                             'optimizer_state_dict': optimizer.state_dict(),
                             'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                            'lr_scheduler_state': capture_main_lr_scheduler_state(args, scheduler),
                             'scaler_state_dict': scaler.state_dict() if scaler else None,
                             'ltm_scheduler_state': capture_ltm_lr_scheduler_state(args),
                             'config': dict(model.config),

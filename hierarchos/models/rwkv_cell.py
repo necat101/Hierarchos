@@ -63,7 +63,14 @@ class RWKVCell(nn.Module):
       slots 3: per-head matrix state reshaped as [B, C, head_size]
     """
 
-    def __init__(self, n_embd, head_size=None, layer_id: int = 0, n_layer: int = 2):
+    def __init__(
+        self,
+        n_embd,
+        head_size=None,
+        layer_id: int = 0,
+        n_layer: int = 2,
+        channel_mix_key_clamp: float = 12.0,
+    ):
         super().__init__()
         self.n_embd = int(n_embd)
         self.head_size = _choose_head_size(self.n_embd, head_size)
@@ -74,6 +81,10 @@ class RWKVCell(nn.Module):
         self.state_clamp = 50.0
         self.allow_legacy_state_migration = True
         self._compiled_impl = None
+        try:
+            self.channel_mix_key_clamp = float(channel_mix_key_clamp or 0.0)
+        except (TypeError, ValueError):
+            self.channel_mix_key_clamp = 12.0
 
         C = self.n_embd
         H = self.n_head
@@ -301,7 +312,14 @@ class RWKVCell(nn.Module):
         x_resid_cm = x
         x_norm2 = self.ln2(x)
         xk_cm = self._mix(x_norm2, prev_cm, self.x_k_cm)
-        ffn = torch.square(torch.relu(self.key_cm(xk_cm)))
+        cm_key = self.key_cm(xk_cm)
+        if self.channel_mix_key_clamp > 0.0:
+            cm_key = torch.clamp(
+                cm_key,
+                min=-self.channel_mix_key_clamp,
+                max=self.channel_mix_key_clamp,
+            )
+        ffn = torch.square(torch.relu(cm_key))
         if deepemb_vec is not None:
             ffn = ffn * deepemb_vec.to(dtype=ffn.dtype, device=ffn.device)
         x = x_resid_cm + self.value_cm(ffn)

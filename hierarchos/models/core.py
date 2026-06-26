@@ -19,14 +19,22 @@ from ..utils.rosa import ROSA, rosa_async_pipeline, ROSAState
 
 def _config_float(config, name: str, default: float) -> float:
     try:
-        value = float(getattr(config, name, default))
+        if isinstance(config, dict):
+            raw_value = config.get(name, default)
+        else:
+            raw_value = getattr(config, name, default)
+        value = float(raw_value)
     except (TypeError, ValueError):
         return default
     return value if math.isfinite(value) and value > 0.0 else default
 
 def _config_nonnegative_float(config, name: str, default: float) -> float:
     try:
-        value = float(getattr(config, name, default))
+        if isinstance(config, dict):
+            raw_value = config.get(name, default)
+        else:
+            raw_value = getattr(config, name, default)
+        value = float(raw_value)
     except (TypeError, ValueError):
         return default
     return value if math.isfinite(value) and value >= 0.0 else default
@@ -273,6 +281,15 @@ class HierarchosCore(nn.Module):
         self.ltm.reset_working_memory()
 
     def refresh_runtime_config(self):
+        rwkv_channel_mix_key_clamp = _config_nonnegative_float(
+            self.config,
+            'rwkv_channel_mix_key_clamp',
+            12.0,
+        )
+        for cell_name in ("h_rnn", "l_rnn"):
+            cell = getattr(self, cell_name, None)
+            if cell is not None and hasattr(cell, "channel_mix_key_clamp"):
+                cell.channel_mix_key_clamp = rwkv_channel_mix_key_clamp
         if hasattr(self, "worker_loop_module"):
             self.worker_loop_module.config = self.config
             self.worker_loop_module.refresh_runtime_config()
@@ -365,11 +382,18 @@ class HierarchosCore(nn.Module):
         nn.init.normal_(self.l_feedback_proj.weight, mean=0.0, std=0.01)
 
         rwkv_head_size = getattr(config, 'rwkv_head_size', None)
+        rwkv_channel_mix_key_clamp = _config_nonnegative_float(
+            config,
+            'rwkv_channel_mix_key_clamp',
+            12.0,
+        )
+        self.config.rwkv_channel_mix_key_clamp = rwkv_channel_mix_key_clamp
         self.h_rnn = RWKVCell(
             config.h_hidden,
             head_size=rwkv_head_size,
             layer_id=0,
             n_layer=getattr(config, 'rwkv_n_layer_hint', 2),
+            channel_mix_key_clamp=rwkv_channel_mix_key_clamp,
         )
         self.h_to_context = nn.Linear(config.h_hidden, config.context_dim)
         self.h_halt_proj = nn.Linear(config.h_hidden, 1)
@@ -387,6 +411,7 @@ class HierarchosCore(nn.Module):
             head_size=rwkv_head_size,
             layer_id=0,
             n_layer=getattr(config, 'rwkv_n_layer_hint', 2),
+            channel_mix_key_clamp=rwkv_channel_mix_key_clamp,
         )
         
         # Configure truncated BPTT for RWKV cells

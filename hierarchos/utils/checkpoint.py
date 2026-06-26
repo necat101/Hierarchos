@@ -142,6 +142,9 @@ def _infer_arch_flags_from_state_dict(config_dict: Dict[str, Any], state_dict: D
         if torch.is_tensor(head_shape) and head_shape.ndim == 2:
             config_dict["rwkv_head_size"] = int(head_shape.shape[1])
 
+    if "rwkv_channel_mix_key_clamp" not in config_dict:
+        config_dict["rwkv_channel_mix_key_clamp"] = 12.0
+
 
 def load_full_model_with_config(model_path: str, device):
     """Loads a full-precision model from a directory or direct .pt file."""

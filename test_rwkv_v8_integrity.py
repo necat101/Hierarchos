@@ -165,12 +165,37 @@ class RWKVV8IntegrityTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(new_state).all())
         self.assertLess(float(y.abs().max().item()), 1000.0)
 
+    def test_rwkv_deepembed_clamp_keeps_channel_mix_input_finite(self):
+        torch.manual_seed(31)
+        cell = RWKVCell(
+            4,
+            head_size=2,
+            channel_mix_key_clamp=2.0,
+            channel_mix_deepembed_clamp=3.0,
+        )
+        cell.eval()
+
+        with torch.no_grad():
+            cell.key_cm.weight.zero_()
+            cell.key_cm.weight[:, 0] = 1e20
+            cell.value_cm.weight.fill_(1.0)
+
+            x = torch.tensor([[2.0, -1.0, 0.5, -3.0]])
+            state = cell.initial_state(1)
+            deepemb = torch.full((1, 16), 1e20)
+            y, new_state = cell(x, state, deepemb_vec=deepemb)
+
+        self.assertTrue(torch.isfinite(y).all())
+        self.assertTrue(torch.isfinite(new_state).all())
+        self.assertLess(float(y.abs().max().item()), 1000.0)
+
     def test_legacy_checkpoint_backfills_channel_mix_key_clamp(self):
         torch.manual_seed(29)
         cfg = _tiny_config()
         model = HierarchosCore(cfg)
         legacy_cfg = dict(cfg)
         legacy_cfg.pop("rwkv_channel_mix_key_clamp", None)
+        legacy_cfg.pop("rwkv_channel_mix_deepembed_clamp", None)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             torch.save(
@@ -184,13 +209,19 @@ class RWKVV8IntegrityTests(unittest.TestCase):
             loaded, loaded_cfg = load_full_model_with_config(tmpdir, "cpu")
 
         self.assertEqual(loaded_cfg.rwkv_channel_mix_key_clamp, 12.0)
+        self.assertEqual(loaded_cfg.rwkv_channel_mix_deepembed_clamp, 4.0)
         self.assertEqual(loaded.h_rnn.channel_mix_key_clamp, 12.0)
         self.assertEqual(loaded.l_rnn.channel_mix_key_clamp, 12.0)
+        self.assertEqual(loaded.h_rnn.channel_mix_deepembed_clamp, 4.0)
+        self.assertEqual(loaded.l_rnn.channel_mix_deepembed_clamp, 4.0)
 
         loaded.config.rwkv_channel_mix_key_clamp = 5.0
+        loaded.config.rwkv_channel_mix_deepembed_clamp = 2.0
         loaded.refresh_runtime_config()
         self.assertEqual(loaded.h_rnn.channel_mix_key_clamp, 5.0)
         self.assertEqual(loaded.l_rnn.channel_mix_key_clamp, 5.0)
+        self.assertEqual(loaded.h_rnn.channel_mix_deepembed_clamp, 2.0)
+        self.assertEqual(loaded.l_rnn.channel_mix_deepembed_clamp, 2.0)
 
     def test_model_compile_hot_path_smoke_with_eager_backend(self):
         if not hasattr(torch, "compile"):

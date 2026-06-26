@@ -22,6 +22,8 @@ class ArchitectureConfigFlagTests(unittest.TestCase):
         self.assertTrue(config["use_rosa"])
         self.assertEqual(config["rosa_max_context"], 512)
         self.assertEqual(config["rwkv_head_size"], 64)
+        self.assertEqual(config["rwkv_channel_mix_key_clamp"], 12.0)
+        self.assertEqual(config["rwkv_channel_mix_deepembed_clamp"], 4.0)
 
     def test_infers_disabled_when_legacy_state_dict_has_no_optional_modules(self):
         config = {}
@@ -45,7 +47,13 @@ class ArchitectureConfigFlagTests(unittest.TestCase):
             _reject_unsupported_rwkv_state_dict(state, "legacy.pt")
 
     def test_does_not_override_explicit_config(self):
-        config = {"use_deepembed": False, "use_rosa": True, "rosa_max_context": 128}
+        config = {
+            "use_deepembed": False,
+            "use_rosa": True,
+            "rosa_max_context": 128,
+            "rwkv_channel_mix_key_clamp": 8.0,
+            "rwkv_channel_mix_deepembed_clamp": 2.0,
+        }
         state = {
             "h_deepemb.weight": torch.empty(2, 4),
             "rosa_emb.weight": torch.empty(3, 2),
@@ -56,6 +64,8 @@ class ArchitectureConfigFlagTests(unittest.TestCase):
         self.assertFalse(config["use_deepembed"])
         self.assertTrue(config["use_rosa"])
         self.assertEqual(config["rosa_max_context"], 128)
+        self.assertEqual(config["rwkv_channel_mix_key_clamp"], 8.0)
+        self.assertEqual(config["rwkv_channel_mix_deepembed_clamp"], 2.0)
 
 
 if __name__ == "__main__":

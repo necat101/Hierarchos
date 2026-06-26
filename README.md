@@ -1,14 +1,20 @@
 -----
 
-# Hierarchos v0.20.2 (alpha): Channel-Mix Stability Clamp
+# Hierarchos v0.20.3 (alpha): DeepEmbed Channel-Mix Clamp
 
-**v0.20.2 focus**: long assistant SFT and rescue runs now have an explicit RWKV channel-mix preactivation clamp. `--rwkv-channel-mix-key-clamp` caps the `key_cm` activation before the ReLU-squared channel-mix FFN, preventing rare large activations from becoming backward-pass NaNs while preserving normal channel-mix behavior.
+**v0.20.3 focus**: long assistant SFT and rescue runs now also clamp DeepEmbed's multiplicative RWKV channel-mix modulation. `--rwkv-channel-mix-deepembed-clamp` caps the token-specific DeepEmbed multiplier before `value_cm`, preventing rare learned modulation spikes from re-amplifying the already-clamped ReLU-squared channel-mix FFN.
+
+**hierarchos/models/rwkv_cell.py**: after the v0.20.2 `key_cm` clamp, DeepEmbed modulation is clamped before it can amplify the channel-mix FFN input to `value_cm`. Defaults are `12.0` for `key_cm` and `4.0` for DeepEmbed, so ordinary LayerNorm-fed activations pass through while pathological spikes are bounded.
+
+**hierarchos/models/core.py** and **hierarchos/utils/checkpoint.py**: old checkpoints are backfilled with `rwkv_channel_mix_key_clamp=12.0` and `rwkv_channel_mix_deepembed_clamp=4.0`, and runtime refresh updates existing H/L RWKV cells during resume. This is shape-compatible and does not add or remove learned tensors.
+
+**hierarchos_cli.py** and **hierarchos/training/trainer.py**: the new channel-mix clamp flags are recorded in run configs, printed in stability logs, and remain explicit runtime safety overrides.
+
+## Previous v0.20.2 Notes: Channel-Mix Key Clamp
+
+**v0.20.2 focus**: long assistant SFT and rescue runs gained an explicit RWKV channel-mix preactivation clamp. `--rwkv-channel-mix-key-clamp` caps the `key_cm` activation before the ReLU-squared channel-mix FFN, preventing rare large activations from becoming backward-pass NaNs while preserving normal channel-mix behavior.
 
 **hierarchos/models/rwkv_cell.py**: `key_cm` output is clamped before `relu().square()`. The default clamp is `12.0`, so ordinary LayerNorm-fed activations pass through while pathological spikes are bounded.
-
-**hierarchos/models/core.py** and **hierarchos/utils/checkpoint.py**: old checkpoints are backfilled with `rwkv_channel_mix_key_clamp=12.0`, and runtime refresh updates existing H/L RWKV cells during resume. This is shape-compatible and does not add or remove learned tensors.
-
-**hierarchos_cli.py** and **hierarchos/training/trainer.py**: the new `--rwkv-channel-mix-key-clamp` flag is recorded in run configs, printed in stability logs, and remains an explicit runtime safety override.
 
 ## Previous v0.20.1 Notes: Drift Clamp Rescue
 
@@ -50,13 +56,20 @@ A novel AI architecture that synergistically integrates Google's Titans memory s
 
 -----
 
-### New in v0.20.2: Channel-Mix Stability Clamp
+### New in v0.20.3: DeepEmbed Channel-Mix Clamp
 
 #### RWKV Channel-Mix Stabilization
+- **DeepEmbed Modulation Clamp**: `--rwkv-channel-mix-deepembed-clamp N` caps DeepEmbed's multiplicative channel-mix modulation before `value_cm`. Default `4.0`; set `0` only for ablations.
+- **Shape-Compatible Resume Safety**: this is a runtime numeric guard, not an architecture-shape change. Existing checkpoints load with the default clamp backfilled.
+- **Compile-Compatible Hot Path**: the clamp lives inside the RWKV forward path and remains compatible with `torch.compile`, including `max-autotune-no-cudagraphs`.
+- **Late-Run NaN Prevention**: this specifically targets rare `key_cm -> relu -> square -> DeepEmbed multiply` spikes that can produce non-finite gradients in `value_cm`, `key_cm`, and upstream projection layers.
+
+### Previous v0.20.2: Channel-Mix Key Clamp
+
+#### RWKV Key Preactivation Stabilization
 - **Channel-Mix Key Clamp**: `--rwkv-channel-mix-key-clamp N` caps the RWKV `key_cm` preactivation before ReLU-squared channel mixing. Default `12.0`; set `0` only for ablations.
 - **Shape-Compatible Resume Safety**: this is a runtime numeric guard, not an architecture-shape change. Existing checkpoints load with the default clamp backfilled.
 - **Compile-Compatible Hot Path**: the clamp lives inside the RWKV forward path and remains compatible with `torch.compile`, including `max-autotune-no-cudagraphs`.
-- **Late-Run NaN Prevention**: this specifically targets rare `key_cm -> relu -> square` activation spikes that can produce non-finite gradients in `value_cm`, `key_cm`, and upstream projection layers.
 
 ### Previous v0.20.1: Drift Clamp Rescue
 
@@ -453,7 +466,7 @@ python hierarchos_cli.py train \
 
 `--assistant-recovery` keeps prompt tokens in the language-model objective but downweights them to `0.10`, weights assistant response tokens at `1.0`, boosts the first `32` response tokens by `2.0x`, uses warmup+cosine LR, lowers the ponder penalty to `0.003`, lengthens memory-gate warmup to `5000` steps, and reserves at least `16` answer tokens when overlong prompts are truncated. Blank completions are dropped by default; pass `--allow-empty-completions` only if empty answers are intentional labels. Keep `--max-ce-loss-for-backward 0` for from-scratch LM training. The default 4-epoch preset gives a 232.5M model about 17.2 training tokens per parameter on a 1B-token dataset; `--epochs 10` is about 43 training tokens per parameter.
 
-#### v0.20.2 Stability Rescue Resume
+#### v0.20.3 Stability Rescue Resume
 
 If a long assistant run develops the pattern `loss up + ponder up + commit up`, or shows rare non-finite gradient skips in the RWKV channel-mix path, do not reset learned hierarchy weights first. Resume from a pre-spike or latest clean checkpoint with a cooler schedule, bounded drift, and the channel-mix key clamp:
 
@@ -476,6 +489,7 @@ python hierarchos_cli.py train \
     --drift-norm-clamp 4.0 \
     --drift-delta-scale 0.50 \
     --rwkv-channel-mix-key-clamp 12.0 \
+    --rwkv-channel-mix-deepembed-clamp 4.0 \
     --grad-clip 0.75 \
     --save-steps 600
 ```
@@ -805,6 +819,7 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.5 --top-
 | `--drift-norm-clamp`           | `train`, `finetune`                 | Optional L2 norm clamp for worker drift states. `0` disables it; use `3.5-4.0` for commit/drift rescue resumes.                         | `0.0`                   |
 | `--drift-delta-scale`          | `train`, `finetune`                 | Scale applied to each worker drift update before accumulation. Values below `1.0` slow runaway drift growth.                            | `1.0`                   |
 | `--rwkv-channel-mix-key-clamp` | `train`, `finetune`                 | Clamp RWKV `key_cm` preactivation before ReLU-squared channel mixing. `12.0` is the recommended stability default; `0` disables it.      | `12.0`                  |
+| `--rwkv-channel-mix-deepembed-clamp` | `train`, `finetune`          | Clamp DeepEmbed's multiplicative RWKV channel-mix modulation before `value_cm`. `4.0` is the recommended stability default; `0` disables it. | `4.0`                |
 | `--override-scheduling`        | `train`                             | **[If resuming]** Ignore checkpoint's schedule state and use new LR args.                                                                | `False`                 |
 | `--starting-lr`                | `train`, `finetune`                 | Max Learning Rate for the schedule, or fixed LR if schedule disabled.                                                                    | `1e-4`                  |
 | `--min-lr`                     | `train`, `finetune`                 | Minimum Learning Rate for cosine annealing schedule.                                                                                     | `1e-6`                  |
@@ -929,11 +944,17 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
 
 ## Changelog
 
+### v0.20.3 (alpha)
+
+  * **DeepEmbed Channel-Mix Clamp**: Adds `--rwkv-channel-mix-deepembed-clamp` to cap DeepEmbed's multiplicative channel-mix modulation before `value_cm`.
+  * **Resume/Override Guardrails**: Checkpoint hydration and explicit CLI override tests now cover both RWKV channel-mix clamps, matching the safety pattern used for ROSA-era config backfills.
+  * **Post-DeepEmbed FFN Bound**: The channel-mix FFN input to `value_cm` is deterministically bounded when both key and DeepEmbed clamps are active.
+
 ### v0.20.2 (alpha)
 
-  * **Channel-Mix Stability Clamp**: Adds `--rwkv-channel-mix-key-clamp` to cap RWKV `key_cm` preactivation before the ReLU-squared channel-mix FFN.
+  * **Channel-Mix Key Clamp**: Adds `--rwkv-channel-mix-key-clamp` to cap RWKV `key_cm` preactivation before the ReLU-squared channel-mix FFN.
   * **Resume-Safe Numeric Guard**: Older checkpoints backfill `rwkv_channel_mix_key_clamp=12.0`; the clamp does not change tensor shapes or checkpoint state layout.
-  * **Compile-Compatible Stabilization**: The clamp remains inside the RWKV hot path and is covered by the RWKV compile/integrity tests.
+  * **Compile-Compatible Stabilization**: The key clamp remains inside the RWKV hot path and is covered by the RWKV compile/integrity tests.
 
 ### v0.20.1 (alpha)
 

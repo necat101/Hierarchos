@@ -479,6 +479,8 @@ def _continuation_parser_and_args(model_path=None, resume_from_ckpt=None, epochs
         "refresh_hf_token_cache": False,
         "refresh_hf_shards": False,
         "max_ce_loss_for_backward": 0.0,
+        "rwkv_channel_mix_key_clamp": 12.0,
+        "rwkv_channel_mix_deepembed_clamp": 4.0,
     }
     parser = argparse.ArgumentParser()
     for key, value in defaults.items():
@@ -618,6 +620,32 @@ def test_cli_resume_checkpoint_hydrates_config_without_base_epoch_offset():
     assert not hasattr(args, "base_completed_epoch")
 
 
+def test_cli_resume_checkpoint_hydrates_channel_mix_clamp_defaults():
+    checkpoint = {
+        "config": {
+            "hf_dataset": "netcat420/Experiment_0.1",
+            "rwkv_channel_mix_key_clamp": 9.0,
+            "rwkv_channel_mix_deepembed_clamp": 2.5,
+        },
+        "completed_epoch": 5,
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        ckpt_path = os.path.join(tmp, "hierarchos_epoch_5.pt")
+        torch.save(checkpoint, ckpt_path)
+
+        parser, args = _continuation_parser_and_args(resume_from_ckpt=ckpt_path, epochs=9)
+        hierarchos_cli._hydrate_training_args_from_model_config(
+            args,
+            parser,
+            explicit_dests={"epochs", "out_dir"},
+        )
+
+    assert args.hf_dataset == "netcat420/Experiment_0.1"
+    assert args.rwkv_channel_mix_key_clamp == 9.0
+    assert args.rwkv_channel_mix_deepembed_clamp == 2.5
+    assert args.resume_completed_epoch == 5
+
+
 def test_cli_resume_checkpoint_rejects_non_advancing_epoch_target():
     args = SimpleNamespace(
         mode="train",
@@ -645,6 +673,8 @@ def test_cli_resume_checkpoint_preserves_explicit_colab_overrides():
             "ltm_lr": 5e-7,
             "min_ltm_lr": 1e-10,
             "train_prompt_tokens": False,
+            "rwkv_channel_mix_key_clamp": 12.0,
+            "rwkv_channel_mix_deepembed_clamp": 4.0,
         },
         "completed_epoch": 11,
     }
@@ -659,6 +689,8 @@ def test_cli_resume_checkpoint_preserves_explicit_colab_overrides():
         args.ltm_lr = 1e-5
         args.min_ltm_lr = 1e-9
         args.train_prompt_tokens = True
+        args.rwkv_channel_mix_key_clamp = 8.0
+        args.rwkv_channel_mix_deepembed_clamp = 2.0
         hierarchos_cli._hydrate_training_args_from_model_config(
             args,
             parser,
@@ -670,6 +702,8 @@ def test_cli_resume_checkpoint_preserves_explicit_colab_overrides():
                 "min_lr",
                 "ltm_lr",
                 "min_ltm_lr",
+                "rwkv_channel_mix_key_clamp",
+                "rwkv_channel_mix_deepembed_clamp",
             },
         )
 
@@ -680,6 +714,8 @@ def test_cli_resume_checkpoint_preserves_explicit_colab_overrides():
     assert args.min_lr == 1e-8
     assert args.ltm_lr == 1e-5
     assert args.min_ltm_lr == 1e-9
+    assert args.rwkv_channel_mix_key_clamp == 8.0
+    assert args.rwkv_channel_mix_deepembed_clamp == 2.0
     assert args.train_prompt_tokens is True
     assert args.resume_completed_epoch == 11
 

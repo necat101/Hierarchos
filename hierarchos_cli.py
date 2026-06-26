@@ -1152,6 +1152,9 @@ _CONTINUATION_SUMMARY_KEYS = (
     "response_boundary_loss_weight",
     "response_boundary_tokens",
     "min_response_tokens",
+    "rwkv_channel_mix_key_clamp",
+    "drift_norm_clamp",
+    "drift_delta_scale",
     "drop_empty_completions",
 )
 
@@ -1425,6 +1428,7 @@ def main():
     arch_group.add_argument("--no-rosa", dest="use_rosa", action="store_false", help="Disable V8 ROSA for ablations or legacy checkpoints.")
     arch_group.add_argument("--rosa-max-context", dest="rosa_max_context", type=int, default=512, help="Capped token window used by ROSA.")
     arch_group.add_argument("--rwkv-head-size", "--rwkv_head_size", dest="rwkv_head_size", type=int, default=None, help="RWKV matrix-state head size. Default auto-selects 64 when divisible, else a smaller divisor.")
+    arch_group.add_argument("--rwkv-channel-mix-key-clamp", "--rwkv_channel_mix_key_clamp", dest="rwkv_channel_mix_key_clamp", type=float, default=12.0, help="Clamp RWKV channel-mix key preactivation before squared ReLU; 0 disables.")
 
     # --- Training Arguments ---
     train_group = parser.add_argument_group('Training')

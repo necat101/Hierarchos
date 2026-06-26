@@ -146,6 +146,24 @@ class RWKVV8IntegrityTests(unittest.TestCase):
 
         self.assertTrue(torch.isfinite(x.grad).all())
 
+    def test_rwkv_channel_mix_key_clamp_keeps_squared_relu_finite(self):
+        torch.manual_seed(23)
+        cell = RWKVCell(4, head_size=2, channel_mix_key_clamp=2.0)
+        cell.eval()
+
+        with torch.no_grad():
+            cell.key_cm.weight.zero_()
+            cell.key_cm.weight[:, 0] = 1e20
+            cell.value_cm.weight.fill_(1.0)
+
+            x = torch.tensor([[2.0, -1.0, 0.5, -3.0]])
+            state = cell.initial_state(1)
+            y, new_state = cell(x, state)
+
+        self.assertTrue(torch.isfinite(y).all())
+        self.assertTrue(torch.isfinite(new_state).all())
+        self.assertLess(float(y.abs().max().item()), 1000.0)
+
     def test_model_compile_hot_path_smoke_with_eager_backend(self):
         if not hasattr(torch, "compile"):
             self.skipTest("torch.compile is not available")

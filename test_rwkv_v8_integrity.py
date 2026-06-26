@@ -10,6 +10,7 @@ from hierarchos.inference.chat import load_hierarchical_chat_state, save_hierarc
 from hierarchos.inference.chat_state import CHAT_STATE_VERSION
 from hierarchos.models.core import _resolve_compile_kwargs
 from hierarchos.models.rwkv_cell import RWKVCell
+from hierarchos.utils.checkpoint import load_full_model_with_config
 from hierarchos.utils.rosa import precompute_rosa_ids_for_chunks
 
 
@@ -163,6 +164,33 @@ class RWKVV8IntegrityTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(y).all())
         self.assertTrue(torch.isfinite(new_state).all())
         self.assertLess(float(y.abs().max().item()), 1000.0)
+
+    def test_legacy_checkpoint_backfills_channel_mix_key_clamp(self):
+        torch.manual_seed(29)
+        cfg = _tiny_config()
+        model = HierarchosCore(cfg)
+        legacy_cfg = dict(cfg)
+        legacy_cfg.pop("rwkv_channel_mix_key_clamp", None)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "config": legacy_cfg,
+                    "training_complete": True,
+                },
+                os.path.join(tmpdir, "hierarchos.pt"),
+            )
+            loaded, loaded_cfg = load_full_model_with_config(tmpdir, "cpu")
+
+        self.assertEqual(loaded_cfg.rwkv_channel_mix_key_clamp, 12.0)
+        self.assertEqual(loaded.h_rnn.channel_mix_key_clamp, 12.0)
+        self.assertEqual(loaded.l_rnn.channel_mix_key_clamp, 12.0)
+
+        loaded.config.rwkv_channel_mix_key_clamp = 5.0
+        loaded.refresh_runtime_config()
+        self.assertEqual(loaded.h_rnn.channel_mix_key_clamp, 5.0)
+        self.assertEqual(loaded.l_rnn.channel_mix_key_clamp, 5.0)
 
     def test_model_compile_hot_path_smoke_with_eager_backend(self):
         if not hasattr(torch, "compile"):

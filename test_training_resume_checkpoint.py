@@ -731,7 +731,7 @@ def test_training_state_finite_rejects_poisoned_pending_grad():
     assert training_state_is_finite(model, include_grads=True) is False
 
 
-def test_clip_gradients_and_check_saturates_nonfinite_gradients():
+def test_clip_gradients_and_check_rejects_nonfinite_gradients():
     model = _FakeTrainModel()
     model.proj.weight.grad = torch.ones_like(model.proj.weight)
     model.proj.bias.grad = torch.ones_like(model.proj.bias)
@@ -741,10 +741,11 @@ def test_clip_gradients_and_check_saturates_nonfinite_gradients():
 
     ok, issue = _clip_gradients_and_check(model, max_norm=1.0)
 
-    assert ok is True
-    assert issue is not None or torch.isfinite(model.proj.weight.grad).all()
-    assert torch.isfinite(model.proj.weight.grad).all()
-    assert torch.isfinite(model.proj.bias.grad).all()
+    assert ok is False
+    assert issue is not None
+    assert "Top non-finite gradient tensors" in issue
+    assert "proj.weight" in issue
+    assert "proj.bias" in issue
 
 
 def test_clip_gradients_and_check_saturates_huge_finite_gradients():
@@ -856,7 +857,7 @@ def test_train_step_skips_nonfinite_loss_before_backward():
     assert model.reset_called is True
 
 
-def test_train_step_saturates_nonfinite_gradient_before_optimizer_step():
+def test_train_step_rejects_nonfinite_gradient_before_optimizer_step():
     model = _InfGradModel()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     args = SimpleNamespace(
@@ -886,15 +887,15 @@ def test_train_step_saturates_nonfinite_gradient_before_optimizer_step():
         running_states=(None, None, None, None, None, None),
     )
 
-    assert outputs is not None
+    assert outputs is None
     assert states == (None, None, None, None, None, None)
-    assert args._train_step_had_nonfinite is False
+    assert args._train_step_had_nonfinite is True
     assert model.weight.grad is None
-    assert not torch.equal(model.weight.detach(), before)
+    assert torch.equal(model.weight.detach(), before)
     assert model.reset_called is True
 
 
-def test_train_step_caps_finite_loss_explosion_for_backward():
+def test_train_step_caps_finite_loss_explosion_but_preserves_commitment_gradient():
     model = _HighFiniteLossModel()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.0)
     args = SimpleNamespace(
@@ -930,7 +931,8 @@ def test_train_step_caps_finite_loss_explosion_for_backward():
     assert outputs["loss"].item() == 20.0
     assert outputs["commitment_cost"].item() == 20.0
     assert args._train_step_had_nonfinite is False
-    assert torch.equal(model.weight.detach(), before)
+    assert not torch.equal(model.weight.detach(), before)
+    assert model.weight.detach().item() < before.item()
     assert states == (None, None, None, None, None, None)
 
 

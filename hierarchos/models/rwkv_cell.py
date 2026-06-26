@@ -70,6 +70,7 @@ class RWKVCell(nn.Module):
         layer_id: int = 0,
         n_layer: int = 2,
         channel_mix_key_clamp: float = 12.0,
+        channel_mix_deepembed_clamp: float = 4.0,
     ):
         super().__init__()
         self.n_embd = int(n_embd)
@@ -85,6 +86,10 @@ class RWKVCell(nn.Module):
             self.channel_mix_key_clamp = float(channel_mix_key_clamp or 0.0)
         except (TypeError, ValueError):
             self.channel_mix_key_clamp = 12.0
+        try:
+            self.channel_mix_deepembed_clamp = float(channel_mix_deepembed_clamp or 0.0)
+        except (TypeError, ValueError):
+            self.channel_mix_deepembed_clamp = 4.0
 
         C = self.n_embd
         H = self.n_head
@@ -321,7 +326,26 @@ class RWKVCell(nn.Module):
             )
         ffn = torch.square(torch.relu(cm_key))
         if deepemb_vec is not None:
-            ffn = ffn * deepemb_vec.to(dtype=ffn.dtype, device=ffn.device)
+            deepemb = deepemb_vec.to(dtype=ffn.dtype, device=ffn.device)
+            if self.channel_mix_deepembed_clamp > 0.0:
+                deepemb = torch.clamp(
+                    torch.nan_to_num(
+                        deepemb,
+                        nan=1.0,
+                        posinf=self.channel_mix_deepembed_clamp,
+                        neginf=-self.channel_mix_deepembed_clamp,
+                    ),
+                    min=-self.channel_mix_deepembed_clamp,
+                    max=self.channel_mix_deepembed_clamp,
+                )
+            ffn = ffn * deepemb
+            if self.channel_mix_key_clamp > 0.0 and self.channel_mix_deepembed_clamp > 0.0:
+                ffn_limit = (
+                    self.channel_mix_key_clamp
+                    * self.channel_mix_key_clamp
+                    * self.channel_mix_deepembed_clamp
+                )
+                ffn = torch.clamp(ffn, min=-ffn_limit, max=ffn_limit)
         x = x_resid_cm + self.value_cm(ffn)
 
         new_state = torch.cat([

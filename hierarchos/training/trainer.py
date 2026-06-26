@@ -263,6 +263,7 @@ _RUNTIME_MODEL_CONFIG_KEYS = (
     "drift_delta_scale",
     "activation_clamp",
     "rwkv_channel_mix_key_clamp",
+    "rwkv_channel_mix_deepembed_clamp",
     "commitment_loss_weight",
     "max_commitment_cost_for_backward",
     "commitment_threshold",
@@ -300,6 +301,7 @@ def _print_runtime_stability_config(model):
         f"drift_norm_clamp={norm_clamp:g}, "
         f"drift_delta_scale={getattr(config, 'drift_delta_scale', 1.0)}, "
         f"rwkv_channel_mix_key_clamp={getattr(config, 'rwkv_channel_mix_key_clamp', 12.0)}, "
+        f"rwkv_channel_mix_deepembed_clamp={getattr(config, 'rwkv_channel_mix_deepembed_clamp', 4.0)}, "
         f"commitment_threshold={threshold:g}, "
         f"max_commitment_cost_for_backward={getattr(config, 'max_commitment_cost_for_backward', 'trainer-only')}"
     )

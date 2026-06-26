@@ -286,10 +286,18 @@ class HierarchosCore(nn.Module):
             'rwkv_channel_mix_key_clamp',
             12.0,
         )
+        rwkv_channel_mix_deepembed_clamp = _config_nonnegative_float(
+            self.config,
+            'rwkv_channel_mix_deepembed_clamp',
+            4.0,
+        )
         for cell_name in ("h_rnn", "l_rnn"):
             cell = getattr(self, cell_name, None)
-            if cell is not None and hasattr(cell, "channel_mix_key_clamp"):
-                cell.channel_mix_key_clamp = rwkv_channel_mix_key_clamp
+            if cell is not None:
+                if hasattr(cell, "channel_mix_key_clamp"):
+                    cell.channel_mix_key_clamp = rwkv_channel_mix_key_clamp
+                if hasattr(cell, "channel_mix_deepembed_clamp"):
+                    cell.channel_mix_deepembed_clamp = rwkv_channel_mix_deepembed_clamp
         if hasattr(self, "worker_loop_module"):
             self.worker_loop_module.config = self.config
             self.worker_loop_module.refresh_runtime_config()
@@ -387,13 +395,20 @@ class HierarchosCore(nn.Module):
             'rwkv_channel_mix_key_clamp',
             12.0,
         )
+        rwkv_channel_mix_deepembed_clamp = _config_nonnegative_float(
+            config,
+            'rwkv_channel_mix_deepembed_clamp',
+            4.0,
+        )
         self.config.rwkv_channel_mix_key_clamp = rwkv_channel_mix_key_clamp
+        self.config.rwkv_channel_mix_deepembed_clamp = rwkv_channel_mix_deepembed_clamp
         self.h_rnn = RWKVCell(
             config.h_hidden,
             head_size=rwkv_head_size,
             layer_id=0,
             n_layer=getattr(config, 'rwkv_n_layer_hint', 2),
             channel_mix_key_clamp=rwkv_channel_mix_key_clamp,
+            channel_mix_deepembed_clamp=rwkv_channel_mix_deepembed_clamp,
         )
         self.h_to_context = nn.Linear(config.h_hidden, config.context_dim)
         self.h_halt_proj = nn.Linear(config.h_hidden, 1)
@@ -412,6 +427,7 @@ class HierarchosCore(nn.Module):
             layer_id=0,
             n_layer=getattr(config, 'rwkv_n_layer_hint', 2),
             channel_mix_key_clamp=rwkv_channel_mix_key_clamp,
+            channel_mix_deepembed_clamp=rwkv_channel_mix_deepembed_clamp,
         )
         
         # Configure truncated BPTT for RWKV cells

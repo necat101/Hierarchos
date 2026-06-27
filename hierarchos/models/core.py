@@ -550,6 +550,8 @@ class HierarchosCore(nn.Module):
         allow_hebbian_update = kwargs.pop("allow_hebbian_update", False)
         return_logits = kwargs.pop("return_logits", True)
         return_topk_values = kwargs.pop("return_topk_values", True)
+        return_raw_topk_values = kwargs.pop("return_raw_topk_values", True)
+        return_topk_indices = kwargs.pop("return_topk_indices", True)
         cached_rosa_ids = kwargs.pop("rosa_ids", None)
         loss_weights = kwargs.pop("loss_weights", None)
         suppress_hebbian = kwargs.pop("suppress_hebbian", getattr(self, "suppress_hebbian", True))
@@ -742,8 +744,10 @@ class HierarchosCore(nn.Module):
                 timestamps=memory_timestamps, sources=memory_sources
             )
             
-            all_topk_vals.append(topk_vals)
-            all_topk_idx.append(topk_idx)
+            if return_topk_values or return_raw_topk_values:
+                all_topk_vals.append(topk_vals)
+            if return_topk_indices:
+                all_topk_idx.append(topk_idx)
             
             # Positional encoding
             args = topk_ts.unsqueeze(-1) * self.time_freqs.unsqueeze(0).unsqueeze(0)
@@ -1018,7 +1022,7 @@ class HierarchosCore(nn.Module):
             "ponder_cost": ponder_cost_out, 
             "commitment_cost": commitment_cost_out,
             "topk_vals": torch.stack(all_topk_vals, dim=1) if (return_topk_values and all_topk_vals) else None, 
-            "raw_topk_vals": all_topk_vals,
+            "raw_topk_vals": all_topk_vals if return_raw_topk_values else None,
             "topk_idx": torch.stack(all_topk_idx, dim=1) if all_topk_idx else None,
             "h_state": h_state,
             "l_state": l_state,

@@ -47,17 +47,28 @@ def _resolve_weights_path(model_path: str) -> Tuple[str, str]:
         raise FileNotFoundError(f"Model path not found: {model_path}")
 
     preferred = ("hierarchos.pt", "model.pt", "hierarchos_final.pt")
-    for name in preferred:
-        candidate = os.path.join(resolved, name)
-        if os.path.exists(candidate):
-            return candidate, resolved
+    preferred_candidates = [
+        os.path.join(resolved, name)
+        for name in preferred
+        if os.path.exists(os.path.join(resolved, name))
+    ]
+    if preferred_candidates:
+        # Converter runs used to write model.pt while training exports write
+        # hierarchos.pt. If both exist, loading by fixed name order can silently
+        # pick an older stale export. Prefer the most recently written known
+        # checkpoint while keeping deterministic name tie-breaking.
+        return max(
+            preferred_candidates,
+            key=lambda path: (os.path.getmtime(path), path),
+        ), resolved
 
     pt_files = sorted(
         f for f in os.listdir(resolved)
         if f.lower().endswith(".pt")
     )
     if pt_files:
-        return os.path.join(resolved, pt_files[0]), resolved
+        pt_paths = [os.path.join(resolved, name) for name in pt_files]
+        return max(pt_paths, key=lambda path: (os.path.getmtime(path), path)), resolved
 
     raise FileNotFoundError(f"Model weights file not found in '{model_path}'")
 

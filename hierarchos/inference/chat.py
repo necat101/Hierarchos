@@ -366,6 +366,41 @@ def _setting_value(settings, name, default):
     return getattr(settings, name, default)
 
 
+def _normalize_ltm_training_mode(value) -> str:
+    mode = str(value or "inner-update").strip().lower().replace("_", "-")
+    aliases = {
+        "inner": "inner-update",
+        "inner-update": "inner-update",
+        "inner-updates": "inner-update",
+        "supervised": "inner-update",
+        "supervised-inner-update": "inner-update",
+        "readonly": "read-only",
+        "read-only": "read-only",
+        "read_only": "read-only",
+        "inference": "read-only",
+        "inference-like": "read-only",
+        "inference-like-ltm": "read-only",
+    }
+    return aliases.get(mode, "inner-update")
+
+
+def _checkpoint_ltm_training_mode(config) -> str:
+    return _normalize_ltm_training_mode(getattr(config, "ltm_training_mode", "inner-update"))
+
+
+def _print_ltm_chat_alignment(config, learning_enabled: bool):
+    mode = _checkpoint_ltm_training_mode(config)
+    print(f"Checkpoint LTM training mode: {mode}")
+    if mode == "read-only":
+        print("Chat LTM alignment: using read-only recurrent/LTM state during prefill and generation.")
+        if learning_enabled:
+            print("Explicit feedback/validation can still write LTM memory; passive response learning remains opt-in.")
+    else:
+        print("WARNING: checkpoint was trained with supervised LTM inner updates.")
+        print("Normal chat generation has no label-gradient inner update, so coherence may lag until retrained/rescued with --ltm-training-mode read-only.")
+    return mode
+
+
 def should_stop_generation_from_uncertainty(logits, response_ids, tokenizer=None, settings=None):
     """Stop when the model has clearly fallen into high-entropy tail sampling."""
     if logits is None:
@@ -573,6 +608,7 @@ def chat(args, device, tokenizer):
     elif learning_enabled:
         print("LTM online learning is ACTIVE for passive prompt memory and explicit feedback/validation.")
         print("Passive response learning is OFF by default; use --passive-response-learning to opt in.")
+    trained_ltm_mode = _print_ltm_chat_alignment(config, learning_enabled)
 
     if not is_quantized:
         model.eval()
@@ -667,6 +703,13 @@ def chat(args, device, tokenizer):
                 valid_mask = flat_labels != -100
                 active_logits = flat_logits[valid_mask]
                 active_labels = flat_labels[valid_mask]
+
+                if active_labels.numel() == 0:
+                    update_model.zero_grad(set_to_none=True)
+                    update_model.eval()
+                    if not silent:
+                        print(" (No supervised tokens for LTM update)")
+                    return None
 
                 if penalty:
                     probs = F.softmax(active_logits, dim=-1)
@@ -1186,6 +1229,8 @@ def chat(args, device, tokenizer):
                 print(f"  Device: {device}")
                 print(f"  Quantized: {is_quantized}")
                 print(f"  LTM Learning: {'ACTIVE' if learning_enabled else 'OFF'}")
+                print(f"  Checkpoint LTM Training Mode: {trained_ltm_mode}")
+                print(f"  Chat LTM Runtime: read-only during normal prefill/generation")
                 print(f"  Chat State File: {chat_state_path or '(disabled)'}")
                 continue
 

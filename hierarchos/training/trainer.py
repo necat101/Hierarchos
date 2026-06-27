@@ -254,6 +254,7 @@ _RUNTIME_MODEL_CONFIG_KEYS = (
     "ltm_lr",
     "min_ltm_lr",
     "disable_ltm_lr_schedule",
+    "ltm_training_mode",
     "ltm_score_grad_scale",
     "halt_logit_clamp",
     "recurrent_state_clamp",
@@ -486,7 +487,11 @@ def save_training_checkpoint_if_finite(checkpoint_dict, path: str, model, optimi
     max_abs = _checkpoint_grad_clip(checkpoint_dict)
     _sanitize_model_nonfinite_(model, log_prefix="checkpoint model")
     if isinstance(checkpoint_dict, dict) and model is not None and "model_state_dict" in checkpoint_dict:
-        checkpoint_dict["model_state_dict"] = sanitize_model_state_dict(model, reset_transient_ltm=False)
+        reset_transient_ltm = bool(checkpoint_dict.get("training_complete", False))
+        checkpoint_dict["model_state_dict"] = sanitize_model_state_dict(
+            model,
+            reset_transient_ltm=reset_transient_ltm,
+        )
     _sanitize_model_transient_state_(model, max_abs=max_abs)
     _sanitize_gradient_nonfinite_(model, max_abs=max_abs)
     _sanitize_optimizer_state_(optimizer)
@@ -868,10 +873,18 @@ def build_hierarchos_optimizer(model, args, device):
     weight_decay = float(getattr(args, "rwkv_weight_decay", 0.1))
     decay = []
     no_decay = []
+    deepembed_no_decay = []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if (".weight" in name or "emb" in name) and ("ln" not in name and "norm" not in name):
+        clean_name = name.replace("_orig_mod.", "")
+        if clean_name.startswith(("h_deepemb.", "l_deepemb.")):
+            # DeepEmbed is initialized to 1.0 and multiplicatively gates the RWKV
+            # channel-mix FFN. Decoupled weight decay quietly pulls that identity
+            # prior toward zero over long runs, effectively weakening the FFN path.
+            no_decay.append(param)
+            deepembed_no_decay.append(clean_name)
+        elif (".weight" in name or "emb" in name) and ("ln" not in name and "norm" not in name):
             decay.append(param)
         else:
             no_decay.append(param)
@@ -880,6 +893,8 @@ def build_hierarchos_optimizer(model, args, device):
         {"params": decay, "weight_decay": weight_decay},
         {"params": no_decay, "weight_decay": 0.0},
     ]
+    if deepembed_no_decay:
+        print(f"INFO: DeepEmbed weights excluded from AdamW decay ({len(deepembed_no_decay)} tensor(s)).")
     if is_directml_device(device):
         return DirectMLAdamW(param_groups, lr=lr)
     if device.type == 'cuda':
@@ -1051,6 +1066,39 @@ def _state_to_device(value, device):
     if isinstance(value, dict):
         return {key: _state_to_device(item, device) for key, item in value.items()}
     return value
+
+def normalize_ltm_training_mode(value) -> str:
+    mode = str(value or "inner-update").strip().lower().replace("_", "-")
+    aliases = {
+        "inner": "inner-update",
+        "gradient": "inner-update",
+        "grad": "inner-update",
+        "titans": "inner-update",
+        "titans-inner-update": "inner-update",
+        "read-only": "read-only",
+        "readonly": "read-only",
+        "inference": "read-only",
+        "inference-like": "read-only",
+        "off": "read-only",
+        "none": "read-only",
+    }
+    return aliases.get(mode, "inner-update")
+
+def ltm_inner_updates_enabled(args) -> bool:
+    return normalize_ltm_training_mode(getattr(args, "ltm_training_mode", "inner-update")) == "inner-update"
+
+def detach_ltm_state_from_outputs(outputs):
+    curr_ltm = outputs.get("ltm_memory_state") if isinstance(outputs, dict) else None
+    if curr_ltm is None:
+        return None
+    return (
+        curr_ltm[0].detach() if len(curr_ltm) >= 1 and isinstance(curr_ltm[0], torch.Tensor) else None,
+        curr_ltm[1].detach() if len(curr_ltm) >= 2 and isinstance(curr_ltm[1], torch.Tensor) else None,
+        curr_ltm[2].detach() if len(curr_ltm) >= 3 and isinstance(curr_ltm[2], torch.Tensor) else None,
+        curr_ltm[3] if len(curr_ltm) >= 4 else None,
+        curr_ltm[4].detach() if len(curr_ltm) >= 5 and isinstance(curr_ltm[4], torch.Tensor) else None,
+        curr_ltm[5].detach() if len(curr_ltm) >= 6 and isinstance(curr_ltm[5], torch.Tensor) else None,
+    )
 
 def capture_model_grad_state(model):
     grad_state = {}
@@ -1339,6 +1387,7 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
         (device.type == 'cuda' and getattr(args, 'cuda_chunked_lm_loss', True))
         or (device.type == 'cpu' and getattr(args, 'cpu_chunked_lm_loss', True))
     )
+    use_ltm_inner_updates = ltm_inner_updates_enabled(args)
     
     try:
         for chunk_idx, chunk_info in enumerate(chunk_plan):
@@ -1369,13 +1418,15 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                     global_pos_offset=start_t,
                     return_logits=not fast_lm_loss,
                     return_topk_values=False,
+                    return_raw_topk_values=use_ltm_inner_updates,
+                    return_topk_indices=use_ltm_inner_updates,
                     rosa_ids=rosa_ids,
                     loss_weights=loss_weights,
                 )
                 
                 # LTM fast-memory update needs gradients from the exact tensors used
                 # by the forward graph. retrieve_topk already keeps them float32.
-                if outputs.get("raw_topk_vals") is not None:
+                if use_ltm_inner_updates and outputs.get("raw_topk_vals") is not None:
                     for t_val in outputs["raw_topk_vals"]:
                         if t_val.requires_grad:
                             t_val.retain_grad()
@@ -1469,7 +1520,7 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
             args._train_step_had_backward = True
             
             # --- GRADIENT-BASED LTM UPDATE (Titans Parity) ---
-            if outputs.get("raw_topk_vals") is not None:
+            if use_ltm_inner_updates and outputs.get("raw_topk_vals") is not None:
                 with torch.no_grad():
                     valid_grads = []
                     for t_val in outputs["raw_topk_vals"]:
@@ -1534,21 +1585,12 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                                      curr_timestamps.detach() if isinstance(curr_timestamps, torch.Tensor) else curr_timestamps,
                                      curr_sources.detach() if isinstance(curr_sources, torch.Tensor) else curr_sources)  # ROSA automaton states (plain Python, no detach needed)
                     else:
-                        curr_ltm = outputs['ltm_memory_state']
-                        ltm_state = (curr_ltm[0].detach(), curr_ltm[1].detach(),
-                                     curr_ltm[2].detach() if len(curr_ltm) >= 3 and curr_ltm[2] is not None else None,
-                                     curr_ltm[3] if len(curr_ltm) >= 4 else None,
-                                     curr_ltm[4].detach() if len(curr_ltm) >= 5 and isinstance(curr_ltm[4], torch.Tensor) else None,
-                                     curr_ltm[5].detach() if len(curr_ltm) >= 6 and isinstance(curr_ltm[5], torch.Tensor) else None)
+                        ltm_state = detach_ltm_state_from_outputs(outputs)
             else:
-                # No LTM outputs? Just take what we have
-                if outputs.get('ltm_memory_state') is not None:
-                    curr_ltm = outputs['ltm_memory_state']
-                    ltm_state = (curr_ltm[0].detach(), curr_ltm[1].detach(),
-                                 curr_ltm[2].detach() if len(curr_ltm) >= 3 and curr_ltm[2] is not None else None,
-                                 curr_ltm[3] if len(curr_ltm) >= 4 else None,
-                                 curr_ltm[4].detach() if len(curr_ltm) >= 5 and isinstance(curr_ltm[4], torch.Tensor) else None,
-                                 curr_ltm[5].detach() if len(curr_ltm) >= 6 and isinstance(curr_ltm[5], torch.Tensor) else None)
+                # In read-only/inference-like LTM mode, carry ROSA/past-token
+                # continuity across TBPTT chunks but do not write supervised fast
+                # memory that chat-time generation cannot reproduce.
+                ltm_state = detach_ltm_state_from_outputs(outputs)
 
             # Update states for next chunk (TBPTT - detach to limit gradient flow)
             recurrent_state_clamp = getattr(args, 'recurrent_state_clamp', 50.0)
@@ -1649,6 +1691,8 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         os.makedirs(args.out_dir, exist_ok=True)
     config = AttrDict(vars(args))
     _apply_runtime_model_config_overrides(config, args)
+    args.ltm_training_mode = normalize_ltm_training_mode(getattr(args, "ltm_training_mode", "inner-update"))
+    config.ltm_training_mode = args.ltm_training_mode
 
     prompt_completion_mode = (
         getattr(args, 'alpaca', False)
@@ -1690,6 +1734,13 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         )
         if bool(getattr(args, "assistant_recovery", False)):
             print("INFO: Assistant recovery preset ACTIVE.")
+    if ltm_inner_updates_enabled(args):
+        print("INFO: Training LTM mode: inner-update (supervised gradient fast-memory updates between TBPTT chunks).")
+    else:
+        print(
+            "INFO: Training LTM mode: read-only/inference-like "
+            "(ROSA/history state carries across chunks; supervised LTM fast-memory writes are disabled)."
+        )
 
     # Device stability
     if is_directml_device(device):
@@ -2074,7 +2125,14 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     if checkpoint:
         restore_dataloader_state(dataloader, checkpoint.get('data_state'))
         restore_rng_state(checkpoint.get('rng_state'))
-        restore_model_grad_state(model, checkpoint.get('grad_state_dict'), device)
+        if getattr(args, 'override_scheduling', False):
+            if checkpoint.get('grad_state_dict'):
+                print(
+                    "INFO: Ignoring pending gradient accumulation from checkpoint "
+                    "because --override-scheduling requested a fresh optimizer/scheduler path."
+                )
+        else:
+            restore_model_grad_state(model, checkpoint.get('grad_state_dict'), device)
         if checkpoint.get('running_states') is not None:
             running_issue = _find_first_nonfinite_payload_tensor(checkpoint['running_states'], "running_states")
             if running_issue:
@@ -2174,12 +2232,12 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                     postfix["seq"] = int(outputs.get('seq_len', 0) or 0)
                 if scheduler:
                     postfix["lr"] = f"{scheduler.get_last_lr()[0]:.2e}"
-                postfix["ltm_lr"] = f"{get_current_ltm_lr(args):.2e}"
+                postfix["ltm_lr"] = f"{get_current_ltm_lr(args):.2e}" if ltm_inner_updates_enabled(args) else "off"
                 pbar.set_postfix(postfix)
 
             if scheduler and getattr(args, '_optimizer_step_was_taken', False):
                 scheduler.step()
-            if getattr(args, '_optimizer_step_was_taken', False):
+            if getattr(args, '_optimizer_step_was_taken', False) and ltm_inner_updates_enabled(args):
                 advance_ltm_lr_schedule(args)
 
             # Periodic Checkpointing (Progress Protection)
@@ -2287,7 +2345,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
                         print("WARNING: lm-eval not installed. Install with: pip install lm-eval>=0.4.0")
                 except Exception as e:
                     print(f"WARNING: Evaluation failed: {e}")
-                    model.train()  # Ensure model is back in training mode
+        model.train()  # Ensure model is back in training mode
 
     # --- FINAL INFERENCE MODEL EXPORT ---
     print("\n" + "="*60)
@@ -2368,6 +2426,11 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
     if dataloader_len <= 0:
         print("ERROR: dataloader_len must be > 0. If automatic detection failed, please specify --dataset-size.")
         return
+    args.ltm_training_mode = normalize_ltm_training_mode(getattr(args, "ltm_training_mode", "inner-update"))
+    if ltm_inner_updates_enabled(args):
+        print("INFO: Fine-tune LTM mode: inner-update (supervised gradient fast-memory updates).")
+    else:
+        print("INFO: Fine-tune LTM mode: read-only/inference-like (supervised LTM fast-memory writes disabled).")
 
     # Load the base model and its config
     model, model_config = load_full_model_with_config(args.model_path, device)
@@ -2398,7 +2461,11 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
     elif 'h_stride' not in model_config:
         model_config.h_stride = h_stride
 
+    _apply_runtime_model_config_overrides(model_config, args)
     model.config = model_config
+    if hasattr(model, "refresh_runtime_config"):
+        model.refresh_runtime_config()
+    _print_runtime_stability_config(model)
 
     # Determine LoRA rank
     lora_r = getattr(args, 'lora_r', 8)
@@ -2481,7 +2548,7 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
     else:
         optimizer = build_hierarchos_optimizer(model, args, device)
     
-    if checkpoint and 'optimizer_state_dict' in checkpoint:
+    if checkpoint and 'optimizer_state_dict' in checkpoint and not getattr(args, 'override_scheduling', False):
         try:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             print("Successfully loaded optimizer state.")
@@ -2498,7 +2565,7 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
     if use_amp:
         if amp_dtype_str == 'float16':
             scaler = GradScaler()
-            if checkpoint and 'scaler_state_dict' in checkpoint:
+            if checkpoint and 'scaler_state_dict' in checkpoint and not getattr(args, 'override_scheduling', False):
                 try: scaler.load_state_dict(checkpoint['scaler_state_dict'])
                 except: pass
         print(f"INFO: Automatic Mixed Precision (AMP) ENABLED for fine-tuning ({amp_dtype_str}).")
@@ -2555,6 +2622,7 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
     ponder_loss_weight = getattr(args, 'ponder_loss_weight', 0.01)
     commitment_loss_weight = getattr(args, 'commitment_loss_weight', 0.5)
     grad_clip = getattr(args, 'grad_clip', 1.0)
+    use_ltm_inner_updates = ltm_inner_updates_enabled(args)
 
     for epoch in range(start_epoch, args.epochs):
         print(f"\n--- LoRA Finetune Epoch {epoch + 1} / {args.epochs} ---")
@@ -2608,13 +2676,15 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                     labels=labels,
                     rosa_ids=rosa_ids,
                     loss_weights=loss_weights,
+                    return_topk_values=False,
+                    return_raw_topk_values=use_ltm_inner_updates,
+                    return_topk_indices=use_ltm_inner_updates,
                 )
                 
-                # AMP FIX: Cast topk_vals to float32 before retain_grad (same fix as train path).
-                # Prevents masked_scatter_ dtype mismatch crash under BFloat16 AMP.
-                if outputs.get("topk_vals") is not None and outputs["topk_vals"].requires_grad:
-                    outputs["topk_vals"] = outputs["topk_vals"].float()
-                    outputs["topk_vals"].retain_grad()
+                if use_ltm_inner_updates and outputs.get("raw_topk_vals") is not None:
+                    for t_val in outputs["raw_topk_vals"]:
+                        if t_val.requires_grad:
+                            t_val.retain_grad()
                 
                 cross_entropy_loss = outputs.get("loss")
                 ponder_cost = outputs.get("ponder_cost")
@@ -2690,12 +2760,20 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                 if backward_called_in_cycle:
                     # LTM Update
                     ltm_grads = None
-                    if outputs.get("topk_vals") is not None and outputs["topk_vals"].requires_grad:
-                        if outputs["topk_vals"].grad is not None:
-                            ltm_grads = outputs["topk_vals"].grad
+                    if use_ltm_inner_updates and outputs.get("raw_topk_vals") is not None:
+                        valid_grads = []
+                        for t_val in outputs["raw_topk_vals"]:
+                            g = t_val.grad
+                            if g is not None:
+                                valid_grads.append(g.detach())
+                            else:
+                                valid_grads.append(torch.zeros_like(t_val))
+                        ltm_grads = torch.stack(valid_grads, dim=1)
+                        for t_val in outputs["raw_topk_vals"]:
+                            t_val.grad = None
+                        outputs["raw_topk_vals"] = None
 
                     if ltm_grads is not None:
-                        base_ltm = model.base_model.model.ltm
                         ltm_grads_copy = ltm_grads.detach().clone()
 
                         valid_update = True
@@ -2722,13 +2800,17 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                                     max=1.0,
                                 )
                                 ltm_grads_copy = ltm_grads_copy * clip_coef
-                            base_ltm.inner_update(
-                                outputs["topk_idx"],
-                                ltm_grads_copy,
-                                current_lr=get_current_ltm_lr(args),
-                                timestamp=float(i + 1),
-                                source=2  # SRC_TRAINING_DATA
-                            )
+                            base_model = getattr(getattr(model, "base_model", None), "model", model)
+                            base_ltm = getattr(base_model, "ltm", None)
+                            topk_idx = outputs.get("topk_idx")
+                            if base_ltm is not None and topk_idx is not None:
+                                base_ltm.inner_update(
+                                    topk_idx,
+                                    ltm_grads_copy,
+                                    current_lr=get_current_ltm_lr(args),
+                                    timestamp=float(i + 1),
+                                    source=2  # SRC_TRAINING_DATA
+                                )
 
                     # Optimizer step
                     if use_amp and scaler:
@@ -2762,7 +2844,8 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
 
                     if scheduler:
                         scheduler.step()
-                    advance_ltm_lr_schedule(args)
+                    if use_ltm_inner_updates:
+                        advance_ltm_lr_schedule(args)
 
                     optimizer.zero_grad(set_to_none=True)
                     backward_called_in_cycle = False
@@ -2799,7 +2882,7 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                 "ponder": f"{avg_ponder:.2f}",
                 "commit": f"{avg_commit:.2e}",
                 "lr": f"{current_lr:.2e}",
-                "ltm_lr": f"{get_current_ltm_lr(args):.2e}"
+                "ltm_lr": f"{get_current_ltm_lr(args):.2e}" if use_ltm_inner_updates else "off"
             })
 
     # Save LoRA adapter

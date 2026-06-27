@@ -34,6 +34,51 @@ def get_q_block_size(qtype: str) -> int:
     else:
         return 32
 
+
+def _q_data_keys(q_data) -> set:
+    try:
+        return {str(key) for key in q_data.files}
+    except AttributeError:
+        return {str(key) for key in q_data.keys()}
+
+
+def detect_quantized_rwkv_format(q_data) -> str:
+    """Classify the recurrent-block format inside a quantized archive."""
+    keys = _q_data_keys(q_data)
+    has_v8 = any(key.startswith("h_rnn.x_r") or key.startswith("h_rnn.r_k") for key in keys)
+    has_legacy = any(key.startswith("h_rnn.time_decay") or key.startswith("h_rnn.time_mix_") for key in keys)
+    if has_v8 and not has_legacy:
+        return "v8-matrix"
+    if has_legacy and not has_v8:
+        return "legacy-scalar"
+    if has_v8 and has_legacy:
+        return "mixed"
+    return "unknown"
+
+
+def validate_quantized_rwkv_format(q_data, source: str = "quantized archive") -> str:
+    """Reject archives that do not match the currently implemented quantized cell."""
+    rwkv_format = detect_quantized_rwkv_format(q_data)
+    if rwkv_format == "legacy-scalar":
+        return rwkv_format
+    if rwkv_format == "v8-matrix":
+        raise ValueError(
+            f"Unsupported v8 matrix-state quantized model in {source}. "
+            "The active full-precision model uses RWKV v8 keys such as h_rnn.x_r/r_k, "
+            "but the quantized inference loader still implements the older scalar-state "
+            "RWKV path. Use full-precision chat or build a v8-compatible quantized loader "
+            "before trusting quantized outputs."
+        )
+    if rwkv_format == "mixed":
+        raise ValueError(
+            f"Mixed legacy/v8 quantized RWKV keys found in {source}. "
+            "Refusing to load a partial recurrent architecture."
+        )
+    raise ValueError(
+        f"Could not identify quantized RWKV format in {source}. "
+        "Expected legacy scalar-RWKV keys such as h_rnn.time_decay for this loader."
+    )
+
 class QuantizedLinear:
     """A wrapper for a quantized linear layer that uses the C++ kernel for inference."""
     def __init__(self, name: str, q_data: dict):
@@ -479,7 +524,9 @@ def load_quantized(model_path: str, device=None):
     if not _HAS_KERNEL: raise ImportError("Cannot load quantized model: C++ kernel not found.")
     npz_files = [f for f in os.listdir(model_path) if f.endswith('.npz')]
     if not npz_files: raise FileNotFoundError(f"No quantized model .npz file found in {model_path}")
-    q_data = np.load(os.path.join(model_path, npz_files[0]), allow_pickle=True)
+    q_path = os.path.join(model_path, npz_files[0])
+    q_data = np.load(q_path, allow_pickle=True)
+    validate_quantized_rwkv_format(q_data, q_path)
     config = AttrDict(q_data['_config'].item())
     if 'model_type' not in config: config['model_type'] = 'hierarchos'
     return QuantizedHierarchos(config, q_data), config

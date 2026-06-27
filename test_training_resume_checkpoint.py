@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from hierarchos.training.datasets import EpochShuffleSampler, LengthGroupedBatchSampler
 from hierarchos.training.trainer import (
+    build_hierarchos_optimizer,
     build_training_checkpoint,
     build_lr_scheduler,
     capture_ltm_lr_scheduler_state,
@@ -30,6 +31,8 @@ from hierarchos.training.trainer import (
     _sanitize_gradient_nonfinite_,
     _clamp_model_finite_magnitude_,
     _clip_gradients_and_check,
+    ltm_inner_updates_enabled,
+    normalize_ltm_training_mode,
 )
 from hierarchos.utils.checkpoint import sanitize_model_state_dict
 import hierarchos_cli
@@ -51,6 +54,71 @@ class _FakeTrainModel(nn.Module):
         self.ltm = _FakeLTM()
         self.proj = nn.Linear(2, 2)
         self.config = {"context_dim": 2}
+
+
+class _FakeDeepEmbedModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.h_deepemb = nn.Embedding(4, 8)
+        self.l_deepemb = nn.Embedding(4, 8)
+        self.tok_emb = nn.Embedding(4, 2)
+        self.proj = nn.Linear(2, 2)
+
+
+class _CountingLTM:
+    def __init__(self):
+        self.inner_update_calls = 0
+
+    def inner_update(self, *args, **kwargs):
+        self.inner_update_calls += 1
+        fast_vals = kwargs.get("fast_vals")
+        mom_vals = kwargs.get("mom_vals")
+        return fast_vals, mom_vals
+
+
+class _LTMModeRecordingModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(()))
+        self.config = SimpleNamespace(vocab_size=8, cpu_chunked_lm_loss=False, cuda_chunked_lm_loss=False)
+        self.ltm = _CountingLTM()
+        self.forward_flags = []
+        self.reset_called = False
+
+    def reset_memory(self):
+        self.reset_called = True
+
+    def forward(self, **kwargs):
+        self.forward_flags.append({
+            "return_raw_topk_values": kwargs.get("return_raw_topk_values"),
+            "return_topk_indices": kwargs.get("return_topk_indices"),
+        })
+        device = self.weight.device
+        raw_topk_vals = None
+        topk_idx = None
+        if kwargs.get("return_raw_topk_values", True):
+            raw_topk_vals = [(self.weight * torch.ones(1, 1, 2, device=device))]
+            topk_idx = torch.zeros(1, 1, 1, dtype=torch.long, device=device)
+        return {
+            "loss": self.weight * 1.0,
+            "ponder_cost": torch.zeros((), device=device),
+            "commitment_cost": torch.zeros((), device=device),
+            "raw_topk_vals": raw_topk_vals,
+            "topk_idx": topk_idx,
+            "ltm_memory_state": (
+                torch.zeros(1, 3, 2, device=device),
+                torch.zeros(1, 3, 2, device=device),
+                torch.arange(2, device=device).reshape(1, 2),
+                [{"rosa": "state"}],
+                torch.zeros(1, 3, device=device),
+                torch.zeros(1, 3, dtype=torch.long, device=device),
+            ),
+            "h_state": None,
+            "l_state": None,
+            "prev_context": None,
+            "target_context": None,
+            "drift_state": None,
+        }
 
 
 class _NaNLossModel(nn.Module):
@@ -461,6 +529,7 @@ def _continuation_parser_and_args(model_path=None, resume_from_ckpt=None, epochs
         "warmup_ratio": 0.0,
         "ltm_lr": 1e-3,
         "min_ltm_lr": None,
+        "ltm_training_mode": "inner-update",
         "alpaca": False,
         "kayla": False,
         "compile": False,
@@ -530,6 +599,43 @@ def test_cli_model_path_continuation_hydrates_saved_training_config():
     assert args.base_completed_epoch == 11
 
 
+def test_cli_model_path_continuation_prefers_checkpoint_config_over_sidecar():
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "hierarchos_config.json"), "w", encoding="utf-8") as f:
+            import json
+            json.dump(
+                {
+                    "hf_dataset": "stale/dataset",
+                    "max_length": 1024,
+                    "completed_epoch": 3,
+                },
+                f,
+            )
+        torch.save(
+            {
+                "model_state_dict": {},
+                "config": {
+                    "hf_dataset": "fresh/dataset",
+                    "max_length": 8880,
+                    "completed_epoch": 9,
+                },
+                "completed_epoch": 9,
+            },
+            os.path.join(tmp, "hierarchos.pt"),
+        )
+
+        parser, args = _continuation_parser_and_args(model_path=tmp, epochs=3)
+        hierarchos_cli._hydrate_training_args_from_model_config(
+            args,
+            parser,
+            explicit_dests={"epochs", "out_dir"},
+        )
+
+    assert args.hf_dataset == "fresh/dataset"
+    assert args.max_length == 8880
+    assert args.base_completed_epoch == 9
+
+
 def test_assistant_recovery_defaults_target_large_assistant_sft():
     parser, args = _continuation_parser_and_args(epochs=3)
     args.assistant_recovery = True
@@ -548,6 +654,7 @@ def test_assistant_recovery_defaults_target_large_assistant_sft():
     assert args.min_response_tokens == 16
     assert args.ponder_loss_weight == 0.003
     assert args.memory_gate_warmup_steps == 5000
+    assert args.ltm_training_mode == "read-only"
 
 
 def test_assistant_recovery_respects_explicit_overrides():
@@ -556,13 +663,137 @@ def test_assistant_recovery_respects_explicit_overrides():
 
     hierarchos_cli._apply_assistant_recovery_defaults(
         args,
-        explicit_dests={"epochs", "prompt_loss_weight", "warmup_ratio"},
+        explicit_dests={"epochs", "prompt_loss_weight", "warmup_ratio", "ltm_training_mode"},
     )
 
     assert args.epochs == 7
     assert args.prompt_loss_weight == 1.0
     assert args.warmup_ratio == 0.0
     assert args.response_boundary_tokens == 32
+    assert args.ltm_training_mode == "inner-update"
+
+
+def test_resume_hydrates_saved_ltm_training_mode():
+    checkpoint = {
+        "config": {
+            "hf_dataset": "netcat420/Experiment_0.1",
+            "ltm_training_mode": "read-only",
+        },
+        "completed_epoch": 5,
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        ckpt_path = os.path.join(tmp, "hierarchos_epoch_5.pt")
+        torch.save(checkpoint, ckpt_path)
+
+        parser, args = _continuation_parser_and_args(resume_from_ckpt=ckpt_path, epochs=7)
+        hierarchos_cli._hydrate_training_args_from_model_config(
+            args,
+            parser,
+            explicit_dests={"epochs", "out_dir"},
+        )
+
+    assert args.ltm_training_mode == "read-only"
+    assert args.resume_completed_epoch == 5
+
+
+def test_ltm_training_mode_normalization():
+    assert normalize_ltm_training_mode("inner") == "inner-update"
+    assert normalize_ltm_training_mode("inference-like") == "read-only"
+    assert ltm_inner_updates_enabled(SimpleNamespace(ltm_training_mode="inner-update")) is True
+    assert ltm_inner_updates_enabled(SimpleNamespace(ltm_training_mode="read-only")) is False
+
+
+def test_deepembed_weights_are_excluded_from_weight_decay():
+    model = _FakeDeepEmbedModel()
+    args = SimpleNamespace(starting_lr=1e-3, rwkv_weight_decay=0.1)
+
+    optimizer = build_hierarchos_optimizer(model, args, torch.device("cpu"))
+
+    decay_params = set(map(id, optimizer.param_groups[0]["params"]))
+    no_decay_params = set(map(id, optimizer.param_groups[1]["params"]))
+    assert id(model.h_deepemb.weight) in no_decay_params
+    assert id(model.l_deepemb.weight) in no_decay_params
+    assert id(model.h_deepemb.weight) not in decay_params
+    assert id(model.l_deepemb.weight) not in decay_params
+    assert id(model.tok_emb.weight) in decay_params
+
+
+def test_read_only_ltm_training_skips_inner_update_but_carries_state():
+    model = _LTMModeRecordingModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    args = SimpleNamespace(
+        amp=False,
+        training_chunk_size=2,
+        compile=False,
+        pad_token_id=0,
+        padding_metrics=False,
+        cpu_chunked_lm_loss=False,
+        cuda_chunked_lm_loss=False,
+        grad_clip=1.0,
+        ltm_training_mode="read-only",
+    )
+    batch = {
+        "input_ids": torch.ones(1, 4, dtype=torch.long),
+        "labels": torch.ones(1, 4, dtype=torch.long),
+    }
+
+    outputs, states = train_step(
+        model,
+        batch,
+        optimizer,
+        scaler=None,
+        accumulation_steps=1,
+        step=0,
+        args=args,
+        running_states=(None, None, None, None, None, None),
+    )
+
+    assert outputs is not None
+    assert model.ltm.inner_update_calls == 0
+    assert model.forward_flags
+    assert all(flag["return_raw_topk_values"] is False for flag in model.forward_flags)
+    assert all(flag["return_topk_indices"] is False for flag in model.forward_flags)
+    assert states[5] is not None
+    assert states[5][2] is not None
+
+
+def test_inner_update_ltm_training_retains_legacy_fast_memory_path():
+    model = _LTMModeRecordingModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    args = SimpleNamespace(
+        amp=False,
+        training_chunk_size=2,
+        compile=False,
+        pad_token_id=0,
+        padding_metrics=False,
+        cpu_chunked_lm_loss=False,
+        cuda_chunked_lm_loss=False,
+        grad_clip=1.0,
+        ltm_training_mode="inner-update",
+        ltm_lr=1e-4,
+        min_ltm_lr=1e-8,
+        min_lr=1e-8,
+        disable_ltm_lr_schedule=True,
+    )
+    batch = {
+        "input_ids": torch.ones(1, 4, dtype=torch.long),
+        "labels": torch.ones(1, 4, dtype=torch.long),
+    }
+
+    outputs, _states = train_step(
+        model,
+        batch,
+        optimizer,
+        scaler=None,
+        accumulation_steps=1,
+        step=0,
+        args=args,
+        running_states=(None, None, None, None, None, None),
+    )
+
+    assert outputs is not None
+    assert model.ltm.inner_update_calls > 0
+    assert all(flag["return_raw_topk_values"] is True for flag in model.forward_flags)
 
 
 def test_resume_hydration_does_not_persist_refresh_cache_flags(tmp_path):
@@ -729,6 +960,35 @@ def test_inference_sanitization_still_clears_transient_ltm():
 
     state = sanitize_model_state_dict(model)
 
+    assert torch.count_nonzero(state["ltm.fast_vals"]) == 0
+    assert torch.count_nonzero(state["ltm._mom_vals"]) == 0
+    assert torch.count_nonzero(state["ltm.timestamps"]) == 0
+    assert torch.count_nonzero(state["ltm.sources"]) == 0
+
+
+def test_safe_inference_checkpoint_save_clears_transient_ltm_payload(tmp_path):
+    model = _FakeTrainModel()
+    model.ltm.fast_vals.fill_(3.0)
+    model.ltm._mom_vals.fill_(4.0)
+    model.ltm.timestamps.fill_(5.0)
+    model.ltm.sources.fill_(2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    path = tmp_path / "hierarchos.pt"
+
+    ok = save_training_checkpoint_if_finite(
+        {
+            "model_state_dict": sanitize_model_state_dict(model),
+            "config": dict(model.config),
+            "training_complete": True,
+        },
+        str(path),
+        model,
+        optimizer=None,
+    )
+
+    assert ok is True
+    saved = torch.load(path, map_location="cpu", weights_only=False)
+    state = saved["model_state_dict"]
     assert torch.count_nonzero(state["ltm.fast_vals"]) == 0
     assert torch.count_nonzero(state["ltm._mom_vals"]) == 0
     assert torch.count_nonzero(state["ltm.timestamps"]) == 0

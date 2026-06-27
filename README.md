@@ -1,6 +1,20 @@
 -----
 
-# Hierarchos v0.20.3 (alpha): DeepEmbed Channel-Mix Clamp
+# Hierarchos v0.20.4 (alpha): Inference-Like LTM Training
+
+**v0.20.4 focus**: assistant SFT and rescue runs can now train with inference-like LTM dynamics. `--ltm-training-mode read-only` carries ROSA/history state across TBPTT chunks but disables supervised gradient fast-memory writes, preventing the model from learning to depend on an LTM inner-update signal that normal chat generation does not receive. `--assistant-recovery` now defaults to this read-only mode unless explicitly overridden.
+
+**hierarchos/models/core.py** and **hierarchos/training/trainer.py**: the model forward path can skip retained LTM retrieval tensors when training in read-only mode. The trainer still preserves cross-chunk recurrent state and ROSA token history, but it no longer writes supervised fast-memory values that would be absent during chat.
+
+**hierarchos/training/trainer.py**: LoRA finetune now follows the same LTM training-mode contract as full training. Read-only mode disables retained retrieval tensors, supervised LTM inner updates, and LTM LR schedule advancement there too, while still applying runtime stability clamp overrides to the loaded base model.
+
+**hierarchos/training/trainer.py**: DeepEmbed weights are excluded from AdamW weight decay. DeepEmbed starts as a multiplicative identity gate at `1.0`; decaying it toward zero over many epochs can quietly weaken the RWKV channel-mix path.
+
+**hierarchos_cli.py**: adds `--ltm-training-mode {inner-update,read-only}` and the shortcut `--inference-like-ltm-training`. Saved configs and checkpoint hydration preserve the mode, while explicit CLI values still win during resume.
+
+**hierarchos/inference/chat.py**: chat now prints the checkpoint's saved LTM training mode at startup and in `/status`. Read-only checkpoints are identified as aligned with normal prefill/generation; older inner-update checkpoints emit a warning because normal chat cannot reproduce supervised label-gradient LTM writes.
+
+## Previous v0.20.3 Notes: DeepEmbed Channel-Mix Clamp
 
 **v0.20.3 focus**: long assistant SFT and rescue runs now also clamp DeepEmbed's multiplicative RWKV channel-mix modulation. `--rwkv-channel-mix-deepembed-clamp` caps the token-specific DeepEmbed multiplier before `value_cm`, preventing rare learned modulation spikes from re-amplifying the already-clamped ReLU-squared channel-mix FFN.
 
@@ -56,7 +70,16 @@ A novel AI architecture that synergistically integrates Google's Titans memory s
 
 -----
 
-### New in v0.20.3: DeepEmbed Channel-Mix Clamp
+### New in v0.20.4: Inference-Like LTM Training
+
+#### Training/Chat Dynamics Alignment
+- **Read-Only LTM Training Mode**: `--ltm-training-mode read-only` carries recurrent state and ROSA token history across TBPTT chunks but skips supervised LTM fast-memory writes. This better matches normal chat inference, where generation does not receive label-gradient inner updates.
+- **Assistant Recovery Default**: `--assistant-recovery` now selects `ltm_training_mode=read-only` unless you explicitly pass `--ltm-training-mode inner-update`.
+- **Chat Visibility**: chat reports the saved LTM training mode at startup and in `/status`, making read-only/inference-like checkpoints distinguishable from older supervised-inner-update runs.
+- **Legacy Titans Path Preserved**: `--ltm-training-mode inner-update` keeps the previous gradient-based fast-memory behavior for experiments that intentionally train with Titans-style inner updates.
+- **DeepEmbed No-Decay**: DeepEmbed embeddings are excluded from AdamW decay so their identity initialization is not slowly pulled toward zero during long runs.
+
+### Previous v0.20.3: DeepEmbed Channel-Mix Clamp
 
 #### RWKV Channel-Mix Stabilization
 - **DeepEmbed Modulation Clamp**: `--rwkv-channel-mix-deepembed-clamp N` caps DeepEmbed's multiplicative channel-mix modulation before `value_cm`. Default `4.0`; set `0` only for ablations.
@@ -97,6 +120,7 @@ epochs=4
 starting_lr=6e-5
 min_lr=1e-6
 warmup_ratio=0.03
+ltm_training_mode=read-only
 ltm_lr=3e-4
 min_ltm_lr=1e-5
 train_prompt_tokens=True
@@ -466,9 +490,9 @@ python hierarchos_cli.py train \
 
 `--assistant-recovery` keeps prompt tokens in the language-model objective but downweights them to `0.10`, weights assistant response tokens at `1.0`, boosts the first `32` response tokens by `2.0x`, uses warmup+cosine LR, lowers the ponder penalty to `0.003`, lengthens memory-gate warmup to `5000` steps, and reserves at least `16` answer tokens when overlong prompts are truncated. Blank completions are dropped by default; pass `--allow-empty-completions` only if empty answers are intentional labels. Keep `--max-ce-loss-for-backward 0` for from-scratch LM training. The default 4-epoch preset gives a 232.5M model about 17.2 training tokens per parameter on a 1B-token dataset; `--epochs 10` is about 43 training tokens per parameter.
 
-#### v0.20.3 Stability Rescue Resume
+#### v0.20.4 Stability Rescue Resume
 
-If a long assistant run develops the pattern `loss up + ponder up + commit up`, or shows rare non-finite gradient skips in the RWKV channel-mix path, do not reset learned hierarchy weights first. Resume from a pre-spike or latest clean checkpoint with a cooler schedule, bounded drift, and the channel-mix key clamp:
+If a long assistant run develops the pattern `loss up + ponder up + commit up`, shows rare non-finite gradient skips in the RWKV channel-mix path, or produces poor chat coherence despite sane loss, do not reset learned hierarchy weights first. Resume from a pre-spike or latest clean checkpoint with a cooler schedule, bounded drift, channel-mix clamps, and inference-like LTM training:
 
 ```bash
 python hierarchos_cli.py train \
@@ -480,6 +504,7 @@ python hierarchos_cli.py train \
     --warmup-ratio 0.0 \
     --ltm-lr 2e-5 \
     --min-ltm-lr 1e-9 \
+    --ltm-training-mode read-only \
     --adaptive-ponder \
     --ponder-target-scale 0.65 \
     --ponder-loss-weight 0.003 \
@@ -630,7 +655,7 @@ python hierarchos_cli.py ckpt-2-inf \
 This creates a HuggingFace-style directory:
 ```
 my_inference_model/
-├── model.pt              # Clean model weights (~66% smaller than checkpoint)
+├── hierarchos.pt         # Clean canonical model weights (~66% smaller than checkpoint)
 ├── hierarchos_config.json # Model configuration
 ├── tokenizer.json         # Tokenizer files
 ├── vocab.json
@@ -827,7 +852,9 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.5 --top-
 | `--warmup-ratio`               | `train`, `finetune`                 | Fraction of optimizer updates used for LR warmup before cosine decay.                                                                    | `0.0`                   |
 | `--disable-lr-schedule`        | `train`, `finetune`                 | Use a fixed Learning Rate (`--starting-lr`) instead of cosine annealing.                                                                 | `False`                 |
 | `--ltm_lr`                     | `train`, `finetune`, `chat`         | Learning Rate for LTM "surprise" updates (or max LR for LTM schedule in chat).                                                         | `1e-3`                  |
-| `--assistant-recovery`         | `train`                             | Apply the v0.20 large-assistant SFT preset: Alpaca formatting, 4 epochs unless overridden, warmup+cosine LR, prompt/response weights `0.10/1.0`, `2.0x` first `32` response tokens, `16` reserved response tokens, `0.003` ponder weight, and `5000` memory-gate warmup steps. | `False`                 |
+| `--ltm-training-mode`          | `train`                             | LTM fast-memory training mode. `inner-update` keeps supervised gradient fast-memory writes; `read-only` carries ROSA/history state only and better matches normal chat inference. | `inner-update`          |
+| `--inference-like-ltm-training` | `train`                            | Shortcut for `--ltm-training-mode read-only`; recommended for assistant rescue/coherence runs.                                         | `False`                 |
+| `--assistant-recovery`         | `train`                             | Apply the v0.20.4 large-assistant SFT preset: Alpaca formatting, 4 epochs unless overridden, warmup+cosine LR, inference-like LTM training, prompt/response weights `0.10/1.0`, `2.0x` first `32` response tokens, `16` reserved response tokens, `0.003` ponder weight, and `5000` memory-gate warmup steps. | `False`                 |
 | `--mask-prompt-tokens`         | `train`, `finetune`                 | Legacy SFT behavior: exclude prompt/instruction/input tokens from CE. By default, prompt tokens are trained and can be downweighted.      | `False`                 |
 | `--allow-masked-active-labels` | `train`, `finetune`                 | Disable the fail-fast audit that rejects masked labels on real prompt/completion tokens when prompt-token training is active.             | `False`                 |
 | `--prompt-loss-weight`         | `train`, `finetune`                 | Per-token CE weight for prompt/instruction/input tokens when prompt tokens are trained.                                                  | `1.0`                   |
@@ -943,6 +970,12 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
   * **DirectML/ZLUDA communities** for enabling AMD GPU acceleration on Windows.
 
 ## Changelog
+
+### v0.20.4 (alpha)
+
+  * **Inference-Like LTM Training**: Adds `--ltm-training-mode read-only` and `--inference-like-ltm-training` so assistant SFT can carry ROSA/history state without supervised fast-memory writes that chat generation cannot reproduce.
+  * **Assistant Recovery Update**: `--assistant-recovery` now defaults to read-only LTM training unless explicitly overridden.
+  * **DeepEmbed No-Decay**: DeepEmbed identity gates are excluded from AdamW weight decay to avoid quietly weakening RWKV channel mixing over long runs.
 
 ### v0.20.3 (alpha)
 

@@ -12,6 +12,7 @@ import signal
 import traceback
 
 from hierarchos.utils.checkpoint import (
+    _infer_arch_flags_from_state_dict,
     _reject_unsupported_rwkv_state_dict,
     _resolve_weights_path,
     sanitize_model_state_dict,
@@ -1143,6 +1144,7 @@ _CONTINUATION_SUMMARY_KEYS = (
     "warmup_ratio",
     "ltm_lr",
     "min_ltm_lr",
+    "ltm_training_mode",
     "compile",
     "force_compile",
     "amp",
@@ -1226,19 +1228,19 @@ def _read_model_config_defaults(model_path):
         except Exception as exc:
             print(f"WARNING: Could not inspect checkpoint architecture from {resolved}: {exc}")
 
-    model_dir = resolved if os.path.isdir(resolved) else os.path.dirname(resolved)
-    for name in ("hierarchos_config.json", "config.json"):
-        candidate = os.path.join(model_dir, name)
-        if os.path.exists(candidate):
-            with open(candidate, "r", encoding="utf-8") as f:
-                return dict(json.load(f)), candidate
-
     if local_checkpoint is not None and isinstance(local_checkpoint, dict):
         if isinstance(local_checkpoint.get("config"), dict):
             config = dict(local_checkpoint["config"])
             if "completed_epoch" not in config and local_checkpoint.get("completed_epoch") is not None:
                 config["completed_epoch"] = local_checkpoint.get("completed_epoch")
             return config, local_checkpoint_path
+
+    model_dir = resolved if os.path.isdir(resolved) else os.path.dirname(resolved)
+    for name in ("hierarchos_config.json", "config.json"):
+        candidate = os.path.join(model_dir, name)
+        if os.path.exists(candidate):
+            with open(candidate, "r", encoding="utf-8") as f:
+                return dict(json.load(f)), candidate
 
     if os.path.isfile(resolved) and resolved.lower().endswith(".pt"):
         try:
@@ -1373,6 +1375,7 @@ def _apply_assistant_recovery_defaults(args, explicit_dests):
     _set_default_if_not_explicit(args, explicit_dests, "warmup_ratio", 0.03, applied)
     _set_default_if_not_explicit(args, explicit_dests, "ltm_lr", 3e-4, applied)
     _set_default_if_not_explicit(args, explicit_dests, "min_ltm_lr", 1e-5, applied)
+    _set_default_if_not_explicit(args, explicit_dests, "ltm_training_mode", "read-only", applied)
     _set_default_if_not_explicit(args, explicit_dests, "prompt_loss_weight", 0.10, applied)
     _set_default_if_not_explicit(args, explicit_dests, "response_loss_weight", 1.0, applied)
     _set_default_if_not_explicit(args, explicit_dests, "response_boundary_loss_weight", 2.0, applied)
@@ -1445,6 +1448,24 @@ def main():
     train_group.add_argument("--ltm-lr", "--ltm_lr", dest="ltm_lr", type=float, default=1e-3, help="Maximum LTM inner-update learning rate.")
     train_group.add_argument("--min-ltm-lr", "--min_ltm_lr", dest="min_ltm_lr", type=float, default=None, help="Minimum LTM LR for cosine annealing. Defaults to --min-lr.")
     train_group.add_argument("--disable-ltm-lr-schedule", "--disable_ltm_lr_schedule", dest="disable_ltm_lr_schedule", action="store_true", help="Keep LTM inner-update LR fixed at --ltm-lr.")
+    train_group.add_argument(
+        "--ltm-training-mode",
+        "--ltm_training_mode",
+        dest="ltm_training_mode",
+        choices=("inner-update", "read-only"),
+        default="inner-update",
+        help=(
+            "How training handles LTM fast memory across TBPTT chunks. "
+            "inner-update uses supervised gradient fast-memory writes; read-only carries ROSA/history state without writes, matching normal chat inference."
+        ),
+    )
+    train_group.add_argument(
+        "--inference-like-ltm-training",
+        dest="ltm_training_mode",
+        action="store_const",
+        const="read-only",
+        help="Shortcut for --ltm-training-mode read-only; recommended for assistant rescue/coherence runs.",
+    )
     train_group.add_argument("--rwkv-weight-decay", "--rwkv_weight_decay", dest="rwkv_weight_decay", type=float, default=0.1, help="AdamW decay for RWKV matrices/embeddings; norms/scalars use 0 decay.")
     train_group.add_argument("--ltm-score-grad-scale", "--ltm_score_grad_scale", type=float, default=1.0, help="Straight-through gradient scale for LTM query/key addressing. Set 0 to keep retrieval addressing frozen.")
     format_group = train_group.add_mutually_exclusive_group()
@@ -1987,15 +2008,13 @@ def main():
         
         # Extract and clean state dict
         state_dict = checkpoint.get('model_state_dict', checkpoint)
-        clean_state_dict = {}
-        for k, v in state_dict.items():
-            # Remove _orig_mod. prefix from compiled models
-            clean_key = k.replace('_orig_mod.', '')
-            clean_state_dict[clean_key] = v
+        clean_state_dict = sanitize_model_state_dict(state_dict, reset_transient_ltm=True)
+        _reject_unsupported_rwkv_state_dict(clean_state_dict, ckpt_path)
         
         # Extract config
-        config = checkpoint.get('config', {})
+        config = dict(checkpoint.get('config', {}))
         completed_epoch = checkpoint.get('completed_epoch', checkpoint.get('epoch', 'unknown'))
+        _infer_arch_flags_from_state_dict(config, clean_state_dict)
         
         # Handle tokenizer
         tokenizer_name = args.ckpt_tok_path or config.get('tokenizer_name', 'openai-community/gpt2')
@@ -2023,8 +2042,9 @@ def main():
         print(f"  Saving tokenizer files...")
         inf_tokenizer.save_pretrained(output_dir)
         
-        # Create inference-ready checkpoint
-        model_path = os.path.join(output_dir, "model.pt")
+        # Create inference-ready checkpoint. Use the same canonical filename as
+        # training export so chat cannot accidentally load an older sibling.
+        model_path = os.path.join(output_dir, "hierarchos.pt")
         inference_checkpoint = {
             'model_state_dict': clean_state_dict,
             'config': config,
@@ -2058,7 +2078,7 @@ def main():
         print(f"="*60)
         print(f"Input checkpoint: {input_size / 1e6:.2f} MB")
         print(f"Output directory: {output_dir}/")
-        print(f"  - model.pt:     {output_size / 1e6:.2f} MB  ({reduction:.1f}% reduction)")
+        print(f"  - hierarchos.pt: {output_size / 1e6:.2f} MB  ({reduction:.1f}% reduction)")
         print(f"  - Total size:   {total_output_size / 1e6:.2f} MB")
         print(f"  - Epoch:        {completed_epoch}")
         print(f"  - Tokenizer:    {tokenizer_name}")

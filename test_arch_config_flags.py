@@ -1,8 +1,18 @@
 import unittest
+import os
+import tempfile
 
 import torch
 
-from hierarchos.utils.checkpoint import _infer_arch_flags_from_state_dict, _reject_unsupported_rwkv_state_dict
+from hierarchos.models.quantized import (
+    detect_quantized_rwkv_format,
+    validate_quantized_rwkv_format,
+)
+from hierarchos.utils.checkpoint import (
+    _infer_arch_flags_from_state_dict,
+    _reject_unsupported_rwkv_state_dict,
+    _resolve_weights_path,
+)
 
 
 class ArchitectureConfigFlagTests(unittest.TestCase):
@@ -66,6 +76,33 @@ class ArchitectureConfigFlagTests(unittest.TestCase):
         self.assertEqual(config["rosa_max_context"], 128)
         self.assertEqual(config["rwkv_channel_mix_key_clamp"], 8.0)
         self.assertEqual(config["rwkv_channel_mix_deepembed_clamp"], 2.0)
+
+    def test_resolve_weights_prefers_newest_known_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_path = os.path.join(tmp, "hierarchos.pt")
+            new_path = os.path.join(tmp, "model.pt")
+            torch.save({"config": {}, "model_state_dict": {}}, old_path)
+            torch.save({"config": {}, "model_state_dict": {}}, new_path)
+            os.utime(old_path, (1000, 1000))
+            os.utime(new_path, (2000, 2000))
+
+            resolved, model_dir = _resolve_weights_path(tmp)
+
+        self.assertEqual(os.path.normcase(resolved), os.path.normcase(new_path))
+        self.assertEqual(os.path.normcase(model_dir), os.path.normcase(tmp))
+
+    def test_quantized_loader_rejects_v8_matrix_state_archive(self):
+        legacy_q = {"h_rnn.time_decay": object(), "h_rnn.time_mix_k": object()}
+        v8_q = {"h_rnn.x_r": object(), "h_rnn.r_k": object()}
+        mixed_q = {"h_rnn.time_decay": object(), "h_rnn.x_r": object()}
+
+        self.assertEqual(detect_quantized_rwkv_format(legacy_q), "legacy-scalar")
+        self.assertEqual(detect_quantized_rwkv_format(v8_q), "v8-matrix")
+        self.assertEqual(detect_quantized_rwkv_format(mixed_q), "mixed")
+        with self.assertRaisesRegex(ValueError, "Unsupported v8 matrix-state quantized model"):
+            validate_quantized_rwkv_format(v8_q, "v8.npz")
+        with self.assertRaisesRegex(ValueError, "Mixed legacy/v8"):
+            validate_quantized_rwkv_format(mixed_q, "mixed.npz")
 
 
 if __name__ == "__main__":

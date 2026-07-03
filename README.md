@@ -12,6 +12,8 @@
 
 **hierarchos/evaluation/lm_eval_wrapper.py** and **hierarchos_cli.py**: benchmark mode clears transient LTM working memory, suppresses Hebbian/passive LTM writes, and evaluates with checkpoint-sized TBPTT chunks so benchmark logits stay aligned with the static chat path.
 
+**Research report**: see [HIERARCHOS_FINDINGS_PAPER.md](HIERARCHOS_FINDINGS_PAPER.md) for the preliminary technical paper covering the 232M release, train/chat parity fixes, stability findings, local benchmark results, and proposed scaling plan.
+
 ## Previous v0.20.4 Notes: Inference-Like LTM Training
 
 **v0.20.4 focus**: assistant SFT and rescue runs can now train with inference-like LTM dynamics. `--ltm-training-mode read-only` carries ROSA/history state across TBPTT chunks but disables supervised gradient fast-memory writes, preventing the model from learning to depend on an LTM inner-update signal that normal chat generation does not receive. `--assistant-recovery` now defaults to this read-only mode unless explicitly overridden.

@@ -17,6 +17,7 @@ from hierarchos.utils.checkpoint import (
     _resolve_weights_path,
     sanitize_model_state_dict,
 )
+from hierarchos.inference.chat_state import clear_ltm_working_memory
 from hierarchos import (
     pick_device,
     set_threads,
@@ -1387,6 +1388,44 @@ def _apply_assistant_recovery_defaults(args, explicit_dests):
         print("INFO: Assistant recovery defaults applied: " + ", ".join(applied))
 
 
+def _apply_benchmark_preset_defaults(args, explicit_dests):
+    if args.mode != "benchmark":
+        return
+    preset = str(getattr(args, "benchmark_preset", "") or "").strip().lower()
+    if not preset:
+        return
+    if preset in ("ally", "handheld", "local"):
+        preset = "rog-ally"
+        args.benchmark_preset = preset
+    if preset != "rog-ally":
+        print(f"ERROR: Unknown benchmark preset: {args.benchmark_preset}")
+        sys.exit(1)
+
+    applied = []
+    if (
+        "benchmark_suite" not in explicit_dests
+        and "benchmark" not in explicit_dests
+        and "eval_tasks" not in explicit_dests
+        and not bool(getattr(args, "benchmark_all", False))
+        and not getattr(args, "benchmark_suite", None)
+        and not getattr(args, "benchmark", None)
+        and not getattr(args, "eval_tasks", None)
+    ):
+        args.benchmark_suite = ["rog-ally"]
+        applied.append("benchmark_suite=['rog-ally']")
+
+    _set_default_if_not_explicit(args, explicit_dests, "device", "cpu", applied)
+    _set_default_if_not_explicit(args, explicit_dests, "threads", min(8, max(1, os.cpu_count() or 8)), applied)
+    _set_default_if_not_explicit(args, explicit_dests, "eval_batch_size", 1, applied)
+    _set_default_if_not_explicit(args, explicit_dests, "eval_limit", 25, applied)
+    _set_default_if_not_explicit(args, explicit_dests, "max_new_tokens", 64, applied)
+    _set_default_if_not_explicit(args, explicit_dests, "benchmark_sequential", True, applied)
+    _set_default_if_not_explicit(args, explicit_dests, "benchmark_out_dir", "./benchmark_results/rog_ally", applied)
+
+    if applied:
+        print(f"INFO: Benchmark preset '{preset}' applied: " + ", ".join(applied))
+
+
 def main():
     parser = argparse.ArgumentParser(description="hierarchos: A Hybrid Memory-Reasoning Architecture")
     parser.add_argument("mode", type=str, choices=["train", "finetune", "chat", "benchmark", "quantize", "merge-lora", "ckpt-2-inf"], help="Operation mode.")
@@ -1646,6 +1685,8 @@ def main():
         help="Run every registered benchmark sequentially. Runnable lm-eval tasks are chained one at a time; external benchmarks are reported or run when their local path is provided.")
     eval_group.add_argument("--benchmark-sequential", action="store_true",
         help="Run selected lm-eval benchmarks one at a time and merge the scores into one final terminal report.")
+    eval_group.add_argument("--benchmark-preset", type=str, default=None, choices=["rog-ally", "ally", "handheld", "local"],
+        help="Apply bounded benchmark defaults for local hardware. 'rog-ally' uses CPU, batch=1, limit=25, sequential tasks, and the rog-ally suite unless tasks are explicit.")
     eval_group.add_argument("--benchmark-out-dir", type=str, default="./benchmark_results",
         help="Directory for post-training benchmark reports.")
     eval_group.add_argument("--benchmark-run-name", type=str, default=None,
@@ -1694,6 +1735,8 @@ def main():
     chat_group.add_argument("--surprise-threshold", type=float, default=1.0, help="Passive learning only writes when loss <= this threshold (default: 1.0; lower is stricter).")
     chat_group.add_argument("--chat-state-file", type=str, nargs="?", const="auto", default=None, help="Autosave a new tiny model-neutral hierarchical chat state .pt file. Pass no value for an auto path.")
     chat_group.add_argument("--resume-chat-from-state-file", type=str, default=None, help="Resume and autosave a tiny model-neutral hierarchical chat state .pt file.")
+    chat_group.add_argument("--carry-chat-state", action="store_true", default=False, help="Carry recurrent/hierarchical state across user turns. Default OFF for Alpaca train/chat parity; use Previous Context text for history instead.")
+    chat_group.add_argument("--chat-prefill-chunk-size", type=int, default=None, help="Chunk prompt prefill like TBPTT training. Default: checkpoint training_chunk_size; use 0 for one full prompt forward.")
     chat_group.add_argument("--chat-input-history-turns", type=int, default=4, help="For Alpaca chat, put this many previous turns in the ### Previous Context field (0 disables).")
     chat_group.add_argument("--chat-input-history-chars", type=int, default=3000, help="Character cap for Alpaca chat ### Previous Context text.")
     
@@ -1711,6 +1754,7 @@ def main():
     explicit_dests = _explicit_cli_dests(parser, normalized_argv)
     _hydrate_training_args_from_model_config(args, parser, explicit_dests)
     _apply_assistant_recovery_defaults(args, explicit_dests)
+    _apply_benchmark_preset_defaults(args, explicit_dests)
     _validate_resume_epoch_target(args)
 
     if args.mode == "benchmark" and args.list_benchmarks:
@@ -1881,6 +1925,8 @@ def main():
         print(f"Loading model for post-training benchmarks: {args.model_path}")
         try:
             model, _ = load_full_model_with_config(args.model_path, pt_device)
+            clear_ltm_working_memory(model)
+            model.suppress_hebbian = True
         except Exception as e:
             print(f"ERROR: Failed to load model for benchmark mode: {e}")
             sys.exit(1)

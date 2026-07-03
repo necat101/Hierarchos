@@ -47,6 +47,13 @@ class BenchmarkRegistryTests(unittest.TestCase):
         self.assertEqual(external, [])
         self.assertEqual(unknown, ["new_custom_task"])
 
+    def test_rog_ally_suite_is_bounded_to_light_runnable_tasks(self):
+        tasks, external, unknown = resolve_task_names(["rog-ally"], include_external=True)
+
+        self.assertEqual(tasks, ["arc_easy", "hellaswag", "truthfulqa_mc1"])
+        self.assertEqual(external, [])
+        self.assertEqual(unknown, [])
+
     def test_sequential_benchmark_chain_merges_scores(self):
         def fake_run_eval(**kwargs):
             task = kwargs["tasks"][0]

@@ -452,34 +452,68 @@ def generate_sample(model, tokenizer, prompt, device, max_new_tokens=100, temper
     h_state, l_state, p_ctx, t_ctx = None, None, None, None
     drift_state = None
     ltm_state = None
+    prefill_chunk_size = int(getattr(getattr(model, "config", None), "training_chunk_size", 0) or 0)
     total_tokens_generated = 0
 
     try:
         generated = tokens
-        for _ in range(max_new_tokens):
-            with torch.no_grad():
+        with torch.no_grad():
+            prefill_len = int(tokens.shape[1])
+            prefill_step = prefill_chunk_size if prefill_chunk_size > 0 else prefill_len
+            prefill_step = max(1, int(prefill_step))
+            logits = None
+            chunk_drift_state = None
+            for start in range(0, prefill_len, prefill_step):
+                end = min(start + prefill_step, prefill_len)
                 outputs = model(
-                    input_ids=tokens,
+                    input_ids=tokens[:, start:end],
                     h_state=h_state,
                     l_state=l_state,
                     prev_context=p_ctx,
                     target_context=t_ctx,
-                    drift_state=drift_state,
+                    drift_state=chunk_drift_state,
                     ltm_memory_state=ltm_state,
-                    global_pos_offset=total_tokens_generated,
+                    global_pos_offset=start,
                     suppress_hebbian=True,
                 )
-                logits = outputs['logits'][:, -1, :] / max(temperature, 1e-6)
-                next_token = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
-                generated = torch.cat([generated, next_token], dim=1)
-                total_tokens_generated += int(tokens.shape[1])
                 h_state, l_state = outputs['h_state'], outputs['l_state']
                 p_ctx, t_ctx = outputs['prev_context'], outputs['target_context']
                 drift_state = outputs.get('drift_state', drift_state)
                 ltm_state = outputs.get('ltm_memory_state')
-                tokens = next_token
+                chunk_drift_state = drift_state
+                logits = outputs['logits'][:, -1, :]
+            total_tokens_generated = prefill_len
+
+            for _ in range(max_new_tokens):
+                next_token_logits = logits / max(temperature, 1e-6)
+                next_token = torch.multinomial(F.softmax(next_token_logits, dim=-1), num_samples=1)
+                generated = torch.cat([generated, next_token], dim=1)
                 if next_token.item() == tokenizer.eos_token_id:
                     break
+
+                outputs = model(
+                    input_ids=next_token,
+                    h_state=h_state,
+                    l_state=l_state,
+                    prev_context=p_ctx,
+                    target_context=t_ctx,
+                    drift_state=(
+                        drift_state
+                        if prefill_chunk_size > 0
+                        and total_tokens_generated > 0
+                        and total_tokens_generated % prefill_chunk_size == 0
+                        else None
+                    ),
+                    ltm_memory_state=ltm_state,
+                    global_pos_offset=total_tokens_generated,
+                    suppress_hebbian=True,
+                )
+                total_tokens_generated += 1
+                h_state, l_state = outputs['h_state'], outputs['l_state']
+                p_ctx, t_ctx = outputs['prev_context'], outputs['target_context']
+                drift_state = outputs.get('drift_state', drift_state)
+                ltm_state = outputs.get('ltm_memory_state')
+                logits = outputs['logits'][:, -1, :]
     finally:
         model.suppress_hebbian = previous_suppress_hebbian
 
@@ -641,6 +675,45 @@ def chat(args, device, tokenizer):
         dummy_optimizer = torch.optim.SGD([dummy_param_amp], lr=1.0)
         print("INFO: AMP ENABLED for online learning.")
 
+    def _set_online_update_warmup_complete(update_model):
+        """Match exported late-training checkpoints when computing LTM gradients."""
+        setter = getattr(update_model, "set_training_step", None)
+        if callable(setter):
+            setter(int(getattr(config, "memory_gate_warmup_steps", 0) or 0))
+
+    def _merge_ltm_state_into_model_state(update_model, state) -> bool:
+        """Copy active chat fast-memory state into model.ltm before saving weights."""
+        if (
+            update_model is None
+            or state is None
+            or not hasattr(update_model, "ltm")
+            or not isinstance(state, (tuple, list))
+            or len(state) < 2
+        ):
+            return False
+        ltm = update_model.ltm
+
+        def _copy_tensor_attr(attr_name, value):
+            target = getattr(ltm, attr_name, None)
+            if not torch.is_tensor(target) or not torch.is_tensor(value):
+                return False
+            src = value.detach()
+            if src.dim() == target.dim() + 1 and src.shape[0] == 1:
+                src = src.squeeze(0)
+            if tuple(src.shape) != tuple(target.shape):
+                return False
+            with torch.no_grad():
+                target.copy_(src.to(device=target.device, dtype=target.dtype))
+            return True
+
+        copied = _copy_tensor_attr("fast_vals", state[0])
+        copied = _copy_tensor_attr("_mom_vals", state[1]) or copied
+        if len(state) >= 5:
+            copied = _copy_tensor_attr("timestamps", state[4]) or copied
+        if len(state) >= 6:
+            copied = _copy_tensor_attr("sources", state[5]) or copied
+        return copied
+
     # =================================================================
     # 4. LOCAL HELPER FOR LTM UPDATE
     # =================================================================
@@ -658,6 +731,7 @@ def chat(args, device, tokenizer):
         target_device = device
 
         update_model.train()
+        _set_online_update_warmup_complete(update_model)
         with torch.enable_grad():
             if label_ids_tensor is None:
                 full_sequence = input_ids_tensor.unsqueeze(0)
@@ -997,6 +1071,14 @@ def chat(args, device, tokenizer):
         alpaca_chat_format = bool(getattr(args, "alpaca", False) or getattr(config, "alpaca", False))
         chat_input_history_turns = int(getattr(args, "chat_input_history_turns", 4) or 0)
         chat_input_history_chars = int(getattr(args, "chat_input_history_chars", 3000) or 0)
+        carry_chat_state = bool(getattr(args, "carry_chat_state", False))
+        requested_prefill_chunk = getattr(args, "chat_prefill_chunk_size", None)
+        if requested_prefill_chunk is None:
+            chat_prefill_chunk_size = int(getattr(config, "training_chunk_size", 0) or 0)
+        else:
+            chat_prefill_chunk_size = int(requested_prefill_chunk or 0)
+        if chat_prefill_chunk_size < 0:
+            chat_prefill_chunk_size = 0
         chat_turn_history = []
         if alpaca_chat_format:
             if chat_input_history_turns > 0 and chat_input_history_chars > 0:
@@ -1008,6 +1090,14 @@ def chat(args, device, tokenizer):
                 print("Chat prompt format: Alpaca ### Instruction/Response")
         else:
             print("Chat prompt format: User/Assistant")
+        if carry_chat_state:
+            print("Chat state carry: ON (experimental; recurrent state persists across user turns).")
+        else:
+            print("Chat state carry: OFF (train-parity mode; use Previous Context text for turn history).")
+        if chat_prefill_chunk_size > 0:
+            print(f"Chat prefill chunking: {chat_prefill_chunk_size} tokens (TBPTT train-parity mode).")
+        else:
+            print("Chat prefill chunking: OFF (single full prompt forward).")
 
         # =================================================================
         # 6. STATE INITIALIZATION
@@ -1180,7 +1270,11 @@ def chat(args, device, tokenizer):
                 if len(parts) > 1:
                     print("Usage: /settings [temperature <0.00-1.00 in 0.05 increments>]")
                     continue
-                print(f"Current Settings:\n  Temperature: {args.temperature:.2f}\n  Top-K: {args.top_k}\n  Top-P: {args.top_p}")
+                print(
+                    f"Current Settings:\n  Temperature: {args.temperature:.2f}\n  Top-K: {args.top_k}\n"
+                    f"  Top-P: {args.top_p}\n  Carry Chat State: {carry_chat_state}\n"
+                    f"  Prefill Chunk Size: {chat_prefill_chunk_size or 'off'}"
+                )
                 if float(getattr(args, "entropy_stop_threshold", 0.0) or 0.0) > 0:
                     print(
                         f"  Entropy Stop: >= {args.entropy_stop_threshold:.2f} "
@@ -1231,6 +1325,7 @@ def chat(args, device, tokenizer):
                 print(f"  LTM Learning: {'ACTIVE' if learning_enabled else 'OFF'}")
                 print(f"  Checkpoint LTM Training Mode: {trained_ltm_mode}")
                 print(f"  Chat LTM Runtime: read-only during normal prefill/generation")
+                print(f"  Chat Prefill Chunk Size: {chat_prefill_chunk_size or 'off'}")
                 print(f"  Chat State File: {chat_state_path or '(disabled)'}")
                 continue
 
@@ -1310,6 +1405,19 @@ def chat(args, device, tokenizer):
             # =================================================================
             # B. GENERATION LOGIC
             # =================================================================
+            if not carry_chat_state:
+                # Alpaca SFT samples are independent. For chat/train parity, each
+                # user turn should prefill from fresh recurrent/context/ROSA state;
+                # conversation memory enters through the formatted Previous Context
+                # text instead of hidden state carried from the previous answer.
+                h_state = _new_h_state()
+                l_state = _new_l_state()
+                prev_context = torch.zeros(1, context_dim, device=rnn_device)
+                target_context = torch.zeros(1, context_dim, device=rnn_device)
+                drift_state = torch.zeros(1, context_dim, device=rnn_device)
+                ltm_state = None
+                total_tokens_generated = 0
+
             prompt_format = wrap_for_hierarchos(
                 prompt,
                 system_prompt=system_prompt,
@@ -1337,51 +1445,66 @@ def chat(args, device, tokenizer):
             model.suppress_hebbian = True
             with torch.no_grad():
                 model_input_ids = prompt_ids.cpu() if is_quantized else prompt_ids.to(device)
-                
-                if is_quantized:
-                    outputs = model(
-                        input_ids=model_input_ids,
-                        h_state=h_state.cpu(),
-                        l_state=l_state.cpu(),
-                        prev_context=prev_context.cpu(),
-                        target_context=target_context.cpu(),
-                        drift_state=drift_state.cpu(),
-                        ltm_memory_state=ltm_state,
-                        global_pos_offset=total_tokens_generated,
-                        device=inference_device,
-                        min_timestamp=min_ts_filter,
-                        source_filter=source_id_filter
-                    )
-                    h_state = outputs['h_state']
-                    l_state = outputs['l_state']
-                    prev_context = outputs['prev_context']
-                    target_context = outputs['target_context']
-                    drift_state = outputs.get('drift_state', drift_state)
-                    ltm_state = outputs.get('ltm_memory_state', ltm_state)
-                else:
-                    outputs = model(
-                        model_input_ids.to(device),
-                        h_state=h_state,
-                        l_state=l_state,
-                        prev_context=prev_context,
-                        target_context=target_context,
-                        drift_state=drift_state,
-                        ltm_memory_state=ltm_state,
-                        global_pos_offset=total_tokens_generated,
-                        min_timestamp=min_ts_filter,
-                        source_filter=source_id_filter
-                    )
-                    if outputs.get('h_state') is not None:
+                prefill_len = int(model_input_ids.shape[1])
+                prefill_step = chat_prefill_chunk_size if chat_prefill_chunk_size > 0 else prefill_len
+                prefill_step = max(1, int(prefill_step))
+                outputs = None
+                chunk_drift_state = None
+
+                for prefill_start in range(0, prefill_len, prefill_step):
+                    prefill_end = min(prefill_start + prefill_step, prefill_len)
+                    chunk_input_ids = model_input_ids[:, prefill_start:prefill_end]
+
+                    if is_quantized:
+                        outputs = model(
+                            input_ids=chunk_input_ids,
+                            h_state=h_state.cpu() if h_state is not None else None,
+                            l_state=l_state.cpu() if l_state is not None else None,
+                            prev_context=prev_context.cpu() if prev_context is not None else None,
+                            target_context=target_context.cpu() if target_context is not None else None,
+                            # Epoch-13 checkpoints trained with drift carried only
+                            # at TBPTT prompt boundaries, not every generated token.
+                            drift_state=chunk_drift_state.cpu() if torch.is_tensor(chunk_drift_state) else chunk_drift_state,
+                            ltm_memory_state=ltm_state,
+                            global_pos_offset=total_tokens_generated + prefill_start,
+                            device=inference_device,
+                            min_timestamp=min_ts_filter,
+                            source_filter=source_id_filter
+                        )
                         h_state = outputs['h_state']
-                    if outputs.get('l_state') is not None:
                         l_state = outputs['l_state']
-                    if outputs.get('drift_state') is not None:
-                        drift_state = outputs['drift_state']
-                    if outputs.get('prev_context') is not None:
                         prev_context = outputs['prev_context']
-                    if outputs.get('target_context') is not None:
                         target_context = outputs['target_context']
-                    ltm_state = outputs.get('ltm_memory_state', ltm_state)
+                        drift_state = outputs.get('drift_state', drift_state)
+                        ltm_state = outputs.get('ltm_memory_state', ltm_state)
+                    else:
+                        outputs = model(
+                            chunk_input_ids.to(device),
+                            h_state=h_state,
+                            l_state=l_state,
+                            prev_context=prev_context,
+                            target_context=target_context,
+                            # Epoch-13 checkpoints trained with drift carried only
+                            # at TBPTT prompt boundaries, not every generated token.
+                            drift_state=chunk_drift_state,
+                            ltm_memory_state=ltm_state,
+                            global_pos_offset=total_tokens_generated + prefill_start,
+                            min_timestamp=min_ts_filter,
+                            source_filter=source_id_filter
+                        )
+                        if outputs.get('h_state') is not None:
+                            h_state = outputs['h_state']
+                        if outputs.get('l_state') is not None:
+                            l_state = outputs['l_state']
+                        if outputs.get('drift_state') is not None:
+                            drift_state = outputs['drift_state']
+                        if outputs.get('prev_context') is not None:
+                            prev_context = outputs['prev_context']
+                        if outputs.get('target_context') is not None:
+                            target_context = outputs['target_context']
+                        ltm_state = outputs.get('ltm_memory_state', ltm_state)
+
+                    chunk_drift_state = drift_state
 
                 logits = outputs["logits"].to(device)
                 next_token_logits = logits[:, -1, :]
@@ -1446,6 +1569,13 @@ def chat(args, device, tokenizer):
                             break
 
                         model_input_ids = current_ids.cpu() if is_quantized else current_ids.to(device)
+                        generation_drift_state = None
+                        if (
+                            chat_prefill_chunk_size > 0
+                            and total_tokens_generated > 0
+                            and total_tokens_generated % chat_prefill_chunk_size == 0
+                        ):
+                            generation_drift_state = drift_state
 
                         if is_quantized:
                             outputs = model(
@@ -1454,7 +1584,9 @@ def chat(args, device, tokenizer):
                                 l_state=l_state.cpu(),
                                 prev_context=prev_context.cpu(),
                                 target_context=target_context.cpu(),
-                                drift_state=drift_state.cpu(),
+                                # Match epoch-13 TBPTT: drift is fed only when the
+                                # current absolute position starts a new chunk.
+                                drift_state=generation_drift_state.cpu() if torch.is_tensor(generation_drift_state) else generation_drift_state,
                                 ltm_memory_state=ltm_state,
                                 global_pos_offset=total_tokens_generated,
                                 device=inference_device,
@@ -1474,7 +1606,9 @@ def chat(args, device, tokenizer):
                                 l_state=l_state,
                                 prev_context=prev_context,
                                 target_context=target_context,
-                                drift_state=drift_state,
+                                # Match epoch-13 TBPTT: drift is fed only when the
+                                # current absolute position starts a new chunk.
+                                drift_state=generation_drift_state,
                                 ltm_memory_state=ltm_state,
                                 global_pos_offset=total_tokens_generated,
                                 min_timestamp=min_ts_filter,
@@ -1668,6 +1802,8 @@ def chat(args, device, tokenizer):
                             print(f"\nSaving updated model to {args.model_path}...")
                             output_weights_path = os.path.join(args.model_path, MODEL_WEIGHTS_NAME)
                             try:
+                                if _merge_ltm_state_into_model_state(model, ltm_state):
+                                    print("Merged active chat LTM state into model weights.")
                                 torch.save({
                                     'model_state_dict': model.state_dict(),
                                     'config': dict(model.config)

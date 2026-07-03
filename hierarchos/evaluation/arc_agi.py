@@ -163,16 +163,35 @@ def generate_text(
     target_context = None
     drift_state = None
     ltm_state = None
+    prefill_chunk_size = int(getattr(getattr(model, "config", None), "training_chunk_size", 0) or 0)
+    total_tokens_seen = 0
 
     model.eval()
     with torch.no_grad():
-        outputs = model(input_ids=input_ids)
-        h_state = outputs.get("h_state")
-        l_state = outputs.get("l_state")
-        prev_context = outputs.get("prev_context")
-        target_context = outputs.get("target_context")
-        drift_state = outputs.get("drift_state")
-        ltm_state = outputs.get("ltm_memory_state")
+        prefill_step = prefill_chunk_size if prefill_chunk_size > 0 else input_ids.shape[1]
+        prefill_step = max(1, int(prefill_step))
+        chunk_drift_state = None
+        outputs = None
+        for start in range(0, input_ids.shape[1], prefill_step):
+            end = min(start + prefill_step, input_ids.shape[1])
+            outputs = model(
+                input_ids=input_ids[:, start:end],
+                h_state=h_state,
+                l_state=l_state,
+                prev_context=prev_context,
+                target_context=target_context,
+                drift_state=chunk_drift_state,
+                ltm_memory_state=ltm_state,
+                global_pos_offset=start,
+            )
+            h_state = outputs.get("h_state")
+            l_state = outputs.get("l_state")
+            prev_context = outputs.get("prev_context")
+            target_context = outputs.get("target_context")
+            drift_state = outputs.get("drift_state")
+            ltm_state = outputs.get("ltm_memory_state")
+            chunk_drift_state = drift_state
+        total_tokens_seen = len(context)
         logits = outputs["logits"][0, -1, :]
 
         for step in range(max_new_tokens):
@@ -188,16 +207,25 @@ def generate_text(
                 break
 
             next_input = next_token.reshape(1, 1).to(device)
+            generation_drift_state = None
+            if (
+                prefill_chunk_size > 0
+                and total_tokens_seen > 0
+                and total_tokens_seen % prefill_chunk_size == 0
+            ):
+                generation_drift_state = drift_state
             outputs = model(
                 input_ids=next_input,
                 h_state=h_state,
                 l_state=l_state,
                 prev_context=prev_context,
                 target_context=target_context,
-                drift_state=drift_state,
+                # Epoch-13 TBPTT parity: drift is fed only at chunk boundaries.
+                drift_state=generation_drift_state,
                 ltm_memory_state=ltm_state,
-                global_pos_offset=len(context) + step,
+                global_pos_offset=total_tokens_seen,
             )
+            total_tokens_seen += 1
             h_state = outputs.get("h_state")
             l_state = outputs.get("l_state")
             prev_context = outputs.get("prev_context")

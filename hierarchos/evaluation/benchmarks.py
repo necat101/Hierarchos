@@ -429,6 +429,7 @@ BENCHMARKS: Dict[str, BenchmarkSpec] = {spec.key: spec for spec in _BENCHMARKS}
 
 SUITES: Dict[str, Tuple[str, ...]] = {
     "smoke": ("hellaswag", "arc_challenge", "truthfulqa_mc1"),
+    "rog-ally": ("arc_easy", "hellaswag", "truthfulqa_mc1"),
     "frontier-text": (
         "mmlu_pro",
         "gpqa_diamond",

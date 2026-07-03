@@ -1,6 +1,18 @@
 -----
 
-# Hierarchos v0.20.4 (alpha): Inference-Like LTM Training
+# Hierarchos v0.20.5 (alpha): KortexHOS Release Profile + Local Benchmark Parity
+
+**v0.20.5 focus**: the current KortexHOS/Hierarchos assistant release path is documented around the settings that produced coherent full-precision chat and stable local benchmark checks. Chat, lm-eval benchmarking, and TBPTT recurrence now use aligned chunk/drift behavior, so local CPU benchmark runs can be used as a cheap sanity check before spending more cloud compute.
+
+**Recommended release chat profile**: for Alpaca-trained assistant checkpoints, start with full precision, static chat state, no passive LTM writes, no previous-turn input history, and conservative sampling: `--temperature 0.4 --top-k 40 --top-p 0.9 --repetition-penalty 1.15 --max-new-tokens 256 --no-passive-learning --chat-input-history-turns 0`.
+
+**ROG Ally / local benchmark preset**: `--benchmark-preset rog-ally` applies bounded local defaults: CPU, batch size `1`, sequential tasks, `max_new_tokens=64`, `eval_limit=25` unless overridden, output under `benchmark_results/rog_ally`, and the light suite `arc_easy`, `hellaswag`, `truthfulqa_mc1`.
+
+**Current release smoke result**: on the bounded ROG Ally preset with `--eval-limit 100`, the current checkpoint reported `arc_easy acc=0.3600`, `hellaswag acc=0.3400 / acc_norm=0.3700`, and `truthfulqa_mc1 acc=0.2200`. These are local sanity metrics, not leaderboard claims, but they show the model is not collapsed and that HellaSwag/ARC signal is measurable on consumer hardware.
+
+**hierarchos/evaluation/lm_eval_wrapper.py** and **hierarchos_cli.py**: benchmark mode clears transient LTM working memory, suppresses Hebbian/passive LTM writes, and evaluates with checkpoint-sized TBPTT chunks so benchmark logits stay aligned with the static chat path.
+
+## Previous v0.20.4 Notes: Inference-Like LTM Training
 
 **v0.20.4 focus**: assistant SFT and rescue runs can now train with inference-like LTM dynamics. `--ltm-training-mode read-only` carries ROSA/history state across TBPTT chunks but disables supervised gradient fast-memory writes, preventing the model from learning to depend on an LTM inner-update signal that normal chat generation does not receive. `--assistant-recovery` now defaults to this read-only mode unless explicitly overridden.
 
@@ -70,7 +82,16 @@ A novel AI architecture that synergistically integrates Google's Titans memory s
 
 -----
 
-### New in v0.20.4: Inference-Like LTM Training
+### New in v0.20.5: KortexHOS Release Profile + ROG Ally Benchmarking
+
+#### Coherent Full-Precision Assistant Profile
+- **Best-Known Chat Parameters**: use `--temperature 0.4 --top-k 40 --top-p 0.9 --repetition-penalty 1.15 --max-new-tokens 256 --no-passive-learning --chat-input-history-turns 0` for first-pass release testing of Alpaca-trained checkpoints.
+- **Static Eval First**: passive learning and chat history are useful experiments, but the release-quality baseline should be static. This keeps chat aligned with the benchmark path and avoids prompt-history/LTM pollution while judging core weights.
+- **TBPTT Drift Parity**: chat generation uses recurrent state continuity without per-token drift reseeding. Benchmark evaluation uses the same checkpoint-sized chunking contract so local benchmark numbers reflect the model path used in clean chat.
+- **ROG Ally Preset**: `--benchmark-preset rog-ally` runs a bounded consumer-hardware sanity suite on CPU with batch size `1` and sequential tasks. Use `--eval-limit 100` when you want a less noisy local read.
+- **Example Local Scores**: current release smoke test at `--eval-limit 100`: ARC Easy `0.3600`, HellaSwag `0.3400` raw / `0.3700` normalized, TruthfulQA MC1 `0.2200`.
+
+### Previous v0.20.4: Inference-Like LTM Training
 
 #### Training/Chat Dynamics Alignment
 - **Read-Only LTM Training Mode**: `--ltm-training-mode read-only` carries recurrent state and ROSA token history across TBPTT chunks but skips supervised LTM fast-memory writes. This better matches normal chat inference, where generation does not receive label-gradient inner updates.
@@ -232,7 +253,7 @@ A powerful, data-efficient, and deep reasoning engine. Its dual-module design (a
   * ⚙️ **Adaptive CPU/CUDA LTM Math**: Keeps CPU-friendly dense LTM math on CPU while automatically using GPU-friendly gather/scatter retrieval and update paths on CUDA.
   * ⚡ **CUDA Datacenter Ready**: Auto-enables AMP (bfloat16 on Ampere+), TF32 matmul, cuDNN benchmark, torch.compile, non-blocking transfers, CUDA pinned memory, and bounded DataLoader prefetch — zero configuration needed.
   * 🪟 **Windows GUI Bundle**: Build a portable GUI release with `Hierarchos.exe` and a bundled backend for normal inference without requiring users to clone the repo.
-  * 📊 **Integrated Benchmarking**: Optional support for `lm-evaluation-harness`. Track model accuracy on standard benchmarks (HellaSwag, ARC, etc.) during or after training with `--eval-tasks`.
+  * 📊 **Integrated Benchmarking**: Optional support for `lm-evaluation-harness`. Track model accuracy on standard benchmarks (HellaSwag, ARC, etc.) during or after training with `--eval-tasks`, or use `--benchmark-preset rog-ally` for a bounded local CPU smoke test.
   * 🎮 **AMD GPU Support (DirectML/ZLUDA)**: Train on AMD Radeon GPUs using DirectML backend on Windows. Opt-in via `--device dml` with automatic compatibility handling and optimized fallbacks.
   * 🎓 **Proper Temporal Learning**: Configurable truncated BPTT (`--detach-every-n-steps`) enables learning across multiple timesteps while managing memory. Default 32-step gradients flow allows the model to **learn temporal dependencies** effectively.
   * 🔗 **End-to-End Gradient Flow**: All architectural components (Manager, Worker, LTM) receive proper gradients during training. No more detachment-induced coherence problems or NaN errors.
@@ -574,6 +595,22 @@ python hierarchos_cli.py chat --model-path "./my_model_merged_squad"
 
 > ⚠️ **Important for Alpaca-Trained Models:** If you trained on instruction datasets like Alpaca, your model expects **instruction-formatted prompts**, not casual conversation. See "Using Your Trained Model" section below.
 
+**Recommended KortexHOS / Alpaca Assistant Release Profile:**
+
+```bash
+python hierarchos_cli.py chat \
+    --model-path "./chatHRM" \
+    --temperature 0.4 \
+    --top-k 40 \
+    --top-p 0.9 \
+    --repetition-penalty 1.15 \
+    --max-new-tokens 256 \
+    --no-passive-learning \
+    --chat-input-history-turns 0
+```
+
+Use this profile as the static coherence baseline before enabling chat history or passive learning. It keeps inference close to the training/benchmark path: no passive LTM writes, no previous-turn text injected into the Alpaca `### Input:` field, and the checkpoint's saved TBPTT chunk size used for prompt prefill. Leave recurrent chat-state carry disabled unless you are intentionally testing multi-turn stateful behavior.
+
 **Quantized *(Requires Compiled Kernel)*:**
 
 ```bash
@@ -686,6 +723,24 @@ Run standardized LLM benchmarks on your model. Requires `pip install lm-eval` (a
 python hierarchos_cli.py benchmark --list-benchmarks
 ```
 
+**ROG Ally / local release sanity check:**
+```bash
+python hierarchos_cli.py benchmark \
+    --model-path "./chatHRM" \
+    --benchmark-preset rog-ally \
+    --eval-limit 100
+```
+
+`--benchmark-preset rog-ally` is the recommended consumer-hardware smoke test before renting more cloud time. It uses CPU, batch size `1`, sequential execution, `max_new_tokens=64`, the light `arc_easy` / `hellaswag` / `truthfulqa_mc1` suite, and writes artifacts under `benchmark_results/rog_ally`. Without an explicit `--eval-limit`, the preset uses `25` samples per task for a quick run; `100` is a better local confidence check on a ROG Ally.
+
+Current KortexHOS release smoke result at `--eval-limit 100`:
+
+```text
+arc_easy:     acc=0.3600, acc_norm=0.3200
+hellaswag:    acc=0.3400, acc_norm=0.3700
+truthfulqa:   acc=0.2200
+```
+
 **Post-training frontier text suite:**
 ```bash
 python hierarchos_cli.py benchmark \
@@ -792,15 +847,17 @@ For models trained with `--alpaca`, the training formatter uses this prompt stri
 
 Adjust generation quality with:
 ```bash
-python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.5 --top-k 40 --top-p 0.9 --repetition-penalty 1.2
+python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.4 --top-k 40 --top-p 0.9 --repetition-penalty 1.15 --no-passive-learning --chat-input-history-turns 0
 ```
 
 | Parameter | Effect | Recommended |
 |-----------|--------|-------------|
-| `--temperature` | Lower = more focused, higher = more creative | 0.5-0.7 |
+| `--temperature` | Lower = more focused, higher = more creative | 0.4 for release checks, 0.5-0.7 for more variety |
 | `--top-k` | Limit vocab to top K tokens | 40 |
 | `--top-p` | Nucleus sampling threshold | 0.9 |
-| `--repetition-penalty` | Penalize repeated tokens (1.0=off, >1.0=stronger) | 1.2 |
+| `--repetition-penalty` | Penalize repeated tokens (1.0=off, >1.0=stronger) | 1.15 for KortexHOS release checks; 1.2 if repetition appears |
+| `--no-passive-learning` | Disables passive chat LTM writes | Recommended for baseline coherence/benchmark parity |
+| `--chat-input-history-turns 0` | Disables previous-turn injection into Alpaca `### Input:` | Recommended for first-turn and release-quality checks |
 
 -----
 
@@ -897,6 +954,13 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.5 --top-
 | `--static-ltm-lr`              | `chat`                              | Disable cosine annealing for chat LTM updates, use fixed `--ltm_lr`.                                                                     | `False`                 |
 | `--ltm-schedule-steps`         | `chat`                              | Number of chat updates per LTM LR cosine cycle.                                                                                          | `100`                   |
 | `--ltm-schedule-min-lr`        | `chat`                              | Minimum LR for chat LTM cosine schedule.                                                                                                 | `1e-5`                  |
+| **Benchmarking** |                                     |                                                                                                                                          |                         |
+| `--benchmark-preset`           | `benchmark`                         | Bounded local benchmark profile. `rog-ally`/`ally`/`handheld`/`local` applies CPU, batch `1`, sequential execution, `eval_limit=25`, `max_new_tokens=64`, and the `rog-ally` suite unless tasks are explicit. | `None`                  |
+| `--benchmark-suite`            | `benchmark`                         | Named benchmark suite to run, such as `rog-ally`, `smoke`, or `frontier-text`.                                                            | `None`                  |
+| `--benchmark`                  | `benchmark`                         | Explicit benchmark task key(s) to run instead of a suite.                                                                                | `None`                  |
+| `--benchmark-all`              | `benchmark`                         | Run every registered runnable benchmark sequentially.                                                                                    | `False`                 |
+| `--eval-limit`                 | `train`, `benchmark`                | Limit eval samples per task. Use `100` for the recommended ROG Ally confidence check, or omit with `--benchmark-preset rog-ally` for a faster 25-sample smoke run. | `None`                  |
+| `--eval-batch-size`            | `train`, `benchmark`                | Evaluation batch size. Use `1` on consumer/handheld hardware.                                                                            | `1`                     |
 | **Architecture (Train)** |                                     | *(Used only if starting train from scratch)* |                         |
 | `--context_dim`                | `train`                             | Core embedding dimension. The default 448 keeps full RWKV matrix-state heads at 64-wide geometry and lands near 233M params with GPT-2 vocab + DeepEmbed/ROSA. | `448`                   |
 | `--persistent_dim`             | `train`                             | Dimension of the fixed Persistent Memory.                                                                                                | `128`                   |
@@ -970,6 +1034,13 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
   * **DirectML/ZLUDA communities** for enabling AMD GPU acceleration on Windows.
 
 ## Changelog
+
+### v0.20.5 (alpha)
+
+  * **KortexHOS Release Profile**: Documents the best-known static full-precision chat settings for Alpaca assistant checkpoints: `temperature=0.4`, `top_k=40`, `top_p=0.9`, `repetition_penalty=1.15`, no passive learning, and zero injected previous-turn history.
+  * **ROG Ally Benchmark Preset**: Adds `--benchmark-preset rog-ally` documentation for bounded local CPU evaluation with ARC Easy, HellaSwag, and TruthfulQA MC1.
+  * **Benchmark/Chat Parity**: Notes that benchmark mode clears transient LTM state, suppresses Hebbian writes, and uses checkpoint-sized TBPTT chunking so local benchmark logits stay aligned with clean chat inference.
+  * **Release Smoke Scores**: Records the current local `--eval-limit 100` sanity result: ARC Easy `0.3600`, HellaSwag `0.3400` raw / `0.3700` normalized, TruthfulQA MC1 `0.2200`.
 
 ### v0.20.4 (alpha)
 

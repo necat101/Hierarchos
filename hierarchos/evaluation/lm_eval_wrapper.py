@@ -12,6 +12,7 @@ from tqdm import tqdm
 try:
     from lm_eval.api.model import LM
     from lm_eval.api.instance import Instance
+    from lm_eval.utils import get_rolling_token_windows, make_disjoint_window
     _HAS_LM_EVAL = True
 except ImportError:
     _HAS_LM_EVAL = False
@@ -103,6 +104,41 @@ class HierarchosLM(LM):
     def tok_decode(self, tokens: List[int]) -> str:
         """Decode token ids to string."""
         return self.tokenizer.decode(tokens, skip_special_tokens=True)
+
+    def _encode_pair(self, context: str, continuation: str) -> Tuple[List[int], List[int]]:
+        """Encode jointly so GPT-style BPE boundaries match the concatenated text."""
+        if not context:
+            continuation_enc = self.tok_encode(continuation)
+            if not continuation_enc:
+                return [self.eot_token_id], []
+            if continuation_enc[0] == self.eot_token_id:
+                return continuation_enc[:1], continuation_enc[1:]
+            return [self.eot_token_id], continuation_enc
+
+        trailing_spaces = len(context) - len(context.rstrip())
+        if trailing_spaces:
+            continuation = context[-trailing_spaces:] + continuation
+            context = context[:-trailing_spaces]
+
+        full_enc = self.tok_encode(context + continuation)
+        context_enc = self.tok_encode(context)
+        return context_enc, full_enc[len(context_enc):]
+
+    def _truncate_scoring_pair(
+        self,
+        context_enc: List[int],
+        continuation_enc: List[int],
+    ) -> Tuple[List[int], List[int]]:
+        """Keep at least one conditioning token and the newest scoreable targets."""
+        if not continuation_enc:
+            return context_enc[-self.max_length:], []
+        # A causal input needs context + continuation[:-1], so a one-token
+        # context can score max_length continuation tokens.
+        max_targets = max(0, self.max_length)
+        continuation_enc = continuation_enc[-max_targets:] if max_targets else []
+        context_budget = max(1, self.max_length - len(continuation_enc) + 1)
+        context_enc = context_enc[-context_budget:] or [self.eot_token_id]
+        return context_enc, continuation_enc
     
     def _model_call(self, input_ids: torch.Tensor) -> torch.Tensor:
         """
@@ -166,65 +202,63 @@ class HierarchosLM(LM):
         Returns:
             List of (log_prob, is_greedy) tuples
         """
-        results = []
+        results = [None] * len(requests)
         
         # Process in batches
         for i in tqdm(range(0, len(requests), self.batch_size), 
                       desc="loglikelihood", disable=len(requests) < 10):
             batch_requests = requests[i:i + self.batch_size]
             
-            batch_results = []
-            for req in batch_requests:
+            encoded_batch = []
+            for batch_offset, req in enumerate(batch_requests):
                 context, continuation = req.args
-                
-                # Tokenize
-                context_enc = self.tok_encode(context)
-                continuation_enc = self.tok_encode(continuation)
-                
-                # Combine and truncate if needed
-                full_enc = context_enc + continuation_enc
-                if len(full_enc) > self.max_length:
-                    # Truncate from the left (keep continuation)
-                    full_enc = full_enc[-(self.max_length):]
-                    context_enc = full_enc[:-len(continuation_enc)]
-                
-                input_ids = torch.tensor([full_enc], dtype=torch.long, device=self.device)
-                
-                # Get logits
-                logits = self._model_call(input_ids)
-                
-                # Compute log-probs for continuation tokens
-                # logits[0, context_len-1:, :] predicts tokens at positions context_len onwards
+                context_enc, continuation_enc = self._encode_pair(context, continuation)
+                context_enc, continuation_enc = self._truncate_scoring_pair(context_enc, continuation_enc)
+                result_index = i + batch_offset
+                if not continuation_enc:
+                    results[result_index] = (0.0, True)
+                    continue
+                encoded_batch.append((result_index, context_enc, continuation_enc))
+
+            if not encoded_batch:
+                continue
+
+            pad_id = getattr(self.tokenizer, "pad_token_id", None)
+            pad_id = self.eot_token_id if pad_id is None else int(pad_id)
+            max_input_len = max(len(context_enc) + len(continuation_enc) - 1 for _, context_enc, continuation_enc in encoded_batch)
+            input_ids = torch.full(
+                (len(encoded_batch), max_input_len),
+                pad_id,
+                dtype=torch.long,
+                device=self.device,
+            )
+            for row, (_, context_enc, continuation_enc) in enumerate(encoded_batch):
+                full_enc = context_enc + continuation_enc[:-1]
+                input_ids[row, :len(full_enc)] = torch.tensor(full_enc, dtype=torch.long, device=self.device)
+
+            logits = self._model_call(input_ids)
+
+            for row, (result_index, context_enc, continuation_enc) in enumerate(encoded_batch):
                 cont_start = len(context_enc) - 1
-                cont_logits = logits[0, cont_start:-1, :]  # [cont_len, vocab]
-                cont_targets = input_ids[0, len(context_enc):]  # [cont_len]
-                
-                # Log softmax
+                cont_len = len(continuation_enc)
+                cont_logits = logits[row, cont_start:cont_start + cont_len, :]
+                cont_targets = torch.tensor(continuation_enc, dtype=torch.long, device=self.device)
                 log_probs = F.log_softmax(cont_logits.float(), dim=-1)
-                
-                # Gather log probs for actual tokens
                 target_log_probs = log_probs.gather(
-                    dim=-1, 
+                    dim=-1,
                     index=cont_targets.unsqueeze(-1)
                 ).squeeze(-1)
-                
-                # Total log probability
                 total_log_prob = target_log_probs.sum().item()
-                
-                # Check if greedy (each predicted token is the argmax)
                 greedy_tokens = cont_logits.argmax(dim=-1)
                 is_greedy = (greedy_tokens == cont_targets).all().item()
-                
-                batch_results.append((total_log_prob, is_greedy))
-            
-            results.extend(batch_results)
-        
+                results[result_index] = (total_log_prob, is_greedy)
+
         return results
     
     def loglikelihood_rolling(
         self, 
         requests: List[Instance]
-    ) -> List[Tuple[float, bool]]:
+    ) -> List[float]:
         """
         Compute rolling log-likelihood (perplexity) for entire sequences.
         
@@ -234,7 +268,7 @@ class HierarchosLM(LM):
             requests: List of Instance objects with args=(sequence,)
             
         Returns:
-            List of (log_prob, True) tuples (is_greedy always True for rolling)
+            One full-document log probability per request.
         """
         results = []
         
@@ -249,31 +283,29 @@ class HierarchosLM(LM):
                 tokens = self.tok_encode(sequence)
                 
                 if len(tokens) == 0:
-                    results.append((0.0, True))
+                    results.append(0.0)
                     continue
-                
-                # Truncate if too long
-                if len(tokens) > self.max_length:
-                    tokens = tokens[:self.max_length]
-                
-                input_ids = torch.tensor([tokens], dtype=torch.long, device=self.device)
-                
-                # Get logits
-                logits = self._model_call(input_ids)
-                
-                # Compute log-probs for all tokens (conditioned on previous)
-                # logits[0, :-1, :] predicts tokens at positions 1 onwards
-                pred_logits = logits[0, :-1, :]
-                targets = input_ids[0, 1:]
-                
-                log_probs = F.log_softmax(pred_logits.float(), dim=-1)
-                target_log_probs = log_probs.gather(
-                    dim=-1,
-                    index=targets.unsqueeze(-1)
-                ).squeeze(-1)
-                
-                total_log_prob = target_log_probs.sum().item()
-                results.append((total_log_prob, True))
+
+                total_log_prob = 0.0
+                windows = get_rolling_token_windows(
+                    token_list=tokens,
+                    prefix_token=self.eot_token_id,
+                    max_seq_len=self.max_length,
+                    context_len=1,
+                )
+                for context_enc, continuation_enc in map(make_disjoint_window, windows):
+                    context_enc, continuation_enc = self._truncate_scoring_pair(context_enc, continuation_enc)
+                    full_enc = context_enc + continuation_enc[:-1]
+                    input_ids = torch.tensor([full_enc], dtype=torch.long, device=self.device)
+                    logits = self._model_call(input_ids)
+                    cont_start = len(context_enc) - 1
+                    cont_len = len(continuation_enc)
+                    pred_logits = logits[0, cont_start:cont_start + cont_len, :]
+                    targets = torch.tensor(continuation_enc, dtype=torch.long, device=self.device)
+                    log_probs = F.log_softmax(pred_logits.float(), dim=-1)
+                    total_log_prob += log_probs.gather(-1, targets.unsqueeze(-1)).sum().item()
+
+                results.append(total_log_prob)
         
         return results
     
@@ -306,11 +338,12 @@ class HierarchosLM(LM):
             temperature = gen_kwargs.get("temperature", 0.0)  # 0 = greedy
             
             # Tokenize context
-            context_enc = self.tok_encode(context)
+            context_enc = self.tok_encode(context) or [self.eot_token_id]
             
             # Truncate context if needed
-            if len(context_enc) > self.max_length - max_gen_toks:
-                context_enc = context_enc[-(self.max_length - max_gen_toks):]
+            context_budget = max(1, self.max_length - max_gen_toks)
+            if len(context_enc) > context_budget:
+                context_enc = context_enc[-context_budget:]
             
             input_ids = torch.tensor([context_enc], dtype=torch.long, device=self.device)
             

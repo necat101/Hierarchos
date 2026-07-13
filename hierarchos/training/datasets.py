@@ -771,6 +771,8 @@ class TokenizedBinaryDataset(Dataset):
     """
     def __init__(self, directory_path: str, max_length: Optional[int] = None):
         super().__init__()
+        self._file = None
+        self._mmap = None
         self.directory_path = directory_path
         self.max_length = int(max_length or 0)
         index_path = os.path.join(directory_path, "index.pt")
@@ -780,7 +782,12 @@ class TokenizedBinaryDataset(Dataset):
         if not os.path.exists(data_path):
             raise FileNotFoundError(f"Token cache data file not found: {data_path}")
 
-        index = torch.load(index_path, map_location="cpu")
+        try:
+            index = torch.load(index_path, map_location="cpu", weights_only=True)
+        except TypeError:
+            index = torch.load(index_path, map_location="cpu")
+        if not isinstance(index, dict) or "offsets" not in index or "lengths" not in index:
+            raise ValueError("Token cache index must contain offsets and lengths")
         self.offsets = index["offsets"].to(dtype=torch.long).contiguous()
         self.lengths = index["lengths"].to(dtype=torch.long).contiguous()
         self.has_rosa_ids = bool(index.get("has_rosa_ids", False))
@@ -789,19 +796,49 @@ class TokenizedBinaryDataset(Dataset):
         if self.loss_weight_dtype == "float32":
             self._loss_weight_torch_dtype = torch.float32
             self._loss_weight_bytes = 4
-        else:
+        elif self.loss_weight_dtype in ("float16", "None", "none"):
             self._loss_weight_torch_dtype = torch.float16
             self._loss_weight_bytes = 2
+        else:
+            raise ValueError(f"Unsupported token-cache loss weight dtype: {self.loss_weight_dtype}")
         self.rosa_sentinel = int(index.get("rosa_sentinel", 0))
         if self.offsets.numel() != self.lengths.numel():
             raise ValueError("Token cache index offsets/lengths size mismatch")
+        if self.offsets.numel() == 0:
+            raise ValueError("Token cache index contains no samples")
+        if bool((self.offsets < 0).any().item()) or bool((self.lengths <= 0).any().item()):
+            raise ValueError("Token cache offsets must be nonnegative and lengths must be positive")
+        if self.has_rosa_ids and self.rosa_sentinel <= 0:
+            raise ValueError("ROSA token cache is missing a valid vocabulary sentinel")
+
+        bytes_per_token = 8
+        if self.has_loss_weights:
+            bytes_per_token += self._loss_weight_bytes
+        if self.has_rosa_ids:
+            bytes_per_token += 4
+        offsets_list = self.offsets.tolist()
+        lengths_list = self.lengths.tolist()
+        expected_offsets = []
+        expected_offset = 0
+        for length in lengths_list:
+            expected_offsets.append(expected_offset)
+            expected_offset += int(length) * bytes_per_token
+        if offsets_list != expected_offsets:
+            raise ValueError(
+                "Token cache offsets do not match the declared record layout; "
+                "the cache may be stale or partially written"
+            )
+        data_size = os.path.getsize(data_path)
+        if data_size != expected_offset:
+            raise ValueError(
+                f"Token cache data size mismatch: expected {expected_offset} bytes, "
+                f"found {data_size}. Rebuild the cache before training."
+            )
         self.sample_lengths = [
             max(1, min(int(length), self.max_length)) if self.max_length > 0 else max(1, int(length))
             for length in self.lengths.tolist()
         ]
         self.data_path = data_path
-        self._file = None
-        self._mmap = None
 
     def __len__(self):
         return int(self.lengths.numel())

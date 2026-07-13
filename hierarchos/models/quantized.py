@@ -330,8 +330,14 @@ class QuantizedHierarchos:
         B, T = input_ids.shape
         allow_hebbian_update = kwargs.pop("allow_hebbian_update", False)
         suppress_hebbian = kwargs.pop("suppress_hebbian", getattr(self, "suppress_hebbian", True))
-        if allow_hebbian_update:
+        hebbian_writer_ready = bool(getattr(self.config, "val_proj_trained", False))
+        allow_untrained_writer = bool(
+            getattr(self.config, "allow_untrained_hebbian_writer", False)
+        )
+        if allow_hebbian_update and (hebbian_writer_ready or allow_untrained_writer):
             suppress_hebbian = False
+        elif not hebbian_writer_ready and not allow_untrained_writer:
+            suppress_hebbian = True
         memory_timestamps = None
         memory_sources = None
         past_tokens = None

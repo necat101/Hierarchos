@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -224,7 +226,6 @@ class LTMModule(nn.Module):
         topk_idx = topk_idx.to(device=device, dtype=torch.long)
         grads_tensor = grads_tensor.to(device=device).float()
         valid_mask = topk_idx >= 0
-        has_valid = valid_mask.any()
 
         curr_fast = curr_fast.float() if inplace else curr_fast.float().clone()
         curr_mom = curr_mom.float() if inplace else curr_mom.float().clone()
@@ -232,16 +233,12 @@ class LTMModule(nn.Module):
         if tokens_covered is None:
             tokens_covered = self.reference_chunk_len
         retention_rate = (1.0 - self.forget_rate) ** (tokens_covered / float(self.reference_chunk_len))
-        retention_rate = torch.where(
-            has_valid,
-            curr_fast.new_tensor(float(retention_rate)),
-            curr_fast.new_tensor(1.0),
-        )
 
         batch_size, num_slots, val_dim = curr_fast.shape
         idx_safe = topk_idx.clamp(min=0)
         flat_idx = idx_safe.reshape(batch_size, -1)
         valid_flat = valid_mask.reshape(batch_size, -1)
+        batch_has_valid = valid_flat.any(dim=1)
         batch_offsets = torch.arange(batch_size, device=device).unsqueeze(1) * num_slots
         linear_idx = (flat_idx + batch_offsets)[valid_flat].reshape(-1)
         grads_flat = grads_tensor.reshape(batch_size, -1, val_dim)[valid_flat].reshape(-1, val_dim).contiguous()
@@ -260,7 +257,7 @@ class LTMModule(nn.Module):
         slot_idx = unique_linear.remainder(num_slots)
 
         momentum_factor = torch.where(
-            has_valid,
+            batch_has_valid.view(batch_size, 1, 1),
             curr_mom.new_tensor(float(self.momentum)),
             curr_mom.new_tensor(1.0),
         )
@@ -271,8 +268,13 @@ class LTMModule(nn.Module):
 
         touched_fast = curr_fast[batch_idx, slot_idx]
         update_step = (touched_mom + self.weight_decay * touched_fast).mul(-current_lr)
-        curr_fast.mul_(retention_rate)
-        touched_fast = touched_fast.mul(retention_rate).add(update_step)
+        retention = torch.where(
+            batch_has_valid.view(batch_size, 1, 1),
+            curr_fast.new_tensor(float(retention_rate)),
+            curr_fast.new_tensor(1.0),
+        )
+        curr_fast.mul_(retention)
+        touched_fast = touched_fast.mul(float(retention_rate)).add(update_step)
         touched_fast.clamp_(min=-50.0, max=50.0)
         curr_fast[batch_idx, slot_idx] = touched_fast
 
@@ -301,6 +303,10 @@ class LTMModule(nn.Module):
         # This mirrors the autocast(enabled=False) pattern used in rwkv_cell.py for WKV stability.
         _device_type = queries.device.type if queries.device.type in ('cuda', 'cpu') else 'cpu'
         with torch.amp.autocast(device_type=_device_type, enabled=False):
+            topk = int(topk)
+            if topk <= 0:
+                raise ValueError(f"topk must be positive, got {topk}")
+
             # Cast queries to float32 to ensure all downstream ops stay in float32
             queries = queries.float()
 
@@ -312,25 +318,26 @@ class LTMModule(nn.Module):
             current_timestamps = current_timestamps.to(device=queries.device)
             current_sources = current_sources.to(device=queries.device)
 
-            if min_timestamp > 0.0 or source_filter is not None:
-                with torch.no_grad():
-                    valid_mask = torch.ones_like(sim, dtype=torch.bool)
-                    if min_timestamp > 0.0:
-                        valid_mask = valid_mask & (current_timestamps >= min_timestamp)
-                    if source_filter is not None:
-                        valid_mask = valid_mask & (current_sources == source_filter)
+            with torch.no_grad():
+                valid_mask = torch.isfinite(sim)
+                if min_timestamp > 0.0:
+                    valid_mask = valid_mask & (current_timestamps >= min_timestamp)
+                if source_filter is not None:
+                    valid_mask = valid_mask & (current_sources == source_filter)
 
-                    sim = torch.nan_to_num(sim, nan=-torch.inf, posinf=torch.finfo(sim.dtype).max, neginf=-torch.inf)
-                    sim = torch.where(valid_mask, sim, self.neg_inf.to(dtype=sim.dtype))
+            # Keep the similarity graph alive for address learning. The old
+            # filtered branch performed these operations inside no_grad(), which
+            # detached query/key score gradients along with the boolean mask.
+            sim = torch.nan_to_num(
+                sim,
+                nan=-torch.inf,
+                posinf=torch.finfo(sim.dtype).max,
+                neginf=-torch.inf,
+            )
+            sim = torch.where(valid_mask, sim, self.neg_inf.to(dtype=sim.dtype))
 
-            use_cuda_math = self._use_cuda_math(queries)
             use_gather_retrieval = self._use_gather_retrieval(queries)
-            if use_cuda_math and min_timestamp <= 0.0 and source_filter is None:
-                effective_topk = min(topk, self.vals.shape[0])
-            else:
-                num_valid_slots_per_query = sim.isfinite().sum(dim=-1)
-                num_valid_slots = num_valid_slots_per_query.min().item()
-                effective_topk = min(topk, int(num_valid_slots))
+            effective_topk = min(topk, self.vals.shape[0])
 
             if effective_topk <= 0:
                 query_shape = list(queries.shape)
@@ -343,6 +350,8 @@ class LTMModule(nn.Module):
 
             sim_detached = sim.detach()
             _, idx = torch.topk(sim_detached, k=effective_topk, dim=-1)
+            selected_valid = torch.gather(valid_mask, dim=-1, index=idx)
+            idx_ret = torch.where(selected_valid, idx, torch.full_like(idx, -1))
             
             current_fast_vals = fast_vals if fast_vals is not None else self.fast_vals
             effective_memory = self.vals + current_fast_vals
@@ -352,6 +361,7 @@ class LTMModule(nn.Module):
             selected_sim = None
             if torch.is_grad_enabled() and getattr(self, "score_grad_scale", 1.0) != 0.0 and sim.requires_grad:
                 selected_sim = torch.gather(sim, dim=-1, index=idx_clamped)
+                selected_sim = torch.where(selected_valid, selected_sim, torch.zeros_like(selected_sim))
 
             if use_gather_retrieval:
                 weighted_vals, ts_retrieved = self._gather_topk_cuda(
@@ -360,12 +370,14 @@ class LTMModule(nn.Module):
                     current_timestamps,
                 )
                 weighted_vals = self._inject_score_gradients(weighted_vals, selected_sim)
+                weighted_vals = weighted_vals * selected_valid.unsqueeze(-1).to(weighted_vals.dtype)
+                ts_retrieved = torch.where(selected_valid, ts_retrieved, torch.zeros_like(ts_retrieved))
                 if effective_topk < topk:
                     pad_size = topk - effective_topk
                     batch_shape_list = list(idx_clamped.shape[:-1])
 
                     idx_pad = torch.full(batch_shape_list + [pad_size], -1, device=idx.device, dtype=idx.dtype)
-                    idx_ret = torch.cat([idx, idx_pad], dim=-1)
+                    idx_ret = torch.cat([idx_ret, idx_pad], dim=-1)
 
                     vals_pad = torch.zeros(batch_shape_list + [pad_size, weighted_vals.shape[-1]],
                                            device=weighted_vals.device, dtype=weighted_vals.dtype)
@@ -376,7 +388,7 @@ class LTMModule(nn.Module):
                     ts_ret = torch.cat([ts_retrieved, ts_pad], dim=-1)
 
                     return vals_ret, idx_ret, ts_ret
-                return weighted_vals, idx, ts_retrieved
+                return weighted_vals, idx_ret, ts_retrieved
             
             num_classes = effective_memory_size
             range_tensor = torch.arange(num_classes, device=idx_clamped.device)
@@ -396,13 +408,15 @@ class LTMModule(nn.Module):
             while ts_for_gather.ndim < one_hot.ndim:
                 ts_for_gather = ts_for_gather.unsqueeze(-2)
             ts_retrieved = (one_hot * ts_for_gather).sum(dim=-1)
+            weighted_vals = weighted_vals * selected_valid.unsqueeze(-1).to(weighted_vals.dtype)
+            ts_retrieved = torch.where(selected_valid, ts_retrieved, torch.zeros_like(ts_retrieved))
             
             if effective_topk < topk:
                 pad_size = topk - effective_topk
                 batch_shape_list = list(idx_clamped.shape[:-1])
                 
                 idx_pad = torch.full(batch_shape_list + [pad_size], -1, device=idx.device, dtype=idx.dtype)
-                idx_ret = torch.cat([idx, idx_pad], dim=-1)
+                idx_ret = torch.cat([idx_ret, idx_pad], dim=-1)
                 
                 vals_pad = torch.zeros(batch_shape_list + [pad_size, weighted_vals.shape[-1]], 
                                        device=weighted_vals.device, dtype=weighted_vals.dtype)
@@ -414,7 +428,7 @@ class LTMModule(nn.Module):
                 
                 return vals_ret, idx_ret, ts_ret
             else:
-                return weighted_vals, idx, ts_retrieved
+                return weighted_vals, idx_ret, ts_retrieved
 
     def inner_update(self, topk_idx: torch.LongTensor, grads_tensor: torch.Tensor, current_lr: float, timestamp: float, 
                     source: int = SRC_USER_INTERACTION, tokens_covered: int = None,
@@ -424,6 +438,14 @@ class LTMModule(nn.Module):
         """
         Performs a Fast Weight Associative Update (Titans Style).
         """
+        try:
+            current_lr = float(current_lr)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"LTM current_lr must be a finite nonnegative number, got {current_lr!r}") from exc
+        if not math.isfinite(current_lr) or current_lr < 0.0:
+            raise ValueError(f"LTM current_lr must be a finite nonnegative number, got {current_lr!r}")
+        if torch.is_tensor(grads_tensor) and not bool(torch.isfinite(grads_tensor).all().item()):
+            raise ValueError("LTM inner_update rejected non-finite gradients")
         curr_fast = fast_vals if fast_vals is not None else self.fast_vals
         curr_mom = mom_vals if mom_vals is not None else self._mom_vals
 
@@ -589,7 +611,6 @@ class LTMModule(nn.Module):
         for batch_idx in range(curr_fast.shape[0]):
             valid_mask = valid_mask_all[batch_idx]
             if not valid_mask.any():
-                curr_fast[batch_idx].mul_(retention_rate)
                 continue
 
             idx_flat = topk_idx[batch_idx][valid_mask].view(-1).to(curr_fast.device)

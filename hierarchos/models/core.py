@@ -17,6 +17,89 @@ from .ltm import LTMModule
 from ..utils.device import setup_msvc_environment, is_directml_device
 from ..utils.rosa import ROSA, rosa_async_pipeline, ROSAState
 
+
+def _config_value(config, name: str, default=None):
+    return config.get(name, default) if isinstance(config, dict) else getattr(config, name, default)
+
+
+def _set_config_value(config, name: str, value) -> None:
+    if isinstance(config, dict):
+        config[name] = value
+    else:
+        setattr(config, name, value)
+
+
+def _positive_config_int(config, name: str, default=None) -> int:
+    value = _config_value(config, name, None)
+    if value is None and default is not None:
+        value = default
+        _set_config_value(config, name, value)
+    try:
+        value = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Hierarchos config '{name}' must be a positive integer, got {value!r}") from exc
+    if value <= 0:
+        raise ValueError(f"Hierarchos config '{name}' must be a positive integer, got {value!r}")
+    return value
+
+
+def _validate_architecture_config(config) -> None:
+    """Fail before allocation when a requested geometry cannot execute coherently."""
+    context_dim = _positive_config_int(config, "context_dim")
+    defaults = {
+        "vocab_size": None,
+        "context_dim": None,
+        "h_hidden": context_dim,
+        "l_hidden": context_dim,
+        "h_stride": 4,
+        "max_h_steps": 5,
+        "max_l_steps": 5,
+        "ltm_slots": 1024,
+        "ltm_key_dim": 128,
+        "ltm_val_dim": 128,
+        "ltm_topk": 4,
+    }
+    values = {
+        name: _positive_config_int(config, name, default)
+        for name, default in defaults.items()
+    }
+
+    # The manager input is enc + l_feedback and therefore has context_dim
+    # features. Supporting a different manager width would require a new learned
+    # projection and would break existing checkpoint layouts.
+    if values["h_hidden"] != values["context_dim"]:
+        raise ValueError(
+            "Hierarchos currently requires h_hidden == context_dim because the "
+            f"manager consumes context-width residuals; got h_hidden={values['h_hidden']} "
+            f"and context_dim={values['context_dim']}."
+        )
+
+    requested_head = _config_value(config, "rwkv_head_size", None)
+    if requested_head not in (None, 0, "", "auto"):
+        try:
+            requested_head = int(requested_head)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"rwkv_head_size must be a positive divisor or auto, got {requested_head!r}") from exc
+        if requested_head <= 0:
+            raise ValueError(f"rwkv_head_size must be a positive divisor or auto, got {requested_head!r}")
+        for width_name in ("h_hidden", "l_hidden"):
+            if values[width_name] % requested_head != 0:
+                raise ValueError(
+                    f"rwkv_head_size={requested_head} does not divide {width_name}={values[width_name]}."
+                )
+
+    detach_every = _config_value(config, "detach_every_n_steps", 32)
+    if detach_every is not None:
+        try:
+            detach_every = int(detach_every)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"detach_every_n_steps must be an integer or None, got {detach_every!r}"
+            ) from exc
+        if detach_every <= 0:
+            detach_every = None
+    _set_config_value(config, "detach_every_n_steps", detach_every)
+
 def _config_float(config, name: str, default: float) -> float:
     try:
         if isinstance(config, dict):
@@ -323,6 +406,7 @@ class HierarchosCore(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        _validate_architecture_config(self.config)
         
         # Tokenizer-dependent
         if not torch.cuda.is_available():
@@ -451,8 +535,13 @@ class HierarchosCore(nn.Module):
         
         # Sinusoidal Encoding for Timestamps
         half_dim = config.ltm_val_dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, dtype=torch.float) * -emb)
+        if half_dim <= 0:
+            emb = torch.empty(0, dtype=torch.float32)
+        elif half_dim == 1:
+            emb = torch.ones(1, dtype=torch.float32)
+        else:
+            scale = math.log(10000) / (half_dim - 1)
+            emb = torch.exp(torch.arange(half_dim, dtype=torch.float32) * -scale)
         self.register_buffer('time_freqs', emb)
 
     def compile(self):
@@ -539,7 +628,16 @@ class HierarchosCore(nn.Module):
         """
         Full forward method - direct port from hierarchos.py for exact parity.
         """
+        if input_ids.ndim != 2:
+            raise ValueError(f"input_ids must have shape [batch, sequence], got {tuple(input_ids.shape)}")
         B, T = input_ids.shape
+        if B <= 0 or T <= 0:
+            raise ValueError("input_ids must contain at least one batch row and one token")
+        if attention_mask is not None and attention_mask.shape != input_ids.shape:
+            raise ValueError(
+                f"attention_mask shape {tuple(attention_mask.shape)} does not match "
+                f"input_ids shape {tuple(input_ids.shape)}"
+            )
         device = input_ids.device
         recurrent_state_clamp = _config_float(self.config, 'recurrent_state_clamp', 50.0)
         context_state_clamp = _config_float(self.config, 'context_state_clamp', 50.0)
@@ -552,11 +650,20 @@ class HierarchosCore(nn.Module):
         return_topk_values = kwargs.pop("return_topk_values", True)
         return_raw_topk_values = kwargs.pop("return_raw_topk_values", True)
         return_topk_indices = kwargs.pop("return_topk_indices", True)
+        compute_ltm_value_alignment = bool(kwargs.pop("compute_ltm_value_alignment", False))
         cached_rosa_ids = kwargs.pop("rosa_ids", None)
         loss_weights = kwargs.pop("loss_weights", None)
         suppress_hebbian = kwargs.pop("suppress_hebbian", getattr(self, "suppress_hebbian", True))
-        if allow_hebbian_update:
+        hebbian_writer_ready = bool(getattr(self.config, "val_proj_trained", False))
+        allow_untrained_writer = bool(
+            getattr(self.config, "allow_untrained_hebbian_writer", False)
+        )
+        if allow_hebbian_update and (hebbian_writer_ready or allow_untrained_writer):
             suppress_hebbian = False
+        elif not hebbian_writer_ready and not allow_untrained_writer:
+            # Historical checkpoints never optimized val_proj. Silently writing its
+            # random projection into fast memory can degrade later generations.
+            suppress_hebbian = True
 
         # Unpack LTM Memory State early so we can use past_tokens + ROSA states
         rosa_states = None
@@ -604,8 +711,8 @@ class HierarchosCore(nn.Module):
             if cached_rosa_ids is None:
                 # --- Datacenter-Optimized Async ROSA Pipeline ---
                 # Launch CPU suffix automaton work immediately (overlaps with GPU tok_emb)
-                # Uses: Numba JIT, parallel batch threads, pinned memory, CUDA streams,
-                #       and persistent automaton state across TBPTT chunks
+                # Uses bounded parallel batch threads, pinned memory, CUDA streams,
+                # and persistent incremental automaton state across TBPTT chunks.
                 rosa_finalize = rosa_async_pipeline(
                     input_ids=input_ids,
                     past_tokens=past_tokens,
@@ -716,9 +823,32 @@ class HierarchosCore(nn.Module):
         ponder_weights = []
         commitment_costs = []
         commitment_weights = []
+        ltm_value_alignment_costs = []
+        ltm_value_alignment_weights = []
         all_topk_vals = []
         all_topk_idx = []
         aux_attention_mask = attention_mask.to(device=device, dtype=torch.float32) if attention_mask is not None else None
+
+        ltm_value_readout = None
+        if compute_ltm_value_alignment:
+            memory_offset = int(self.config.context_dim + self.config.persistent_dim)
+            memory_width = int(self.config.ltm_topk * self.config.ltm_val_dim)
+            memory_weights = self.in_proj.weight[:, memory_offset:memory_offset + memory_width]
+            if memory_weights.shape[1] != memory_width:
+                raise RuntimeError(
+                    f"LTM value readout width {memory_weights.shape[1]} does not match "
+                    f"ltm_topk * ltm_val_dim ({memory_width})"
+                )
+            # A Hebbian write stores the same projected value in each selected
+            # slot. Summing the corresponding in_proj blocks gives the exact
+            # linear readback for that repeated value. Detach the readout and
+            # target so this auxiliary trains val_proj rather than moving the
+            # already-learned language path to accommodate a random writer.
+            ltm_value_readout = memory_weights.reshape(
+                self.config.context_dim,
+                self.config.ltm_topk,
+                self.config.ltm_val_dim,
+            ).sum(dim=1).detach()
 
         stride = self.config.h_stride
         final_drift = None
@@ -752,8 +882,8 @@ class HierarchosCore(nn.Module):
             # Positional encoding
             args = topk_ts.unsqueeze(-1) * self.time_freqs.unsqueeze(0).unsqueeze(0)
             pe = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
-            if self.config.ltm_val_dim % 2 == 1: 
-                pe = torch.cat([pe, torch.zeros_like(pe[..., :1])], dim=-1)
+            if self.config.ltm_val_dim % 2 == 1:
+                pe = torch.cat([pe, pe.new_zeros(*pe.shape[:-1], 1)], dim=-1)
             topk_vals = topk_vals + pe
             
             if self.memory_token_routers and hasattr(self, "ltm_router"):
@@ -876,6 +1006,21 @@ class HierarchosCore(nn.Module):
             enc = _finite_clamp(enc, activation_clamp)
             l_state = _finite_clamp(l_state, recurrent_state_clamp)
             final_drift = _l2_norm_clamp(_finite_clamp(final_drift, drift_state_clamp), drift_norm_clamp)
+
+            if ltm_value_readout is not None:
+                value_to_store = self.val_proj(enc.detach())
+                memory_readback = F.linear(value_to_store, ltm_value_readout)
+                target_value = enc.detach().float()
+                squared_error = (memory_readback.float() - target_value).square().mean(dim=-1)
+                target_energy = target_value.square().mean(dim=-1).clamp_min(1e-4)
+                alignment_cost = squared_error / target_energy
+                ltm_value_alignment_costs.append(alignment_cost)
+                if aux_attention_mask is not None:
+                    ltm_value_alignment_weights.append(aux_attention_mask[:, t])
+                else:
+                    ltm_value_alignment_weights.append(
+                        torch.ones(B, device=device, dtype=torch.float32)
+                    )
             
             final_embs.append(enc)
             commitment_costs.append(cc)
@@ -916,6 +1061,7 @@ class HierarchosCore(nn.Module):
         loss = None
         ponder_cost_out = None
         commitment_cost_out = None
+        ltm_value_alignment_cost_out = None
 
         if labels is not None and not return_logits:
             loss = self._compute_cuda_chunked_lm_loss(
@@ -1009,6 +1155,10 @@ class HierarchosCore(nn.Module):
 
             ponder_cost_out = _weighted_aux_mean(ponder_costs, ponder_weights)
             commitment_cost_out = _weighted_aux_mean(commitment_costs, commitment_weights)
+            ltm_value_alignment_cost_out = _weighted_aux_mean(
+                ltm_value_alignment_costs,
+                ltm_value_alignment_weights,
+            )
 
         h_state = _finite_clamp(h_state, recurrent_state_clamp)
         l_state = _finite_clamp(l_state, recurrent_state_clamp)
@@ -1021,6 +1171,7 @@ class HierarchosCore(nn.Module):
             "logits": logits, 
             "ponder_cost": ponder_cost_out, 
             "commitment_cost": commitment_cost_out,
+            "ltm_value_alignment_cost": ltm_value_alignment_cost_out,
             "topk_vals": torch.stack(all_topk_vals, dim=1) if (return_topk_values and all_topk_vals) else None, 
             "raw_topk_vals": all_topk_vals if return_raw_topk_values else None,
             "topk_idx": torch.stack(all_topk_idx, dim=1) if all_topk_idx else None,

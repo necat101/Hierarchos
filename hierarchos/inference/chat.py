@@ -27,7 +27,11 @@ from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from ..utils.device import is_directml_device
-from ..utils.checkpoint import load_full_model_with_config
+from ..utils.checkpoint import (
+    load_full_model_with_config,
+    sanitize_model_state_dict,
+    save_checkpoint_safely,
+)
 from .chat_state import (
     CHAT_STATE_KIND,
     CHAT_STATE_VERSION,
@@ -388,6 +392,10 @@ def _checkpoint_ltm_training_mode(config) -> str:
     return _normalize_ltm_training_mode(getattr(config, "ltm_training_mode", "inner-update"))
 
 
+def _checkpoint_has_trained_hebbian_writer(config) -> bool:
+    return bool(_setting_value(config, "val_proj_trained", False))
+
+
 def _print_ltm_chat_alignment(config, learning_enabled: bool):
     mode = _checkpoint_ltm_training_mode(config)
     print(f"Checkpoint LTM training mode: {mode}")
@@ -398,6 +406,11 @@ def _print_ltm_chat_alignment(config, learning_enabled: bool):
     else:
         print("WARNING: checkpoint was trained with supervised LTM inner updates.")
         print("Normal chat generation has no label-gradient inner update, so coherence may lag until retrained/rescued with --ltm-training-mode read-only.")
+    if learning_enabled and not _checkpoint_has_trained_hebbian_writer(config):
+        print(
+            "Legacy checkpoint note: val_proj was not trained, so unsafe Hebbian "
+            "validation writes are disabled; gradient-derived feedback remains available."
+        )
     return mode
 
 
@@ -440,6 +453,245 @@ def should_stop_generation_from_uncertainty(logits, response_ids, tokenizer=None
         )
     except Exception:
         return False
+
+
+def sample_next_token(
+    logits,
+    *,
+    temperature=0.7,
+    top_k=0,
+    top_p=1.0,
+    repetition_penalty=1.0,
+    previous_tokens=None,
+):
+    """Sample one token without mutating caller-owned logits."""
+    if logits.dim() == 1:
+        logits = logits.unsqueeze(0)
+    if logits.dim() != 2:
+        raise ValueError(f"Expected [batch, vocab] logits, got shape {tuple(logits.shape)}")
+    if not bool(torch.isfinite(logits).all().item()):
+        raise RuntimeError("Refusing to sample from non-finite logits.")
+
+    scores = logits.float().clone()
+    repetition_penalty = float(repetition_penalty)
+    if repetition_penalty <= 0:
+        raise ValueError("repetition_penalty must be greater than zero")
+    if previous_tokens is not None and len(previous_tokens) > 0 and repetition_penalty != 1.0:
+        token_ids = sorted({int(token) for token in previous_tokens if 0 <= int(token) < scores.shape[-1]})
+        if token_ids:
+            token_index = torch.tensor(token_ids, device=scores.device, dtype=torch.long)
+            selected = scores.index_select(1, token_index)
+            selected = torch.where(selected > 0, selected / repetition_penalty, selected * repetition_penalty)
+            scores.index_copy_(1, token_index, selected)
+
+    temperature = float(temperature)
+    if temperature <= 0:
+        return scores.argmax(dim=-1, keepdim=True)
+    scores.div_(max(temperature, 1e-6))
+
+    top_k = int(top_k or 0)
+    if top_k > 0 and top_k < scores.shape[-1]:
+        threshold = torch.topk(scores, top_k, dim=-1).values[:, -1:]
+        scores.masked_fill_(scores < threshold, -torch.inf)
+
+    top_p = float(top_p)
+    if not 0.0 < top_p <= 1.0:
+        raise ValueError("top_p must be in the interval (0, 1]")
+    if top_p < 1.0:
+        sorted_scores, sorted_indices = torch.sort(scores, descending=True, dim=-1)
+        cumulative_probs = torch.cumsum(F.softmax(sorted_scores, dim=-1), dim=-1)
+        remove = cumulative_probs > top_p
+        remove[..., 1:] = remove[..., :-1].clone()
+        remove[..., 0] = False
+        remove = torch.zeros_like(remove).scatter(1, sorted_indices, remove)
+        scores.masked_fill_(remove, -torch.inf)
+
+    probs = F.softmax(scores, dim=-1)
+    if not bool(torch.isfinite(probs).all().item()) or bool((probs.sum(dim=-1) <= 0).any().item()):
+        raise RuntimeError("Sampling filters produced an invalid probability distribution.")
+    return torch.multinomial(probs, num_samples=1)
+
+
+def tbptt_chunk_ranges(length, chunk_size, global_offset=0):
+    """Split a sequence on absolute TBPTT boundaries, including carried chat state."""
+    length = max(0, int(length or 0))
+    chunk_size = int(chunk_size or 0)
+    global_offset = max(0, int(global_offset or 0))
+    if length == 0:
+        return []
+    if chunk_size <= 0:
+        return [(0, length)]
+
+    ranges = []
+    start = 0
+    while start < length:
+        absolute_start = global_offset + start
+        remainder = absolute_start % chunk_size
+        width = chunk_size - remainder if remainder else chunk_size
+        end = min(length, start + width)
+        ranges.append((start, end))
+        start = end
+    return ranges
+
+
+def boundary_drift_seed(drift_state, global_offset, chunk_size):
+    """Return carried drift only where training would begin a new TBPTT chunk."""
+    chunk_size = int(chunk_size or 0)
+    global_offset = int(global_offset or 0)
+    if chunk_size > 0 and global_offset > 0 and global_offset % chunk_size == 0:
+        return drift_state
+    return None
+
+
+def advance_chat_model_state(
+    model,
+    token_ids,
+    *,
+    device,
+    h_state,
+    l_state,
+    prev_context,
+    target_context,
+    drift_state,
+    drift_seed,
+    ltm_state,
+    global_pos_offset,
+    min_timestamp=0.0,
+    source_filter=None,
+    is_quantized=False,
+    inference_device=None,
+):
+    """Consume tokens once and return the model outputs plus updated runtime state."""
+    model_input_ids = token_ids.cpu() if is_quantized else token_ids.to(device)
+
+    def _quantized_state(value):
+        return value.cpu() if torch.is_tensor(value) else value
+
+    call_kwargs = {
+        "input_ids": model_input_ids,
+        "h_state": _quantized_state(h_state) if is_quantized else h_state,
+        "l_state": _quantized_state(l_state) if is_quantized else l_state,
+        "prev_context": _quantized_state(prev_context) if is_quantized else prev_context,
+        "target_context": _quantized_state(target_context) if is_quantized else target_context,
+        "drift_state": _quantized_state(drift_seed) if is_quantized else drift_seed,
+        "ltm_memory_state": ltm_state,
+        "global_pos_offset": int(global_pos_offset or 0),
+        "min_timestamp": min_timestamp,
+        "source_filter": source_filter,
+    }
+    if is_quantized:
+        call_kwargs["device"] = inference_device
+
+    outputs = model(**call_kwargs)
+    if not isinstance(outputs, dict) or "logits" not in outputs:
+        raise RuntimeError("Chat model forward must return a dict containing logits")
+
+    def _updated(name, previous):
+        value = outputs.get(name)
+        return previous if value is None else value
+
+    state = (
+        _updated("h_state", h_state),
+        _updated("l_state", l_state),
+        _updated("prev_context", prev_context),
+        _updated("target_context", target_context),
+        _updated("drift_state", drift_state),
+        _updated("ltm_memory_state", ltm_state),
+    )
+    return outputs, state
+
+
+def reset_active_ltm_state(model, ltm_state, *, preserve_rosa=True):
+    """Clear both module buffers and the state tuple consumed by the next forward."""
+    clear_ltm_working_memory(model)
+    if not isinstance(ltm_state, (tuple, list)) or len(ltm_state) < 2:
+        return None
+
+    state = list(ltm_state)
+    if torch.is_tensor(state[0]):
+        state[0] = torch.zeros_like(state[0])
+    if torch.is_tensor(state[1]):
+        state[1] = torch.zeros_like(state[1])
+    if len(state) >= 3 and not preserve_rosa:
+        state[2] = None
+    if len(state) >= 4 and not preserve_rosa:
+        state[3] = None
+    if len(state) >= 5 and torch.is_tensor(state[4]):
+        state[4] = torch.zeros_like(state[4])
+    if len(state) >= 6 and torch.is_tensor(state[5]):
+        unknown_source = int(getattr(getattr(model, "ltm", None), "SRC_UNKNOWN", 0))
+        state[5] = torch.full_like(state[5], unknown_source)
+    return tuple(state)
+
+
+def zero_ltm_momentum_state(model, ltm_state):
+    """Reset optimizer-like LTM momentum in both active and module-owned state."""
+    module_momentum = getattr(getattr(model, "ltm", None), "_mom_vals", None)
+    if torch.is_tensor(module_momentum):
+        with torch.no_grad():
+            module_momentum.zero_()
+    if not isinstance(ltm_state, (tuple, list)) or len(ltm_state) < 2:
+        return ltm_state
+    state = list(ltm_state)
+    if torch.is_tensor(state[1]):
+        state[1] = torch.zeros_like(state[1])
+    return tuple(state)
+
+
+def prepare_online_ltm_gradients(grads, max_norm):
+    """Reject non-finite memory gradients, then value- and norm-clip finite ones."""
+    if not torch.is_tensor(grads):
+        return None
+    prepared = grads.detach().float().clone()
+    if not bool(torch.isfinite(prepared).all().item()):
+        return None
+    max_norm = float(max_norm or 0.0)
+    if max_norm > 0:
+        prepared.clamp_(min=-max_norm, max=max_norm)
+        grad_norm = prepared.norm()
+        if not bool(torch.isfinite(grad_norm).item()):
+            return None
+        prepared.mul_(torch.clamp(prepared.new_tensor(max_norm) / (grad_norm + 1e-8), max=1.0))
+    return prepared
+
+
+def ltm_replay_seed_state(ltm_state):
+    """Reuse fast memory while replaying the supervised sequence from fresh ROSA history."""
+    if not isinstance(ltm_state, (tuple, list)) or len(ltm_state) < 2:
+        return ltm_state
+    state = list(ltm_state)
+    if len(state) >= 3:
+        state[2] = None
+    if len(state) >= 4:
+        state[3] = None
+    return tuple(state)
+
+
+def consolidate_ltm_state_for_save(model, ltm_state) -> bool:
+    """Fold fast memory into slow LTM values so a fresh chat load retains it."""
+    ltm = getattr(model, "ltm", None)
+    slow_vals = getattr(ltm, "vals", None)
+    if ltm is None or not torch.is_tensor(slow_vals):
+        return False
+    fast_vals = ltm_state[0] if isinstance(ltm_state, (tuple, list)) and ltm_state else getattr(ltm, "fast_vals", None)
+    if not torch.is_tensor(fast_vals):
+        return False
+    fast_vals = fast_vals.detach()
+    if fast_vals.dim() == slow_vals.dim() + 1 and fast_vals.shape[0] == 1:
+        fast_vals = fast_vals.squeeze(0)
+    if fast_vals.shape != slow_vals.shape:
+        raise ValueError(
+            f"Cannot consolidate LTM state with shape {tuple(fast_vals.shape)} into {tuple(slow_vals.shape)}"
+        )
+    if not bool(torch.isfinite(fast_vals).all().item()):
+        raise ValueError("Cannot save non-finite LTM fast memory")
+    with torch.no_grad():
+        consolidated = slow_vals.float() + fast_vals.to(device=slow_vals.device, dtype=torch.float32)
+        if not bool(torch.isfinite(consolidated).all().item()):
+            raise ValueError("LTM consolidation produced non-finite slow values")
+        slow_vals.copy_(consolidated.to(dtype=slow_vals.dtype))
+    clear_ltm_working_memory(model)
+    return True
 
 
 # --- Simple Generation Helper ---
@@ -485,8 +737,12 @@ def generate_sample(model, tokenizer, prompt, device, max_new_tokens=100, temper
             total_tokens_generated = prefill_len
 
             for _ in range(max_new_tokens):
-                next_token_logits = logits / max(temperature, 1e-6)
-                next_token = torch.multinomial(F.softmax(next_token_logits, dim=-1), num_samples=1)
+                next_token = sample_next_token(
+                    logits,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                )
                 generated = torch.cat([generated, next_token], dim=1)
                 if next_token.item() == tokenizer.eos_token_id:
                     break
@@ -567,15 +823,15 @@ def chat(args, device, tokenizer):
     # =================================================================
     # 2. MODEL LOADING
     # =================================================================
-    if not args.model_path or not os.path.isdir(args.model_path):
-        print(f"Error: Model directory not found or invalid at {args.model_path}")
+    if not args.model_path or not os.path.exists(args.model_path):
+        print(f"Error: Model path not found at {args.model_path}")
         sys.exit(1)
 
-    try:
-        npz_files = [f for f in os.listdir(args.model_path) if f.endswith('.npz')]
-    except FileNotFoundError:
-        print(f"Error: Model directory not found at {args.model_path}")
-        sys.exit(1)
+    npz_files = (
+        [f for f in os.listdir(args.model_path) if f.endswith('.npz')]
+        if os.path.isdir(args.model_path)
+        else []
+    )
 
     if npz_files and _HAS_QUANTIZED:
         try:
@@ -620,6 +876,16 @@ def chat(args, device, tokenizer):
             print(f"Error loading shadow model: {e}")
             traceback.print_exc()
             sys.exit(1)
+
+    tokenizer_vocab = len(tokenizer)
+    model_vocab = getattr(config, "vocab_size", None)
+    if model_vocab is not None and int(model_vocab) != int(tokenizer_vocab):
+        print(
+            f"Error: tokenizer vocabulary ({tokenizer_vocab}) does not match "
+            f"checkpoint vocabulary ({int(model_vocab)})."
+        )
+        print("Use the exact tokenizer from training; generation with mismatched token IDs is invalid.")
+        sys.exit(1)
 
     # =================================================================
     # 3. LTM & OPTIMIZER SETUP
@@ -730,7 +996,9 @@ def chat(args, device, tokenizer):
             
         target_device = device
 
-        update_model.train()
+        # Online feedback should observe the same adaptive inference path used
+        # to produce the answer. eval() still permits gradients.
+        update_model.eval()
         _set_online_update_warmup_complete(update_model)
         with torch.enable_grad():
             if label_ids_tensor is None:
@@ -757,7 +1025,9 @@ def chat(args, device, tokenizer):
                 outputs = update_model(
                     input_ids=full_sequence,
                     labels=None,
-                    ltm_memory_state=ltm_state,
+                    # Replay this sample once. Reusing the active ROSA history
+                    # here would append the same prompt/answer a second time.
+                    ltm_memory_state=ltm_replay_seed_state(ltm_state),
                     suppress_hebbian=True,
                 )
                 logits = outputs["logits"]
@@ -793,16 +1063,23 @@ def chat(args, device, tokenizer):
                 else:
                     loss = F.cross_entropy(active_logits, active_labels)
 
+            if not bool(torch.isfinite(loss.detach()).all().item()):
+                update_model.zero_grad(set_to_none=True)
+                if not silent:
+                    print(" (Rejected non-finite online-learning loss)")
+                return None
+
+            # Surprise/quality probes need only the scalar loss. Avoid a full
+            # backward pass when no memory write was requested.
+            if compute_only:
+                loss_value = float(loss.detach().item())
+                update_model.zero_grad(set_to_none=True)
+                return loss_value
+
             if use_amp and scaler:
-                scaler.scale(loss).backward()
+                scaler.scale(loss + dummy_param_amp * 0.0).backward()
             else:
                 loss.backward()
-
-            # If compute_only, return loss without updating
-            if compute_only:
-                update_model.zero_grad(set_to_none=True)
-                update_model.eval()
-                return loss.item()
 
             # Extract and apply LTM gradients
             ltm_grads = None
@@ -829,6 +1106,16 @@ def chat(args, device, tokenizer):
                     current_scale = scaler.get_scale()
                     if current_scale != 1.0:
                         ltm_grads_copy = ltm_grads_copy / current_scale
+
+                ltm_grads_copy = prepare_online_ltm_gradients(
+                    ltm_grads_copy,
+                    getattr(args, "online_ltm_grad_clip", 0.75),
+                )
+                if ltm_grads_copy is None:
+                    update_model.zero_grad(set_to_none=True)
+                    if not silent:
+                        print(" (Rejected non-finite online LTM gradient; memory unchanged)")
+                    return None
 
                 curr_ltm = outputs.get("ltm_memory_state")
                 curr_fast = curr_ltm[0] if curr_ltm is not None else None
@@ -899,6 +1186,11 @@ def chat(args, device, tokenizer):
     def perform_validation_hebbian_update(input_ids_tensor, label_ids_tensor, source_id, lr_override=None, silent=False):
         """Stores a validated exchange in fast LTM using Hebbian writes only after praise/validation."""
         nonlocal ltm_has_been_updated, ltm_state
+
+        if not _checkpoint_has_trained_hebbian_writer(config):
+            if not silent:
+                print(" (Hebbian validation skipped: checkpoint value writer is untrained)", end="", flush=True)
+            return None
 
         update_model = model
         if update_model is None:
@@ -1295,10 +1587,9 @@ def chat(args, device, tokenizer):
 
             if prompt.startswith('/reset_ltm'):
                 print("Resetting LTM memory...")
-                if hasattr(model, 'ltm') and hasattr(model.ltm, 'reset_working_memory'):
-                    model.ltm.reset_working_memory()
-                if is_quantized and shadow_model and hasattr(shadow_model.ltm, 'reset_working_memory'):
-                    shadow_model.ltm.reset_working_memory()
+                ltm_state = reset_active_ltm_state(model, ltm_state, preserve_rosa=True)
+                if is_quantized and shadow_model:
+                    reset_active_ltm_state(shadow_model, None, preserve_rosa=True)
                 ltm_has_been_updated = True
                 print("LTM Reset complete.")
                 continue
@@ -1444,103 +1735,64 @@ def chat(args, device, tokenizer):
             # chat learning should happen through explicit feedback/validation.
             model.suppress_hebbian = True
             with torch.no_grad():
-                model_input_ids = prompt_ids.cpu() if is_quantized else prompt_ids.to(device)
-                prefill_len = int(model_input_ids.shape[1])
-                prefill_step = chat_prefill_chunk_size if chat_prefill_chunk_size > 0 else prefill_len
-                prefill_step = max(1, int(prefill_step))
+                prefill_len = int(prompt_ids.shape[1])
                 outputs = None
-                chunk_drift_state = None
-
-                for prefill_start in range(0, prefill_len, prefill_step):
-                    prefill_end = min(prefill_start + prefill_step, prefill_len)
-                    chunk_input_ids = model_input_ids[:, prefill_start:prefill_end]
-
-                    if is_quantized:
-                        outputs = model(
-                            input_ids=chunk_input_ids,
-                            h_state=h_state.cpu() if h_state is not None else None,
-                            l_state=l_state.cpu() if l_state is not None else None,
-                            prev_context=prev_context.cpu() if prev_context is not None else None,
-                            target_context=target_context.cpu() if target_context is not None else None,
-                            # Epoch-13 checkpoints trained with drift carried only
-                            # at TBPTT prompt boundaries, not every generated token.
-                            drift_state=chunk_drift_state.cpu() if torch.is_tensor(chunk_drift_state) else chunk_drift_state,
-                            ltm_memory_state=ltm_state,
-                            global_pos_offset=total_tokens_generated + prefill_start,
-                            device=inference_device,
-                            min_timestamp=min_ts_filter,
-                            source_filter=source_id_filter
-                        )
-                        h_state = outputs['h_state']
-                        l_state = outputs['l_state']
-                        prev_context = outputs['prev_context']
-                        target_context = outputs['target_context']
-                        drift_state = outputs.get('drift_state', drift_state)
-                        ltm_state = outputs.get('ltm_memory_state', ltm_state)
-                    else:
-                        outputs = model(
-                            chunk_input_ids.to(device),
-                            h_state=h_state,
-                            l_state=l_state,
-                            prev_context=prev_context,
-                            target_context=target_context,
-                            # Epoch-13 checkpoints trained with drift carried only
-                            # at TBPTT prompt boundaries, not every generated token.
-                            drift_state=chunk_drift_state,
-                            ltm_memory_state=ltm_state,
-                            global_pos_offset=total_tokens_generated + prefill_start,
-                            min_timestamp=min_ts_filter,
-                            source_filter=source_id_filter
-                        )
-                        if outputs.get('h_state') is not None:
-                            h_state = outputs['h_state']
-                        if outputs.get('l_state') is not None:
-                            l_state = outputs['l_state']
-                        if outputs.get('drift_state') is not None:
-                            drift_state = outputs['drift_state']
-                        if outputs.get('prev_context') is not None:
-                            prev_context = outputs['prev_context']
-                        if outputs.get('target_context') is not None:
-                            target_context = outputs['target_context']
-                        ltm_state = outputs.get('ltm_memory_state', ltm_state)
-
-                    chunk_drift_state = drift_state
+                prefill_ranges = tbptt_chunk_ranges(
+                    prefill_len,
+                    chat_prefill_chunk_size,
+                    total_tokens_generated,
+                )
+                for prefill_start, prefill_end in prefill_ranges:
+                    absolute_start = total_tokens_generated + prefill_start
+                    outputs, runtime_state = advance_chat_model_state(
+                        model,
+                        prompt_ids[:, prefill_start:prefill_end],
+                        device=device,
+                        h_state=h_state,
+                        l_state=l_state,
+                        prev_context=prev_context,
+                        target_context=target_context,
+                        drift_state=drift_state,
+                        drift_seed=boundary_drift_seed(
+                            drift_state,
+                            absolute_start,
+                            chat_prefill_chunk_size,
+                        ),
+                        ltm_state=ltm_state,
+                        global_pos_offset=absolute_start,
+                        min_timestamp=min_ts_filter,
+                        source_filter=source_id_filter,
+                        is_quantized=is_quantized,
+                        inference_device=inference_device,
+                    )
+                    (
+                        h_state,
+                        l_state,
+                        prev_context,
+                        target_context,
+                        drift_state,
+                        ltm_state,
+                    ) = runtime_state
 
                 logits = outputs["logits"].to(device)
                 next_token_logits = logits[:, -1, :]
-
-                # Apply repetition penalty
-                rep_penalty = getattr(args, 'repetition_penalty', 1.2)
-                if rep_penalty != 1.0 and len(response_ids) > 0:
-                    for prev_token in set(response_ids):
-                        if next_token_logits[0, prev_token] > 0:
-                            next_token_logits[0, prev_token] /= rep_penalty
-                        else:
-                            next_token_logits[0, prev_token] *= rep_penalty
-
-                # Apply sampling
-                if args.temperature > 0:
-                    next_token_logits = next_token_logits / args.temperature
-                    if args.top_k > 0:
-                        v, _ = torch.topk(next_token_logits, min(args.top_k, next_token_logits.size(-1)))
-                        next_token_logits[next_token_logits < v[:, [-1]]] = -float('Inf')
-                    if args.top_p < 1.0:
-                        sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
-                        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                        sorted_indices_to_remove = cumulative_probs > args.top_p
-                        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                        sorted_indices_to_remove[..., 0] = 0
-                        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-                        next_token_logits[indices_to_remove] = -float('Inf')
-
-                    probs = F.softmax(next_token_logits, dim=-1)
-                    next_token_id = torch.multinomial(probs, num_samples=1)
-                else:
-                    next_token_id = torch.argmax(next_token_logits, dim=-1).unsqueeze(0)
-
                 total_tokens_generated += prompt_ids.shape[1]
 
-                if next_token_id.item() != tokenizer.eos_token_id:
+                max_new_tokens = max(0, int(getattr(args, 'max_new_tokens', 512) or 0))
+                if max_new_tokens > 0:
+                    next_token_id = sample_next_token(
+                        next_token_logits,
+                        temperature=args.temperature,
+                        top_k=args.top_k,
+                        top_p=args.top_p,
+                        repetition_penalty=getattr(args, 'repetition_penalty', 1.2),
+                        previous_tokens=response_ids,
+                    )
+                else:
+                    next_token_id = None
+
+                pending_state_token = False
+                if next_token_id is not None and next_token_id.item() != tokenizer.eos_token_id:
                     response_ids.append(next_token_id.item())
                     decoded_token = tokenizer.decode([next_token_id.item()])
                     # Buffer output to catch JSON closing syntax
@@ -1550,6 +1802,7 @@ def chat(args, device, tokenizer):
                         print(_flush, end="", flush=True)
                         _display_buffer = _display_buffer[-2:]
                     current_ids = next_token_id
+                    pending_state_token = True
                 else:
                     current_ids = None
 
@@ -1559,7 +1812,6 @@ def chat(args, device, tokenizer):
             # memory updates that compound exponentially, causing the latent
             # space to bleed (gibberish output after ~10-15 tokens).
             model.suppress_hebbian = True
-            max_new_tokens = getattr(args, 'max_new_tokens', 512)
             if current_ids is not None:
                 with torch.no_grad():
                     for i in range(max_new_tokens - 1):
@@ -1568,63 +1820,36 @@ def chat(args, device, tokenizer):
                             print("\n[Generation interrupted by user.]", end="", flush=True)
                             break
 
-                        model_input_ids = current_ids.cpu() if is_quantized else current_ids.to(device)
-                        generation_drift_state = None
-                        if (
-                            chat_prefill_chunk_size > 0
-                            and total_tokens_generated > 0
-                            and total_tokens_generated % chat_prefill_chunk_size == 0
-                        ):
-                            generation_drift_state = drift_state
-
-                        if is_quantized:
-                            outputs = model(
-                                input_ids=model_input_ids,
-                                h_state=h_state.cpu(),
-                                l_state=l_state.cpu(),
-                                prev_context=prev_context.cpu(),
-                                target_context=target_context.cpu(),
-                                # Match epoch-13 TBPTT: drift is fed only when the
-                                # current absolute position starts a new chunk.
-                                drift_state=generation_drift_state.cpu() if torch.is_tensor(generation_drift_state) else generation_drift_state,
-                                ltm_memory_state=ltm_state,
-                                global_pos_offset=total_tokens_generated,
-                                device=inference_device,
-                                min_timestamp=min_ts_filter,
-                                source_filter=source_id_filter
-                            )
-                            h_state = outputs['h_state']
-                            l_state = outputs['l_state']
-                            prev_context = outputs['prev_context']
-                            target_context = outputs['target_context']
-                            drift_state = outputs.get('drift_state', drift_state)
-                            ltm_state = outputs.get('ltm_memory_state', ltm_state)
-                        else:
-                            outputs = model(
-                                model_input_ids.to(device),
-                                h_state=h_state,
-                                l_state=l_state,
-                                prev_context=prev_context,
-                                target_context=target_context,
-                                # Match epoch-13 TBPTT: drift is fed only when the
-                                # current absolute position starts a new chunk.
-                                drift_state=generation_drift_state,
-                                ltm_memory_state=ltm_state,
-                                global_pos_offset=total_tokens_generated,
-                                min_timestamp=min_ts_filter,
-                                source_filter=source_id_filter
-                            )
-                            if outputs.get('h_state') is not None:
-                                h_state = outputs['h_state']
-                            if outputs.get('l_state') is not None:
-                                l_state = outputs['l_state']
-                            if outputs.get('drift_state') is not None:
-                                drift_state = outputs['drift_state']
-                            if outputs.get('prev_context') is not None:
-                                prev_context = outputs['prev_context']
-                            if outputs.get('target_context') is not None:
-                                target_context = outputs['target_context']
-                            ltm_state = outputs.get('ltm_memory_state', ltm_state)
+                        outputs, runtime_state = advance_chat_model_state(
+                            model,
+                            current_ids,
+                            device=device,
+                            h_state=h_state,
+                            l_state=l_state,
+                            prev_context=prev_context,
+                            target_context=target_context,
+                            drift_state=drift_state,
+                            drift_seed=boundary_drift_seed(
+                                drift_state,
+                                total_tokens_generated,
+                                chat_prefill_chunk_size,
+                            ),
+                            ltm_state=ltm_state,
+                            global_pos_offset=total_tokens_generated,
+                            min_timestamp=min_ts_filter,
+                            source_filter=source_id_filter,
+                            is_quantized=is_quantized,
+                            inference_device=inference_device,
+                        )
+                        (
+                            h_state,
+                            l_state,
+                            prev_context,
+                            target_context,
+                            drift_state,
+                            ltm_state,
+                        ) = runtime_state
+                        pending_state_token = False
 
                         logits = outputs["logits"].to(device)
                         total_tokens_generated += current_ids.shape[-1]
@@ -1633,33 +1858,14 @@ def chat(args, device, tokenizer):
                         if should_stop_generation_from_uncertainty(next_token_logits, response_ids, tokenizer, args):
                             break
 
-                        # Apply repetition penalty
-                        rep_penalty = getattr(args, 'repetition_penalty', 1.2)
-                        if rep_penalty != 1.0 and len(response_ids) > 0:
-                            for prev_token in set(response_ids):
-                                if next_token_logits[0, prev_token] > 0:
-                                    next_token_logits[0, prev_token] /= rep_penalty
-                                else:
-                                    next_token_logits[0, prev_token] *= rep_penalty
-
-                        if args.temperature > 0:
-                            next_token_logits = next_token_logits / args.temperature
-                            if args.top_k > 0:
-                                v, _ = torch.topk(next_token_logits, min(args.top_k, next_token_logits.size(-1)))
-                                next_token_logits[next_token_logits < v[:, [-1]]] = -float('Inf')
-                            if args.top_p < 1.0:
-                                sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
-                                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                                sorted_indices_to_remove = cumulative_probs > args.top_p
-                                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                                sorted_indices_to_remove[..., 0] = 0
-                                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-                                next_token_logits[indices_to_remove] = -float('Inf')
-
-                            probs = F.softmax(next_token_logits, dim=-1)
-                            next_token_id = torch.multinomial(probs, num_samples=1)
-                        else:
-                            next_token_id = torch.argmax(next_token_logits, dim=-1).unsqueeze(0)
+                        next_token_id = sample_next_token(
+                            next_token_logits,
+                            temperature=args.temperature,
+                            top_k=args.top_k,
+                            top_p=args.top_p,
+                            repetition_penalty=getattr(args, 'repetition_penalty', 1.2),
+                            previous_tokens=response_ids,
+                        )
 
                         if next_token_id.item() == tokenizer.eos_token_id:
                             break
@@ -1671,6 +1877,7 @@ def chat(args, device, tokenizer):
                             decoded_token = ""
 
                         if "###" in decoded_token and len(decoded_token) <= 5:
+                            current_ids = None
                             break
 
                         # Buffer output to catch JSON closing syntax
@@ -1680,6 +1887,44 @@ def chat(args, device, tokenizer):
                             print(_flush, end="", flush=True)
                             _display_buffer = _display_buffer[-2:]
                         current_ids = next_token_id
+                        pending_state_token = True
+
+            # The sampled token that reaches max_new_tokens has not yet been
+            # consumed by the recurrent model. Flush it once so carried/saved
+            # state and ROSA history describe every token already shown.
+            if pending_state_token and current_ids is not None:
+                with torch.no_grad():
+                    _, runtime_state = advance_chat_model_state(
+                        model,
+                        current_ids,
+                        device=device,
+                        h_state=h_state,
+                        l_state=l_state,
+                        prev_context=prev_context,
+                        target_context=target_context,
+                        drift_state=drift_state,
+                        drift_seed=boundary_drift_seed(
+                            drift_state,
+                            total_tokens_generated,
+                            chat_prefill_chunk_size,
+                        ),
+                        ltm_state=ltm_state,
+                        global_pos_offset=total_tokens_generated,
+                        min_timestamp=min_ts_filter,
+                        source_filter=source_id_filter,
+                        is_quantized=is_quantized,
+                        inference_device=inference_device,
+                    )
+                    (
+                        h_state,
+                        l_state,
+                        prev_context,
+                        target_context,
+                        drift_state,
+                        ltm_state,
+                    ) = runtime_state
+                    total_tokens_generated += current_ids.shape[-1]
+                    pending_state_token = False
 
             # Leave Hebbian writes suppressed between turns. They are opened
             # only inside the praise/validation feedback path above.
@@ -1761,7 +2006,9 @@ def chat(args, device, tokenizer):
             # Momentum is an optimizer-like transient. Do not carry it across
             # conversation turns, even when fast_vals are intentionally retained.
             if ltm_state is not None and len(ltm_state) >= 2:
-                ltm_state = (ltm_state[0], torch.zeros_like(ltm_state[1]), *ltm_state[2:])
+                ltm_state = zero_ltm_momentum_state(model, ltm_state)
+                if shadow_model is not None:
+                    zero_ltm_momentum_state(shadow_model, None)
                 fv_norm = ltm_state[0].float().norm().item()
                 print(f"[LTM State | fast_vals norm: {fv_norm:.6e} | momentum reset]")
 
@@ -1800,13 +2047,20 @@ def chat(args, device, tokenizer):
                         response = input(f"Do you want to save the learned LTM updates back to '{args.model_path}'? (y/n): ").lower()
                         if response in ["y", "yes"]:
                             print(f"\nSaving updated model to {args.model_path}...")
-                            output_weights_path = os.path.join(args.model_path, MODEL_WEIGHTS_NAME)
+                            output_weights_path = (
+                                os.path.join(args.model_path, MODEL_WEIGHTS_NAME)
+                                if os.path.isdir(args.model_path)
+                                else args.model_path
+                            )
                             try:
                                 if _merge_ltm_state_into_model_state(model, ltm_state):
                                     print("Merged active chat LTM state into model weights.")
-                                torch.save({
-                                    'model_state_dict': model.state_dict(),
-                                    'config': dict(model.config)
+                                if consolidate_ltm_state_for_save(model, ltm_state):
+                                    print("Consolidated fast LTM memory into persistent slow values.")
+                                save_checkpoint_safely({
+                                    'model_state_dict': sanitize_model_state_dict(model),
+                                    'config': dict(model.config),
+                                    'training_complete': True,
                                 }, output_weights_path)
                                 print("Save complete.")
                             except Exception as e:

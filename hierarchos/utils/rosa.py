@@ -1,10 +1,10 @@
 """
 ROSA — Rapid Online Suffix Automaton (RWKV-v8)
-Feature-complete, datacenter GPU-optimized implementation.
+Persistent incremental implementation with an asynchronous GPU pipeline.
 
 Key optimizations:
-  1. Numba JIT-compiled suffix automaton (10-50x vs pure Python)
-  2. Parallel batch processing via ThreadPoolExecutor (GIL-free with Numba)
+  1. Single-pass persistent automata across TBPTT chunks
+  2. Bounded parallel batch processing via ThreadPoolExecutor
   3. Pinned-memory buffer pool for zero-copy CPU→GPU DMA transfers
   4. CUDA stream-based async pipeline for CPU/GPU overlap
   5. Suffix automaton state persistence across TBPTT chunks (O(T_chunk) not O(T_total))
@@ -36,6 +36,7 @@ if _USE_NUMBA:
 # ─────────────────────────────────────────────────────────────
 _ROSA_POOL = None
 _ROSA_POOL_PID = None
+_ROSA_AUTO_WORKER_LIMIT = 32
 
 def _get_pool(max_workers: int = 0) -> Optional[ThreadPoolExecutor]:
     """Returns a per-process thread pool for parallel ROSA batch computation."""
@@ -54,7 +55,10 @@ def _get_pool(max_workers: int = 0) -> Optional[ThreadPoolExecutor]:
                 gpu_count = max(1, torch.cuda.device_count())
             except Exception:
                 pass
-            max_workers = max(1, cpu_count // gpu_count)
+            max_workers = min(
+                _ROSA_AUTO_WORKER_LIMIT,
+                max(1, cpu_count // gpu_count),
+            )
         _ROSA_POOL = ThreadPoolExecutor(max_workers=max_workers)
         _ROSA_POOL_PID = pid
     return _ROSA_POOL
@@ -425,17 +429,13 @@ def rosa_single(x: List[int], state: Optional[ROSAState] = None) -> Tuple[List[i
     if state is not None:
         preds = _rosa_incremental(state, x)
         return preds, state
-    else:
-        # Full build from scratch
-        if _NUMBA_OK and _rosa_jit is not None:
-            preds = _rosa_jit(x)
-        else:
-            preds = ROSA(x)
-        # Build state for future incremental use
-        new_state = ROSAState.new()
-        # Rebuild state by replaying (fast for first chunk)
-        _rosa_incremental(new_state, x)
-        return preds, new_state
+
+    # Building the persistent automaton already computes the predictions. The
+    # old path first ran the stateless JIT kernel and then replayed every token
+    # to construct this state, duplicating first-chunk work.
+    new_state = ROSAState.new()
+    preds = _rosa_incremental(new_state, x)
+    return preds, new_state
 
 
 def rosa_batch_parallel(
@@ -670,11 +670,6 @@ def warmup():
         except Exception:
             pass
 
-# Auto-warmup on import (non-blocking)
-try:
-    if _NUMBA_OK:
-        import threading
-        _warmup_thread = threading.Thread(target=warmup, daemon=True)
-        _warmup_thread.start()
-except Exception:
-    pass
+# The persistent path no longer invokes the stateless JIT kernel, so importing
+# this module should not launch a background compilation thread. ``warmup`` is
+# retained as an explicit compatibility/debugging helper.

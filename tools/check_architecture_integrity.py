@@ -21,6 +21,11 @@ if str(ROOT) not in sys.path:
 
 import torch
 
+from hierarchos.inference.chat import (
+    advance_chat_model_state,
+    boundary_drift_seed,
+    tbptt_chunk_ranges,
+)
 from hierarchos.models.core import HierarchosCore
 from hierarchos.models.quantized import (
     detect_quantized_rwkv_format,
@@ -108,6 +113,7 @@ def tiny_config(**overrides):
         min_ltm_lr=1e-8,
         ltm_momentum=0.9,
         ltm_weight_decay=1e-4,
+        val_proj_trained=True,
         ltm_forget_rate=0.01,
         ltm_score_grad_scale=1.0,
         ltm_cpu_gather_retrieval=True,
@@ -292,6 +298,298 @@ def check_inference_memory_contract(audit: Audit) -> None:
     changed = not torch.equal(before, model.ltm.fast_vals.detach())
     audit.require(changed, "explicit validation path can write fast LTM memory")
 
+    model.reset_memory()
+    model.config.val_proj_trained = False
+    legacy_before = model.ltm.fast_vals.detach().clone()
+    with torch.no_grad():
+        model(ids, allow_hebbian_update=True)
+    audit.require(
+        torch.equal(legacy_before, model.ltm.fast_vals.detach()),
+        "legacy checkpoints cannot write random val_proj vectors into fast LTM",
+    )
+
+
+def check_hebbian_writer_training_contract(audit: Audit) -> None:
+    torch.manual_seed(131)
+    model = HierarchosCore(tiny_config(use_rosa=False, use_deepembed=False))
+    layout = {name: tuple(tensor.shape) for name, tensor in model.state_dict().items()}
+    ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long)
+
+    model.eval()
+    outputs = model(
+        ids,
+        labels=ids,
+        compute_ltm_value_alignment=True,
+        return_logits=False,
+        return_topk_values=False,
+        return_raw_topk_values=False,
+        return_topk_indices=False,
+    )
+    cost = outputs["ltm_value_alignment_cost"]
+    audit.require(cost is not None and torch.isfinite(cost), "Hebbian writer alignment cost is finite")
+    cost.backward()
+
+    writer_grad = model.val_proj.weight.grad
+    audit.require(
+        writer_grad is not None and torch.isfinite(writer_grad).all() and writer_grad.norm().item() > 0,
+        "Hebbian writer alignment reaches val_proj",
+    )
+    other_grads = [
+        name
+        for name, parameter in model.named_parameters()
+        if name != "val_proj.weight" and parameter.grad is not None
+    ]
+    audit.require(other_grads == [], "Hebbian writer auxiliary is isolated from language weights")
+    audit.require(
+        layout == {name: tuple(tensor.shape) for name, tensor in model.state_dict().items()},
+        "Hebbian writer training preserves checkpoint layout",
+    )
+
+
+def check_streaming_generation_parity(audit: Audit) -> None:
+    torch.manual_seed(14)
+    model = HierarchosCore(tiny_config(isolate_batch_ltm=False, h_stride=2))
+    model.eval()
+    model.suppress_hebbian = True
+
+    prompt = torch.tensor([[3, 4, 5, 6]], dtype=torch.long)
+    continuation = torch.tensor([[7, 8, 9, 10, 11]], dtype=torch.long)
+
+    with torch.no_grad():
+        prefill = model(prompt, suppress_hebbian=True, global_pos_offset=0)
+        h_state = prefill["h_state"]
+        l_state = prefill["l_state"]
+        prev_context = prefill["prev_context"]
+        target_context = prefill["target_context"]
+        ltm_state = prefill["ltm_memory_state"]
+        stream_logits = [prefill["logits"][:, -1, :].float()]
+
+        for pos in range(continuation.shape[1]):
+            token = continuation[:, pos:pos + 1]
+            out = model(
+                token,
+                h_state=h_state,
+                l_state=l_state,
+                prev_context=prev_context,
+                target_context=target_context,
+                drift_state=None,
+                ltm_memory_state=ltm_state,
+                suppress_hebbian=True,
+                global_pos_offset=prompt.shape[1] + pos,
+            )
+            h_state = out["h_state"]
+            l_state = out["l_state"]
+            prev_context = out["prev_context"]
+            target_context = out["target_context"]
+            ltm_state = out["ltm_memory_state"]
+            stream_logits.append(out["logits"][:, -1, :].float())
+
+        full_ids = torch.cat([prompt, continuation], dim=1)
+        for k in range(continuation.shape[1] + 1):
+            full_prefix = full_ids[:, :prompt.shape[1] + k]
+            full_out = model(full_prefix, suppress_hebbian=True, global_pos_offset=0)
+            diff = (full_out["logits"][:, -1, :].float() - stream_logits[k]).abs().max().item()
+            if diff > 1e-4:
+                audit.fail(f"streaming logits diverge from full forward at continuation step {k}: max diff {diff:.3e}")
+                return
+    audit.ok("streaming one-token inference matches full forward without per-token drift reseeding")
+
+
+def check_epoch13_tbptt_boundary_parity(audit: Audit) -> None:
+    torch.manual_seed(15)
+    chunk_size = 4
+    model = HierarchosCore(tiny_config(isolate_batch_ltm=False, training_chunk_size=chunk_size, h_stride=2))
+    model.eval()
+    model.suppress_hebbian = True
+
+    prompt = torch.tensor([[3, 4, 5, 6, 7, 8]], dtype=torch.long)
+    continuation = torch.tensor([[9, 10, 11, 12, 13]], dtype=torch.long)
+    full_ids = torch.cat([prompt, continuation], dim=1)
+
+    def run_chunked_reference(ids: torch.Tensor):
+        h_state = l_state = prev_context = target_context = drift_state = ltm_state = None
+        logits_by_pos = []
+        with torch.no_grad():
+            for start in range(0, ids.shape[1], chunk_size):
+                out = model(
+                    ids[:, start:start + chunk_size],
+                    h_state=h_state,
+                    l_state=l_state,
+                    prev_context=prev_context,
+                    target_context=target_context,
+                    drift_state=drift_state,
+                    ltm_memory_state=ltm_state,
+                    suppress_hebbian=True,
+                    global_pos_offset=start,
+                )
+                logits_by_pos.extend(out["logits"].float().unbind(dim=1))
+                h_state = out["h_state"]
+                l_state = out["l_state"]
+                prev_context = out["prev_context"]
+                target_context = out["target_context"]
+                drift_state = out["drift_state"]
+                ltm_state = out["ltm_memory_state"]
+        return logits_by_pos
+
+    reference_logits = run_chunked_reference(full_ids)
+
+    with torch.no_grad():
+        h_state = l_state = prev_context = target_context = drift_state = ltm_state = None
+        chunk_drift_state = None
+        for start in range(0, prompt.shape[1], chunk_size):
+            out = model(
+                prompt[:, start:start + chunk_size],
+                h_state=h_state,
+                l_state=l_state,
+                prev_context=prev_context,
+                target_context=target_context,
+                drift_state=chunk_drift_state,
+                ltm_memory_state=ltm_state,
+                suppress_hebbian=True,
+                global_pos_offset=start,
+            )
+            h_state = out["h_state"]
+            l_state = out["l_state"]
+            prev_context = out["prev_context"]
+            target_context = out["target_context"]
+            drift_state = out["drift_state"]
+            ltm_state = out["ltm_memory_state"]
+            chunk_drift_state = drift_state
+
+        total_seen = int(prompt.shape[1])
+        comparisons = [(prompt.shape[1] - 1, out["logits"][:, -1, :].float())]
+        for pos in range(continuation.shape[1]):
+            token = continuation[:, pos:pos + 1]
+            boundary_drift = (
+                drift_state
+                if total_seen > 0 and total_seen % chunk_size == 0
+                else None
+            )
+            out = model(
+                token,
+                h_state=h_state,
+                l_state=l_state,
+                prev_context=prev_context,
+                target_context=target_context,
+                drift_state=boundary_drift,
+                ltm_memory_state=ltm_state,
+                suppress_hebbian=True,
+                global_pos_offset=total_seen,
+            )
+            h_state = out["h_state"]
+            l_state = out["l_state"]
+            prev_context = out["prev_context"]
+            target_context = out["target_context"]
+            drift_state = out["drift_state"]
+            ltm_state = out["ltm_memory_state"]
+            comparisons.append((total_seen, out["logits"][:, -1, :].float()))
+            total_seen += 1
+
+        for pos, logits in comparisons:
+            diff = (reference_logits[pos] - logits.squeeze(0)).abs().max().item()
+            if diff > 1e-4:
+                audit.fail(f"boundary-only generation diverges from TBPTT chunk reference at position {pos}: max diff {diff:.3e}")
+                return
+    audit.ok("boundary-only chat generation matches epoch-13 TBPTT chunk recurrence")
+
+
+def check_carried_chat_state_parity(audit: Audit) -> None:
+    """A turn split inside a TBPTT chunk must not create a new drift boundary."""
+    torch.manual_seed(151)
+    chunk_size = 4
+    model = HierarchosCore(tiny_config(isolate_batch_ltm=False, training_chunk_size=chunk_size, h_stride=2))
+    model.eval()
+    model.suppress_hebbian = True
+    ids = torch.tensor([[3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]], dtype=torch.long)
+
+    def run_fragments(fragment_widths):
+        h_state = l_state = prev_context = target_context = drift_state = ltm_state = None
+        logits_by_pos = []
+        global_offset = 0
+        with torch.no_grad():
+            for fragment_width in fragment_widths:
+                fragment = ids[:, global_offset:global_offset + fragment_width]
+                for local_start, local_end in tbptt_chunk_ranges(
+                    fragment.shape[1], chunk_size, global_offset=global_offset
+                ):
+                    absolute_start = global_offset + local_start
+                    outputs, state = advance_chat_model_state(
+                        model,
+                        fragment[:, local_start:local_end],
+                        device=torch.device("cpu"),
+                        h_state=h_state,
+                        l_state=l_state,
+                        prev_context=prev_context,
+                        target_context=target_context,
+                        drift_state=drift_state,
+                        drift_seed=boundary_drift_seed(drift_state, absolute_start, chunk_size),
+                        ltm_state=ltm_state,
+                        global_pos_offset=absolute_start,
+                    )
+                    logits_by_pos.extend(outputs["logits"].float().unbind(dim=1))
+                    h_state, l_state, prev_context, target_context, drift_state, ltm_state = state
+                global_offset += fragment_width
+        return logits_by_pos
+
+    reference = run_fragments([ids.shape[1]])
+    carried = run_fragments([6, ids.shape[1] - 6])
+    max_diff = max((left - right).abs().max().item() for left, right in zip(reference, carried))
+    audit.require(
+        max_diff <= 1e-4,
+        f"carried chat state preserves absolute TBPTT recurrence across an in-chunk turn split (max diff {max_diff:.3e})",
+    )
+
+
+def check_train_eval_parity_after_memory_warmup(audit: Audit) -> None:
+    torch.manual_seed(16)
+    warmup_steps = 5
+    model = HierarchosCore(
+        tiny_config(
+            isolate_batch_ltm=False,
+            memory_gate_warmup_steps=warmup_steps,
+            memory_gate_warmup_floor=0.10,
+        )
+    )
+    ids = torch.tensor([[3, 4, 5, 6, 7, 8, 9, 10]], dtype=torch.long)
+
+    with torch.no_grad():
+        model.train()
+        model.suppress_hebbian = True
+        model.set_training_step(0)
+        train_warmup_logits = model(
+            ids,
+            suppress_hebbian=True,
+            return_topk_values=False,
+            return_raw_topk_values=False,
+            return_topk_indices=False,
+        )["logits"].float()
+
+        model.train()
+        model.suppress_hebbian = True
+        model.set_training_step(warmup_steps)
+        train_done_logits = model(
+            ids,
+            suppress_hebbian=True,
+            return_topk_values=False,
+            return_raw_topk_values=False,
+            return_topk_indices=False,
+        )["logits"].float()
+
+        model.eval()
+        model.suppress_hebbian = True
+        eval_logits = model(
+            ids,
+            suppress_hebbian=True,
+            return_topk_values=False,
+            return_raw_topk_values=False,
+            return_topk_indices=False,
+        )["logits"].float()
+
+    done_diff = (train_done_logits - eval_logits).abs().max().item()
+    audit.require(done_diff <= 1e-6, "train/eval logits match after memory-gate warmup is complete")
+    warmup_diff = (train_warmup_logits - eval_logits).abs().max().item()
+    audit.require(warmup_diff > 1e-5, "train-mode warmup step 0 intentionally differs from eval")
+
 
 def check_clamps_and_optimizer(audit: Audit) -> None:
     torch.manual_seed(17)
@@ -318,6 +616,8 @@ def check_clamps_and_optimizer(audit: Audit) -> None:
     audit.require(id(model.h_deepemb.weight) in no_decay_params, "H DeepEmbed is excluded from AdamW decay")
     audit.require(id(model.l_deepemb.weight) in no_decay_params, "L DeepEmbed is excluded from AdamW decay")
     audit.require(id(model.h_deepemb.weight) not in decay_params, "H DeepEmbed is not in decay group")
+    audit.require(id(model.val_proj.weight) in no_decay_params, "LTM val_proj is excluded from AdamW decay")
+    audit.require(id(model.val_proj.weight) not in decay_params, "LTM val_proj is not in decay group")
 
 
 def check_checkpoint_and_quantized_guards(audit: Audit) -> None:
@@ -361,13 +661,30 @@ def check_checkpoint_and_quantized_guards(audit: Audit) -> None:
 
 
 def check_static_source_contracts(audit: Audit) -> None:
+    cli_source = (ROOT / "hierarchos_cli.py").read_text(encoding="utf-8")
     chat_source = (ROOT / "hierarchos" / "inference" / "chat.py").read_text(encoding="utf-8")
     trainer_source = (ROOT / "hierarchos" / "training" / "trainer.py").read_text(encoding="utf-8")
     quantized_source = (ROOT / "hierarchos" / "models" / "quantized.py").read_text(encoding="utf-8")
+    benchmarks_source = (ROOT / "hierarchos" / "evaluation" / "benchmarks.py").read_text(encoding="utf-8")
+    lm_eval_source = (ROOT / "hierarchos" / "evaluation" / "lm_eval_wrapper.py").read_text(encoding="utf-8")
 
     audit.require("model.suppress_hebbian = True" in chat_source, "chat explicitly suppresses normal Hebbian writes")
     audit.require("allow_hebbian_update=True" in chat_source, "chat validation path is the explicit Hebbian write gate")
+    audit.require("--carry-chat-state" in cli_source, "chat recurrent state carry is opt-in")
+    audit.require("--chat-prefill-chunk-size" in cli_source, "chat exposes TBPTT prefill chunk sizing")
+    audit.require("getattr(config, \"training_chunk_size\", 0)" in chat_source, "chat defaults prefill chunking from checkpoint training_chunk_size")
+    audit.require("boundary_drift_seed(" in chat_source and "tbptt_chunk_ranges(" in chat_source, "chat feeds drift only at absolute TBPTT boundaries")
+    audit.require("if pending_state_token and current_ids is not None:" in chat_source, "chat consumes the final emitted token before carrying or saving state")
+    audit.require("_set_online_update_warmup_complete(update_model)" in chat_source, "chat LTM gradient updates run with memory-gate warmup completed")
+    audit.require("_merge_ltm_state_into_model_state(model, ltm_state)" in chat_source, "chat save path persists active LTM fast-memory state")
+    audit.require("--benchmark-preset" in cli_source and "rog-ally" in cli_source, "CLI exposes bounded ROG Ally benchmark preset")
+    audit.require('"rog-ally": ("arc_easy", "hellaswag", "truthfulqa_mc1")' in benchmarks_source, "ROG Ally suite stays light and runnable")
+    audit.require("for start in range(0, input_ids.shape[1], chunk_size)" in lm_eval_source, "lm-eval wrapper uses chunked TBPTT-style forward")
+    audit.require("clear_ltm_working_memory(model)" in cli_source and "model.suppress_hebbian = True" in cli_source, "benchmark mode clears transient LTM and suppresses Hebbian writes")
+    audit.require("suppress_hebbian=True" in lm_eval_source, "lm-eval wrapper explicitly suppresses Hebbian writes")
+    audit.require("target_context=target_ctx, drift_state=drift_state, ltm_memory_state=ltm_state" in trainer_source, "trainer preserves epoch-13 TBPTT boundary drift default")
     audit.require("ltm_inner_updates_enabled(args)" in trainer_source, "trainer gates supervised LTM inner updates")
+    audit.require("--ltm-value-alignment-weight" in cli_source, "CLI exposes opt-in Hebbian writer training")
     audit.require('"ltm_lr": f"{get_current_ltm_lr(args):.2e}" if use_ltm_inner_updates else "off"' in trainer_source, "finetune reports LTM LR as off in read-only mode")
     audit.require("validate_quantized_rwkv_format" in quantized_source, "quantized loader validates recurrent architecture format")
     audit.warn("quantized CPU/Vulkan inference remains legacy scalar-RWKV only; full-precision v8 is the coherent path for current rescue runs")
@@ -383,6 +700,11 @@ def main() -> int:
         check_core_forward,
         check_ltm_train_modes,
         check_inference_memory_contract,
+        check_hebbian_writer_training_contract,
+        check_streaming_generation_parity,
+        check_epoch13_tbptt_boundary_parity,
+        check_carried_chat_state_parity,
+        check_train_eval_parity_after_memory_warmup,
         check_clamps_and_optimizer,
         check_checkpoint_and_quantized_guards,
         check_static_source_contracts,

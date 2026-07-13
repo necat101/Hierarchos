@@ -184,34 +184,68 @@ def probe_model(model, tokenizer, device, prompts: Iterable[str], max_tokens: in
     for prompt_text in prompts:
         prompt = format_prompt(prompt_text)
         ids = torch.tensor(tokenizer.encode(prompt, add_special_tokens=False), dtype=torch.long, device=device).unsqueeze(0)
-        outputs = model(ids)
+        prefill_chunk_size = int(getattr(getattr(model, "config", None), "training_chunk_size", 0) or 0)
+        prefill_step = prefill_chunk_size if prefill_chunk_size > 0 else ids.shape[1]
+        prefill_step = max(1, int(prefill_step))
+        outputs = None
+        h_state = None
+        l_state = None
+        prev_context = None
+        target_context = None
+        drift_state = None
+        ltm_state = None
+        chunk_drift_state = None
+        for start in range(0, ids.shape[1], prefill_step):
+            end = min(start + prefill_step, ids.shape[1])
+            outputs = model(
+                ids[:, start:end],
+                h_state=h_state,
+                l_state=l_state,
+                prev_context=prev_context,
+                target_context=target_context,
+                drift_state=chunk_drift_state,
+                ltm_memory_state=ltm_state,
+                global_pos_offset=start,
+            )
+            h_state = outputs.get("h_state")
+            l_state = outputs.get("l_state")
+            prev_context = outputs.get("prev_context")
+            target_context = outputs.get("target_context")
+            drift_state = outputs.get("drift_state")
+            ltm_state = outputs.get("ltm_memory_state")
+            chunk_drift_state = drift_state
         logits = outputs["logits"][:, -1, :].float()
         probs = torch.softmax(logits, dim=-1)
         top_vals, top_idx = torch.topk(probs, 5)
         top = [(tokenizer.decode([int(i)]), round(float(v), 4)) for v, i in zip(top_vals[0], top_idx[0])]
 
-        h_state = outputs.get("h_state")
-        l_state = outputs.get("l_state")
-        prev_context = outputs.get("prev_context")
-        target_context = outputs.get("target_context")
-        drift_state = outputs.get("drift_state")
-        ltm_state = outputs.get("ltm_memory_state")
         current = top_idx[:, :1]
         generated: list[int] = []
+        total_tokens_seen = int(ids.shape[1])
         for _ in range(max_tokens):
             token_id = int(current.item())
             if token_id == tokenizer.eos_token_id:
                 break
             generated.append(token_id)
+            generation_drift_state = None
+            if (
+                prefill_chunk_size > 0
+                and total_tokens_seen > 0
+                and total_tokens_seen % prefill_chunk_size == 0
+            ):
+                generation_drift_state = drift_state
             outputs = model(
                 current,
                 h_state=h_state,
                 l_state=l_state,
                 prev_context=prev_context,
                 target_context=target_context,
-                drift_state=drift_state,
+                # Epoch-13 TBPTT parity: drift is fed only at chunk boundaries.
+                drift_state=generation_drift_state,
                 ltm_memory_state=ltm_state,
+                global_pos_offset=total_tokens_seen,
             )
+            total_tokens_seen += 1
             h_state = outputs.get("h_state")
             l_state = outputs.get("l_state")
             prev_context = outputs.get("prev_context")

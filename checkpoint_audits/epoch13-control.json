@@ -1,0 +1,115 @@
+{
+  "weights_path": "C:\\Users\\User\\Downloads\\chatHRM\\chatHRM\\hierarchos.pt",
+  "file_bytes": 931161249,
+  "sha256": "396787af4a7811e5fc87286c9e2f93db37c50b7accbfc72aa45a9e3a08b9a751",
+  "state_tensors": 95,
+  "unique_parameters": 232516229,
+  "tied_embeddings": true,
+  "nonfinite_state_tensors": [],
+  "config": {
+    "vocab_size": 50257,
+    "context_dim": 448,
+    "h_hidden": 448,
+    "l_hidden": 448,
+    "rwkv_head_size": 64,
+    "training_chunk_size": 256,
+    "ltm_training_mode": "read-only",
+    "val_proj_trained": false
+  },
+  "prompt_top5": [
+    {
+      "token_id": 15496,
+      "token": "Hello",
+      "probability": 0.47993049025535583
+    },
+    {
+      "token_id": 39,
+      "token": "H",
+      "probability": 0.1378791183233261
+    },
+    {
+      "token_id": 10248,
+      "token": "Good",
+      "probability": 0.05826444551348686
+    },
+    {
+      "token_id": 25404,
+      "token": "dl",
+      "probability": 0.05318482220172882
+    },
+    {
+      "token_id": 17250,
+      "token": "Hi",
+      "probability": 0.03588688746094704
+    }
+  ],
+  "gates": {
+    "ltm": {
+      "mean": 0.012609487399458885,
+      "std": 0.0019645269494503736,
+      "min": 0.010696855373680592,
+      "max": 0.015291169285774231,
+      "abs_max": 0.015291169285774231
+    },
+    "rosa": {
+      "mean": 0.9412624835968018,
+      "std": 0.012602405622601509,
+      "min": 0.9302062392234802,
+      "max": 0.965068519115448,
+      "abs_max": 0.965068519115448
+    }
+  },
+  "hebbian_writer": {
+    "config_marks_trained": false,
+    "normalized_alignment_cost": 0.9795272946357727,
+    "val_proj_gradient_norm": 0.6287215352058411,
+    "other_auxiliary_gradient_tensors": [],
+    "weight": {
+      "mean": 0.0001870226114988327,
+      "std": 0.027314959093928337,
+      "min": -0.04724358022212982,
+      "max": 0.04724552854895592,
+      "abs_max": 0.04724552854895592
+    }
+  },
+  "deepembed": {
+    "h_deepemb": {
+      "mean": 0.3548738658428192,
+      "std": 0.004238948691636324,
+      "min": 0.12290451675653458,
+      "max": 0.853213906288147,
+      "abs_max": 0.853213906288147,
+      "sample_token_centered_rms": 0.004179108422249556,
+      "mean_abs_distance_from_identity": 0.6451139450073242
+    },
+    "l_deepemb": {
+      "mean": 0.354072242975235,
+      "std": 0.019352201372385025,
+      "min": -0.2622449994087219,
+      "max": 1.0186179876327515,
+      "abs_max": 1.0186179876327515,
+      "sample_token_centered_rms": 0.01936374045908451,
+      "mean_abs_distance_from_identity": 0.6458997130393982
+    }
+  },
+  "out_norm": {
+    "mean": 3.756434202194214,
+    "std": 0.17558534443378448,
+    "min": 3.11590576171875,
+    "max": 4.2205891609191895,
+    "abs_max": 4.2205891609191895
+  },
+  "parity": {
+    "tokens": 270,
+    "chunk_size": 256,
+    "max_abs_logit_delta": 1.1444091796875e-05,
+    "mean_abs_logit_delta": 8.01171609055018e-07,
+    "state_max_abs_deltas": {
+      "h_state": 0.0,
+      "l_state": 0.0,
+      "prev_context": 0.0,
+      "target_context": 0.0,
+      "drift_state": 0.0
+    }
+  }
+}

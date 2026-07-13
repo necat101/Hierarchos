@@ -22,7 +22,8 @@ def test_inference_memory_update():
         'l_conv_atol': 1e-4,
         'h_stride': 2,
         'commitment_threshold': 0.05,
-        'max_length': 64
+        'max_length': 64,
+        'val_proj_trained': True,
     }
     
     model = HierarchosCore(AttrDict(config))

@@ -30,6 +30,7 @@ def _config():
         l_conv_atol=1e-4,
         commitment_threshold=0.05,
         isolate_batch_ltm=True,
+        val_proj_trained=True,
         use_deepembed=False,
         use_rosa=False,
         compile=False,

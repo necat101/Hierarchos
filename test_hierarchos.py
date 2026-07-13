@@ -41,6 +41,10 @@ def test_training_step():
     # Run forward pass
     print("Running forward pass...")
     outputs = model(input_ids=input_ids, labels=labels)
+    raw_topk_vals = outputs.get("raw_topk_vals") or []
+    for topk_val in raw_topk_vals:
+        if topk_val.requires_grad:
+            topk_val.retain_grad()
     
     loss = outputs['loss']
     print(f"Loss: {loss.item()}")
@@ -62,12 +66,15 @@ def test_training_step():
                 
     # Test LTM Update
     print("Testing LTM Update...")
-    if outputs.get("topk_vals") is not None and outputs["topk_vals"].grad is not None:
-        ltm_grads = outputs["topk_vals"].grad
+    retained_grads = [topk_val.grad for topk_val in raw_topk_vals]
+    if retained_grads and all(grad is not None for grad in retained_grads):
+        ltm_grads = torch.stack(retained_grads, dim=1)
+        assert torch.isfinite(ltm_grads).all()
         model.ltm.inner_update(
             outputs["topk_idx"], 
             ltm_grads, 
             current_lr=0.01, 
+            timestamp=0.0,
             source=2,
             tokens_covered=T
         )

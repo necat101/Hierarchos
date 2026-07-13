@@ -15,6 +15,7 @@ from hierarchos.utils.checkpoint import (
     _infer_arch_flags_from_state_dict,
     _reject_unsupported_rwkv_state_dict,
     _resolve_weights_path,
+    save_checkpoint_safely,
     sanitize_model_state_dict,
 )
 from hierarchos.inference.chat_state import clear_ltm_working_memory
@@ -1088,6 +1089,53 @@ def configure_tokenizer_length(tokenizer, max_length):
         pass
 
 
+def resolve_tokenizer_source(tokenizer_path=None, model_path=None):
+    """Resolve tokenizer assets without treating a direct .pt file as a HF directory."""
+    if tokenizer_path:
+        return tokenizer_path
+    if model_path:
+        resolved = os.path.abspath(os.path.expanduser(model_path))
+        if os.path.isfile(resolved):
+            return os.path.dirname(resolved)
+        if os.path.isdir(resolved):
+            tokenizer_markers = ("tokenizer.json", "tokenizer_config.json")
+            if any(os.path.isfile(os.path.join(resolved, name)) for name in tokenizer_markers):
+                return resolved
+            nested = []
+            for name in sorted(os.listdir(resolved)):
+                candidate = os.path.join(resolved, name)
+                if os.path.isdir(candidate) and any(
+                    os.path.isfile(os.path.join(candidate, marker))
+                    for marker in tokenizer_markers
+                ):
+                    nested.append(candidate)
+            if len(nested) == 1:
+                return nested[0]
+        return model_path
+    return "openai-community/gpt2"
+
+
+def resolve_export_tokenizer_source(explicit_tokenizer_path, config):
+    """Resolve the exact tokenizer recorded by training for inference export."""
+    config = config or {}
+    return (
+        explicit_tokenizer_path
+        or config.get("tokenizer_path")
+        or config.get("tokenizer_name")
+        or "openai-community/gpt2"
+    )
+
+
+def validate_tokenizer_vocab(tokenizer, config, source: str = "model"):
+    tokenizer_vocab = len(tokenizer)
+    model_vocab = config.get("vocab_size") if isinstance(config, dict) else getattr(config, "vocab_size", None)
+    if model_vocab is not None and int(model_vocab) != int(tokenizer_vocab):
+        raise ValueError(
+            f"Tokenizer/model vocabulary mismatch for {source}: tokenizer={tokenizer_vocab}, "
+            f"checkpoint={int(model_vocab)}. Use the exact tokenizer from training."
+        )
+
+
 def resolve_num_workers(requested_workers, device, batch_size):
     requested_workers = int(requested_workers)
     if requested_workers >= 0:
@@ -1130,6 +1178,7 @@ _CONTINUATION_SKIP_CONFIG_KEYS = {
     "refresh_hf_token_cache",
     "refresh_hf_shards",
     "max_ce_loss_for_backward",
+    "startup_weight_max_abs",
 }
 
 _CONTINUATION_SUMMARY_KEYS = (
@@ -1146,6 +1195,8 @@ _CONTINUATION_SUMMARY_KEYS = (
     "ltm_lr",
     "min_ltm_lr",
     "ltm_training_mode",
+    "ltm_value_alignment_weight",
+    "ltm_value_alignment_min_updates",
     "compile",
     "force_compile",
     "amp",
@@ -1266,8 +1317,8 @@ def _read_model_config_defaults(model_path):
 
 
 def _hydrate_training_args_from_model_config(args, parser, explicit_dests):
-    """Use saved model metadata as training defaults for base-model continuation."""
-    if args.mode != "train":
+    """Use saved model metadata as defaults for continuation and LoRA tuning."""
+    if args.mode not in ("train", "finetune"):
         return
 
     continuation_source = args.resume_from_ckpt or args.model_path
@@ -1469,7 +1520,7 @@ def main():
     arch_group.add_argument("--no-deepembed", dest="use_deepembed", action="store_false", help="Disable V8 DeepEmbed for ablations or legacy checkpoints.")
     arch_group.add_argument("--use-rosa", dest="use_rosa", action="store_true", default=True, help="Enable V8 ROSA embedding path (default).")
     arch_group.add_argument("--no-rosa", dest="use_rosa", action="store_false", help="Disable V8 ROSA for ablations or legacy checkpoints.")
-    arch_group.add_argument("--rosa-max-context", dest="rosa_max_context", type=int, default=512, help="Capped token window used by ROSA.")
+    arch_group.add_argument("--rosa-max-context", dest="rosa_max_context", type=int, default=512, help="Compatibility setting retained in checkpoints; persistent ROSA carries full token history.")
     arch_group.add_argument("--rwkv-head-size", "--rwkv_head_size", dest="rwkv_head_size", type=int, default=None, help="RWKV matrix-state head size. Default auto-selects 64 when divisible, else a smaller divisor.")
     arch_group.add_argument("--rwkv-channel-mix-key-clamp", "--rwkv_channel_mix_key_clamp", dest="rwkv_channel_mix_key_clamp", type=float, default=12.0, help="Clamp RWKV channel-mix key preactivation before squared ReLU; 0 disables.")
     arch_group.add_argument("--rwkv-channel-mix-deepembed-clamp", "--rwkv_channel_mix_deepembed_clamp", dest="rwkv_channel_mix_deepembed_clamp", type=float, default=4.0, help="Clamp DeepEmbed's multiplicative RWKV channel-mix modulation before value projection; 0 disables.")
@@ -1507,6 +1558,25 @@ def main():
     )
     train_group.add_argument("--rwkv-weight-decay", "--rwkv_weight_decay", dest="rwkv_weight_decay", type=float, default=0.1, help="AdamW decay for RWKV matrices/embeddings; norms/scalars use 0 decay.")
     train_group.add_argument("--ltm-score-grad-scale", "--ltm_score_grad_scale", type=float, default=1.0, help="Straight-through gradient scale for LTM query/key addressing. Set 0 to keep retrieval addressing frozen.")
+    train_group.add_argument(
+        "--ltm-value-alignment-weight",
+        "--ltm_value_alignment_weight",
+        dest="ltm_value_alignment_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Experimental auxiliary weight that trains val_proj for safe Hebbian "
+            "validation writes. Default 0 preserves the legacy language-model objective."
+        ),
+    )
+    train_group.add_argument(
+        "--ltm-value-alignment-min-updates",
+        "--ltm_value_alignment_min_updates",
+        dest="ltm_value_alignment_min_updates",
+        type=int,
+        default=100,
+        help="Successful writer-training optimizer updates required before Hebbian writes are enabled (default: 100).",
+    )
     format_group = train_group.add_mutually_exclusive_group()
     format_group.add_argument("--kayla", action="store_true")
     format_group.add_argument(
@@ -1561,7 +1631,7 @@ def main():
     train_group.add_argument("--lora_alpha", type=int, default=16)
     train_group.add_argument("--grad-clip", type=float, default=1.0)
     train_group.add_argument("--max-sanitized-gradient-values", type=int, default=0, help="Deprecated compatibility no-op. Optimizer steps now always reject NaN/Inf gradients; finite gradients are still clipped with --grad-clip.")
-    train_group.add_argument("--startup-weight-max-abs", type=float, default=100.0, help="One-time startup clamp for finite model weights/buffers after checkpoint repair (0 disables).")
+    train_group.add_argument("--startup-weight-max-abs", type=float, default=0.0, help="Explicit emergency clamp for finite loaded weights/buffers; changes checkpoint values, so 0 is the compatibility-safe default.")
     train_group.add_argument("--max-ce-loss-for-backward", type=float, default=0.0, help="Clamp finite CE loss used for backward (0 disables; recommended for from-scratch training).")
     train_group.add_argument("--max-commitment-cost-for-backward", type=float, default=2.0, help="Clamp finite commitment cost used for backward to prevent auxiliary loss explosions (0 disables).")
     train_group.add_argument("--max-ponder-cost-for-backward", type=float, default=0.0, help="Clamp finite ponder cost used for backward (0 disables).")
@@ -1576,7 +1646,7 @@ def main():
     train_group.add_argument("--commitment-loss-weight", type=float, default=0.5)
     train_group.add_argument("--commitment-threshold", type=float, default=0.05)
     train_group.add_argument("--l_conv_atol", "--l-conv-atol", type=float, default=1e-4, help="Converge tolerance for WorkerLoop. Default: 1e-4.")
-    train_group.add_argument("--detach_every_n_steps", "--detach-every-n-steps", type=int, default=32, help="RWKV state detachment frequency. Default: 32.")
+    train_group.add_argument("--detach_every_n_steps", "--detach-every-n-steps", type=int, default=32, help="RWKV state detachment frequency. Use 0 to disable; default: 32.")
     train_group.add_argument("--h_halt_thresh", "--h-halt-thresh", type=float, default=0.9, help="H-RNN halt probability threshold. Default: 0.9.")
     train_group.add_argument("--encourage-thinking", action="store_true", help="Invert ponder loss to REWARD thinking (for recovery training).")
     train_group.add_argument("--adaptive-ponder", action="store_true", help="Scale ponder target based on CE loss (more thinking for harder content).")
@@ -1728,16 +1798,17 @@ def main():
     chat_group.add_argument("--ltm-schedule-min-lr", type=float, default=1e-5, help="Min LR for LTM cosine annealing.")
     chat_group.add_argument("--finetune-unlock-percent", type=float, default=None, help="Target %% of params to train (overrides lora_r).")
     chat_group.add_argument("--gradient-checkpointing", action="store_true", help="Enable gradient checkpointing.")
-    chat_group.add_argument("--passive-learning", action="store_true", default=True, help="Enable passive LTM learning from user prompts/observed context (ON by default).")
+    chat_group.add_argument("--passive-learning", action="store_true", default=False, help="Enable passive LTM learning from user prompts/observed context. Default OFF for checkpoint-stable inference.")
     chat_group.add_argument("--no-passive-learning", dest="passive_learning", action="store_false", help="Disable passive LTM learning.")
     chat_group.add_argument("--passive-response-learning", action="store_true", default=False, help="Also allow passive learning from self-generated responses after confidence/quality gates. Default: OFF.")
     chat_group.add_argument("--passive-lr", type=float, default=5e-6, help="Learning rate for passive LTM updates (default: 5e-6, very conservative).")
+    chat_group.add_argument("--online-ltm-grad-clip", type=float, default=0.75, help="Value/global-norm clip for finite online LTM gradients; non-finite gradients are always rejected.")
     chat_group.add_argument("--surprise-threshold", type=float, default=1.0, help="Passive learning only writes when loss <= this threshold (default: 1.0; lower is stricter).")
     chat_group.add_argument("--chat-state-file", type=str, nargs="?", const="auto", default=None, help="Autosave a new tiny model-neutral hierarchical chat state .pt file. Pass no value for an auto path.")
     chat_group.add_argument("--resume-chat-from-state-file", type=str, default=None, help="Resume and autosave a tiny model-neutral hierarchical chat state .pt file.")
     chat_group.add_argument("--carry-chat-state", action="store_true", default=False, help="Carry recurrent/hierarchical state across user turns. Default OFF for Alpaca train/chat parity; use Previous Context text for history instead.")
     chat_group.add_argument("--chat-prefill-chunk-size", type=int, default=None, help="Chunk prompt prefill like TBPTT training. Default: checkpoint training_chunk_size; use 0 for one full prompt forward.")
-    chat_group.add_argument("--chat-input-history-turns", type=int, default=4, help="For Alpaca chat, put this many previous turns in the ### Previous Context field (0 disables).")
+    chat_group.add_argument("--chat-input-history-turns", type=int, default=0, help="For Alpaca chat, put this many previous turns in the ### Previous Context field. Default 0 matches independent SFT samples.")
     chat_group.add_argument("--chat-input-history-chars", type=int, default=3000, help="Character cap for Alpaca chat ### Previous Context text.")
     
     # --- Utility Arguments ---
@@ -1799,7 +1870,10 @@ def main():
     
     # Tokenizer Loading
     tokenizer = None
-    tokenizer_source = args.tokenizer_path or args.model_path or "openai-community/gpt2"
+    tokenizer_source = resolve_tokenizer_source(
+        args.tokenizer_path,
+        args.model_path or args.resume_from_ckpt,
+    )
     try:
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=True)
         if tokenizer.pad_token is None:
@@ -1924,7 +1998,8 @@ def main():
 
         print(f"Loading model for post-training benchmarks: {args.model_path}")
         try:
-            model, _ = load_full_model_with_config(args.model_path, pt_device)
+            model, benchmark_config = load_full_model_with_config(args.model_path, pt_device)
+            validate_tokenizer_vocab(tokenizer, benchmark_config, args.model_path)
             clear_ltm_working_memory(model)
             model.suppress_hebbian = True
         except Exception as e:
@@ -2052,18 +2127,20 @@ def main():
             print(f"ERROR: Failed to load checkpoint: {e}")
             sys.exit(1)
         
-        # Extract and clean state dict
-        state_dict = checkpoint.get('model_state_dict', checkpoint)
-        clean_state_dict = sanitize_model_state_dict(state_dict, reset_transient_ltm=True)
-        _reject_unsupported_rwkv_state_dict(clean_state_dict, ckpt_path)
-        
-        # Extract config
-        config = dict(checkpoint.get('config', {}))
+        # Strictly validate every learned tensor before producing an inference
+        # export. This also applies deterministic legacy qproj adaptation.
+        try:
+            verified_model, verified_config = load_full_model_with_config(ckpt_path, torch.device("cpu"))
+        except Exception as e:
+            print(f"ERROR: Checkpoint failed coherent-load validation: {e}")
+            sys.exit(1)
+        clean_state_dict = sanitize_model_state_dict(verified_model, reset_transient_ltm=True)
+        config = dict(verified_config)
         completed_epoch = checkpoint.get('completed_epoch', checkpoint.get('epoch', 'unknown'))
-        _infer_arch_flags_from_state_dict(config, clean_state_dict)
         
         # Handle tokenizer
-        tokenizer_name = args.ckpt_tok_path or config.get('tokenizer_name', 'openai-community/gpt2')
+        tokenizer_name = resolve_export_tokenizer_source(args.ckpt_tok_path, config)
+        config['tokenizer_name'] = tokenizer_name
         print(f"  Tokenizer: {tokenizer_name}")
         
         # Load and verify tokenizer
@@ -2075,8 +2152,9 @@ def main():
             # Verify vocab size matches model
             model_vocab = config.get('vocab_size')
             if model_vocab and model_vocab != vocab_size:
-                print(f"  WARNING: Model vocab_size ({model_vocab}) != tokenizer vocab_size ({vocab_size})")
-                print(f"           Make sure you're using the same tokenizer as training!")
+                print(f"ERROR: Model vocab_size ({model_vocab}) != tokenizer vocab_size ({vocab_size})")
+                print("       Refusing to export an inference package with an incompatible tokenizer.")
+                sys.exit(1)
         except Exception as e:
             print(f"ERROR: Failed to load tokenizer '{tokenizer_name}': {e}")
             sys.exit(1)
@@ -2099,7 +2177,7 @@ def main():
             'converted_from': os.path.basename(ckpt_path),
             'tokenizer_name': tokenizer_name,
         }
-        torch.save(inference_checkpoint, model_path)
+        save_checkpoint_safely(inference_checkpoint, model_path)
         
         # Save config as JSON for easy inspection
         config_path = os.path.join(output_dir, "hierarchos_config.json")

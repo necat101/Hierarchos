@@ -3,6 +3,7 @@ import os
 import types
 import tempfile
 
+import pytest
 import torch
 
 from hierarchos.training.datasets import (
@@ -132,6 +133,18 @@ def _write_binary_token_cache(directory, rows, tokenizer, max_length=256):
     }, os.path.join(directory, "index.pt"))
     with open(os.path.join(directory, "_SUCCESS"), "w", encoding="utf-8") as f:
         json.dump({"samples": len(lengths)}, f)
+
+
+def test_binary_token_cache_rejects_truncated_data():
+    tokenizer = TinyTokenizer()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _write_binary_token_cache(tmpdir, [{"text": "cache integrity"}], tokenizer)
+        data_path = os.path.join(tmpdir, "tokens.bin")
+        with open(data_path, "r+b") as data_file:
+            data_file.truncate(os.path.getsize(data_path) - 1)
+
+        with pytest.raises(ValueError, match="data size mismatch"):
+            TokenizedBinaryDataset(tmpdir)
 
 
 def test_process_text_sample_autodetects_common_columns():

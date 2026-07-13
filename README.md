@@ -1,8 +1,34 @@
 -----
 
-# Hierarchos v0.20.5 (alpha): KortexHOS Release Profile + Local Benchmark Parity
+# Hierarchos v0.20.7 (alpha): Epoch-13 Compatibility + Safe LTM Writers
 
-**v0.20.5 focus**: the current KortexHOS/Hierarchos assistant release path is documented around the settings that produced coherent full-precision chat and stable local benchmark checks. Chat, lm-eval benchmarking, and TBPTT recurrence now use aligned chunk/drift behavior, so local CPU benchmark runs can be used as a cheap sanity check before spending more cloud compute.
+**v0.20.7 focus**: validate the coherent epoch-13 release weights as a real control and close the remaining untrained Hebbian-writer path without changing a learned parameter name or shape. The reference model remains `232,516,229` parameters and `95` state tensors. See [EPOCH13_CHECKPOINT_AUDIT.md](EPOCH13_CHECKPOINT_AUDIT.md) and the machine-readable [epoch-13 control report](checkpoint_audits/epoch13-control.json).
+
+**Real checkpoint compatibility**: all `95` tensors in the re-downloaded epoch-13 checkpoint strict-load finitely, tied embeddings remain tied, and the exact local tokenizer matches the `50,257`-token vocabulary. Chunked epoch-13 recurrence and one-token chat streaming match across a real `256`-token TBPTT boundary with maximum logit delta `1.144409e-05` over `270` tokens. A single nested download directory now resolves safely for both weights and tokenizer assets.
+
+**Safe online memory**: the historical language objective never trained `val_proj`, the projection used for Hebbian validation writes. Legacy checkpoints now block that random writer at the model boundary while retaining gradient-derived feedback learning. Future runs can opt into `--ltm-value-alignment-weight`; the energy-normalized auxiliary affects only the existing writer tensor, excludes it from AdamW decay, and requires `100` successful updates by default before enabling Hebbian writes. The default weight is `0.0`, preserving the legacy objective.
+
+**Epoch-13 weight findings**: the checkpoint is coherent and usable as a budget-saving v2 warm start, but it is specialized rather than optimal. ROSA routing is strong, LTM routing is nearly closed, and the two DeepEmbed tables average about `0.355` after historical weight decay from their `1.0` identity initialization. Do not reset these learned compensations; rehabilitate them gradually with diverse data and the corrected no-decay optimizer.
+
+**Verification**: `python -m pytest -q` reports `230 passed, 3 skipped`; `python tools/check_architecture_integrity.py` reports `65 passed, 1 documented warning, 0 failures`. The warning remains the legacy scalar-RWKV quantized path; coherent v8 checkpoints should use full precision.
+
+## Previous v0.20.6 Notes: Checkpoint-Compatible Architecture Hardening
+
+**v0.20.6 focus**: harden the coherent full-precision v8 path without changing the learned checkpoint layout. The reference `448/448/448` model remains `232,516,229` parameters, the state dictionary remains `95` tensors, and existing coherent checkpoints require no weight conversion. Strict synthetic checkpoint round-trip testing preserves every state key, tied embedding storage, and logits exactly.
+
+**Runtime parity fixes**: chat now applies drift only at absolute TBPTT boundaries, including when a carried conversation begins partway through a chunk, and consumes the final emitted token exactly once before state carry/save. The architecture control reports `2.384e-07` maximum logit drift across an in-chunk turn split.
+
+**Checkpoint and resume safety**: learned tensors must load completely and finitely; unsupported shape mismatches, duplicate compiled keys, and conflicting tied weights fail loudly. Saving never repairs or mutates live learned weights, gradients, optimizer moments, or finite LTM state. Checkpoint installation is atomic with rollback, exact resume requires finite optimizer/scheduler/scaler state, inference export preserves the tokenizer source recorded by training, and transient LTM working state is reset for clean static inference.
+
+**Training and memory hardening**: finite model gradients remain norm-clipped while NaN/Inf gradients skip the optimizer step. Filtered LTM retrieval is now per-query and differentiable, rows without valid slots do not decay because another row matched, DeepEmbed stays out of AdamW decay, and full-sequence LoRA finetuning no longer leaks post-backward fast-memory writes between unrelated batches.
+
+**Efficiency and evaluation fixes**: persistent ROSA builds its first automaton in one pass instead of computing the first chunk twice, automatic ROSA workers are bounded, token caches are integrity-checked before use, and lm-eval uses joint context/continuation BPE with correct causal scoring and real batching.
+
+**Verification**: `python -m pytest -q` reports `226 passed, 3 skipped`; `python tools/check_architecture_integrity.py` reports `57 passed, 1 documented warning, 0 failures`. The warning is that CPU/Vulkan quantized inference still targets the older scalar-RWKV format; current coherent v8 checkpoints should use the full-precision path.
+
+## Previous v0.20.5 Notes: KortexHOS Release Profile + Local Benchmark Parity
+
+**v0.20.5 focus**: the current KortexHOS/Hierarchos assistant release path is documented around the settings that produced coherent full-precision chat and stable local benchmark checks. Chat, lm-eval benchmarking, and TBPTT recurrence use aligned chunk/drift behavior, so local CPU benchmark runs can be used as a cheap sanity check before spending more cloud compute.
 
 **Recommended release chat profile**: for Alpaca-trained assistant checkpoints, start with full precision, static chat state, no passive LTM writes, no previous-turn input history, and conservative sampling: `--temperature 0.4 --top-k 40 --top-p 0.9 --repetition-penalty 1.15 --max-new-tokens 256 --no-passive-learning --chat-input-history-turns 0`.
 
@@ -200,7 +226,7 @@ max_ce_loss_for_backward=0.0
 - **`--no-amp` Flag**: Explicitly disable AMP if needed.
 
 #### 🧪 Test Suite
-- **11/11 Tests Pass**: Full architectural validation including gradient flow, state continuity, training convergence, memory gradients, sampling logic, coherence, forward/backward, inference generation, V7 backward compat, LTM decay parity, and momentum amplification.
+- **226 Tests Pass**: Validation covers gradient flow, recurrent state continuity, strict checkpoint loading, train/chat logit parity, LTM update and filtering behavior, sampling, token-cache integrity, evaluator scoring, and forward/backward execution. Three environment-specific tests are skipped on this Windows CPU test host.
 - **Self-Contained Tests**: All tests create models in-memory — no hardcoded checkpoint paths.
 
 
@@ -913,6 +939,8 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.4 --top-
 | `--ltm_lr`                     | `train`, `finetune`, `chat`         | Learning Rate for LTM "surprise" updates (or max LR for LTM schedule in chat).                                                         | `1e-3`                  |
 | `--ltm-training-mode`          | `train`                             | LTM fast-memory training mode. `inner-update` keeps supervised gradient fast-memory writes; `read-only` carries ROSA/history state only and better matches normal chat inference. | `inner-update`          |
 | `--inference-like-ltm-training` | `train`                            | Shortcut for `--ltm-training-mode read-only`; recommended for assistant rescue/coherence runs.                                         | `False`                 |
+| `--ltm-value-alignment-weight` | `train`, `finetune`                 | Opt-in energy-normalized auxiliary for training the Hebbian `val_proj` writer. It affects only that existing tensor; `0` preserves the legacy objective. | `0.0`                   |
+| `--ltm-value-alignment-min-updates` | `train`, `finetune`             | Successful writer-training optimizer updates required before a checkpoint enables Hebbian validation writes.                           | `100`                   |
 | `--assistant-recovery`         | `train`                             | Apply the v0.20.4 large-assistant SFT preset: Alpaca formatting, 4 epochs unless overridden, warmup+cosine LR, inference-like LTM training, prompt/response weights `0.10/1.0`, `2.0x` first `32` response tokens, `16` reserved response tokens, `0.003` ponder weight, and `5000` memory-gate warmup steps. | `False`                 |
 | `--mask-prompt-tokens`         | `train`, `finetune`                 | Legacy SFT behavior: exclude prompt/instruction/input tokens from CE. By default, prompt tokens are trained and can be downweighted.      | `False`                 |
 | `--allow-masked-active-labels` | `train`, `finetune`                 | Disable the fail-fast audit that rejects masked labels on real prompt/completion tokens when prompt-token training is active.             | `False`                 |
@@ -1036,6 +1064,25 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
   * **DirectML/ZLUDA communities** for enabling AMD GPU acceleration on Windows.
 
 ## Changelog
+
+### v0.20.7 (alpha)
+
+  * **Epoch-13 Control Validated**: The real `232,516,229`-parameter checkpoint strict-loads all `95` tensors, contains no non-finite learned state, and matches one-token chat streaming across a `256`-token boundary within `1.144409e-05` logits.
+  * **Legacy Hebbian Guard**: Checkpoints whose `val_proj` writer was never trained cannot inject random projected values into fast LTM memory. Gradient-derived chat feedback remains available.
+  * **Opt-In Writer Training**: Adds an energy-normalized `--ltm-value-alignment-weight` auxiliary, writer no-decay grouping, and a configurable readiness-update threshold without changing checkpoint tensor layout.
+  * **Nested Download Resolution**: A single unambiguous nested model package resolves its weights and exact tokenizer automatically.
+  * **Reproducible Weight Audit**: Adds `tools/audit_checkpoint_health.py`, a saved epoch-13 JSON control, and a detailed v2 warm-start assessment in `EPOCH13_CHECKPOINT_AUDIT.md`.
+  * **Expanded Verification**: `230 passed, 3 skipped`; architecture audit `65 passed, 1 documented legacy-quantization warning, 0 failures`.
+
+### v0.20.6 (alpha)
+
+  * **Checkpoint Compatibility Preserved**: No learned parameter names or shapes changed. The reference model remains `232,516,229` parameters with `95` state tensors.
+  * **Strict and Atomic Checkpoints**: Coherent loading rejects missing, unexpected, conflicting, shape-incompatible, or non-finite learned tensors. Saves reject rather than rewrite corrupt learned/optimizer/gradient state, do not mutate live finite LTM memory, and retain the previous checkpoint if atomic installation fails.
+  * **Carried-Chat TBPTT Parity**: Absolute chunk boundaries prevent a new conversation turn from accidentally reseeding drift in the middle of a training chunk; the final generated token is flushed once into carried state.
+  * **LTM Correctness**: Filtered retrieval handles no-match rows independently without severing addressing gradients, mixed batches avoid unintended decay, and non-finite inner-update gradients are rejected.
+  * **Trainer and Export Guardrails**: Exact resume restores optimizer/scheduler/scaler state, DeepEmbed is excluded from weight decay, full-sequence LoRA uses read-only fast memory, and inference export honors the tokenizer path stored by training.
+  * **ROSA and Evaluation Efficiency**: Persistent ROSA avoids duplicate first-chunk work and bounds automatic workers; token caches receive structural validation; lm-eval uses correct joint BPE continuation scoring and actual batches.
+  * **Expanded Verification**: `226 passed, 3 skipped`; architecture audit `57 passed, 1 documented legacy-quantization warning, 0 failures`.
 
 ### v0.20.5 (alpha)
 

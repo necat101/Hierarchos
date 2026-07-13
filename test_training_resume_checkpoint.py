@@ -3,6 +3,7 @@ import argparse
 import os
 import tempfile
 
+import pytest
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -31,6 +32,7 @@ from hierarchos.training.trainer import (
     _sanitize_gradient_nonfinite_,
     _clamp_model_finite_magnitude_,
     _clip_gradients_and_check,
+    configure_finetune_ltm_mode,
     ltm_inner_updates_enabled,
     normalize_ltm_training_mode,
 )
@@ -272,7 +274,7 @@ def test_training_checkpoint_preserves_resume_only_state():
     assert checkpoint["running_states"][0].device.type == "cpu"
 
 
-def test_training_checkpoint_repairs_nonfinite_model_before_snapshot():
+def test_training_checkpoint_builder_does_not_silently_repair_nonfinite_model():
     model = _FakeTrainModel()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     model.proj.weight.data.view(-1)[0] = float("inf")
@@ -290,9 +292,8 @@ def test_training_checkpoint_repairs_nonfinite_model_before_snapshot():
     )
 
     saved_weight = checkpoint["model_state_dict"]["proj.weight"]
-    assert torch.isfinite(saved_weight).all()
-    assert saved_weight.view(-1)[0].item() == 1.0
-    assert model.proj.weight.data.view(-1)[0].item() == 1.0
+    assert torch.isinf(saved_weight.view(-1)[0])
+    assert torch.isinf(model.proj.weight.data.view(-1)[0])
 
 
 def test_training_checkpoint_does_not_apply_startup_weight_clamp_mid_run():
@@ -521,6 +522,7 @@ def _continuation_parser_and_args(model_path=None, resume_from_ckpt=None, epochs
         "prompt_column": None,
         "completion_column": None,
         "max_length": 1024,
+        "h_stride": 4,
         "training_chunk_size": 256,
         "batch_size": 64,
         "starting_lr": 1e-4,
@@ -555,6 +557,38 @@ def _continuation_parser_and_args(model_path=None, resume_from_ckpt=None, epochs
     for key, value in defaults.items():
         parser.add_argument(f"--{key}", dest=key, default=value)
     return parser, SimpleNamespace(**defaults)
+
+
+def test_finetune_forces_read_only_ltm_to_prevent_cross_batch_leakage(capsys):
+    args = SimpleNamespace(ltm_training_mode="inner-update")
+
+    assert configure_finetune_ltm_mode(args) == "read-only"
+    assert args.ltm_training_mode == "read-only"
+    assert "leak into unrelated batches" in capsys.readouterr().out
+
+
+def test_cli_finetune_hydrates_shape_sensitive_runtime_defaults():
+    saved_config = {
+        "max_length": 8880,
+        "h_stride": 7,
+        "ltm_training_mode": "read-only",
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "hierarchos_config.json"), "w", encoding="utf-8") as f:
+            import json
+            json.dump(saved_config, f)
+
+        parser, args = _continuation_parser_and_args(model_path=tmp)
+        args.mode = "finetune"
+        hierarchos_cli._hydrate_training_args_from_model_config(
+            args,
+            parser,
+            explicit_dests={"out_dir"},
+        )
+
+    assert args.max_length == 8880
+    assert args.h_stride == 7
+    assert args.ltm_training_mode == "read-only"
 
 
 def test_cli_model_path_continuation_hydrates_saved_training_config():
@@ -1005,6 +1039,14 @@ def test_restore_model_grad_state_round_trips_pending_accumulation():
     assert torch.equal(model.proj.weight.grad, torch.full_like(model.proj.weight, 9.0))
 
 
+def test_restore_model_grad_state_rejects_nonfinite_pending_accumulation():
+    model = _FakeTrainModel()
+    grad_state = {"proj.weight": torch.full_like(model.proj.weight, float("nan"))}
+
+    with pytest.raises(RuntimeError, match="cannot be resumed safely"):
+        restore_model_grad_state(model, grad_state, torch.device("cpu"))
+
+
 def test_training_state_finite_rejects_poisoned_optimizer_state():
     model = _FakeTrainModel()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
@@ -1430,17 +1472,26 @@ def test_ltm_transient_recovery_resets_fast_and_saturates_momentum():
 
 def test_checkpoint_save_allows_clean_state_and_writes_file():
     model = _FakeTrainModel()
+    model.ltm.fast_vals.fill_(3.0)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "clean.pt")
 
-        saved = save_training_checkpoint_if_finite({"ok": torch.tensor(1)}, path, model, optimizer)
+        saved = save_training_checkpoint_if_finite(
+            {"model_state_dict": model.state_dict(), "training_complete": False},
+            path,
+            model,
+            optimizer,
+        )
+        loaded = torch.load(path, map_location="cpu", weights_only=False)
 
         assert saved is True
         assert os.path.exists(path)
+        assert torch.all(model.ltm.fast_vals == 3.0)
+        assert torch.all(loaded["model_state_dict"]["ltm.fast_vals"] == 3.0)
 
 
-def test_checkpoint_save_sanitizes_poisoned_gradient():
+def test_checkpoint_save_rejects_poisoned_gradient_without_mutating_it():
     model = _FakeTrainModel()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     model.proj.weight.grad = torch.ones_like(model.proj.weight)
@@ -1449,14 +1500,14 @@ def test_checkpoint_save_sanitizes_poisoned_gradient():
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "poisoned_grad.pt")
 
-        saved = save_training_checkpoint_if_finite({"bad": torch.tensor(1)}, path, model, optimizer)
+        with pytest.raises(RuntimeError, match="non-finite learned/gradient state"):
+            save_training_checkpoint_if_finite({"bad": torch.tensor(1)}, path, model, optimizer)
 
-        assert saved is True
-        assert os.path.exists(path)
-        assert model.proj.weight.grad.view(-1)[0].item() == 0.0
+        assert not os.path.exists(path)
+        assert torch.isnan(model.proj.weight.grad.view(-1)[0])
 
 
-def test_checkpoint_save_sanitizes_poisoned_optimizer_state():
+def test_checkpoint_save_rejects_poisoned_optimizer_state_without_mutating_it():
     model = _FakeTrainModel()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     x = torch.ones(1, 2)
@@ -1468,14 +1519,14 @@ def test_checkpoint_save_sanitizes_poisoned_optimizer_state():
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "poisoned_optimizer.pt")
 
-        saved = save_training_checkpoint_if_finite({"bad": torch.tensor(1)}, path, model, optimizer)
+        with pytest.raises(RuntimeError, match="non-finite optimizer state"):
+            save_training_checkpoint_if_finite({"bad": torch.tensor(1)}, path, model, optimizer)
 
-        assert saved is True
-        assert os.path.exists(path)
-        assert next(iter(optimizer.state.values()))["exp_avg"].view(-1)[0].item() == 0.0
+        assert not os.path.exists(path)
+        assert torch.isnan(next(iter(optimizer.state.values()))["exp_avg"].view(-1)[0])
 
 
-def test_checkpoint_save_sanitizes_poisoned_running_state_payload():
+def test_checkpoint_save_drops_poisoned_transient_running_state():
     model = _FakeTrainModel()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     checkpoint = {
@@ -1491,7 +1542,34 @@ def test_checkpoint_save_sanitizes_poisoned_running_state_payload():
 
         assert saved is True
         assert os.path.exists(path)
-        assert torch.equal(loaded["running_states"][0], torch.zeros(1))
+        assert loaded["running_states"] is None
+
+
+def test_checkpoint_save_rejects_nonfinite_live_learned_weight():
+    model = _FakeTrainModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    model.proj.weight.data.view(-1)[0] = float("nan")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "poisoned_weight.pt")
+        with pytest.raises(RuntimeError, match="non-finite learned/gradient state"):
+            save_training_checkpoint_if_finite({"model_state_dict": model.state_dict()}, path, model, optimizer)
+
+        assert not os.path.exists(path)
+        assert torch.isnan(model.proj.weight.data.view(-1)[0])
+
+
+def test_checkpoint_save_rejects_nonfinite_python_scheduler_scalar():
+    model = _FakeTrainModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    checkpoint = {"scheduler_state_dict": {"_last_lr": [float("nan")]}}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "poisoned_scheduler.pt")
+        with pytest.raises(RuntimeError, match="non-finite payload state"):
+            save_training_checkpoint_if_finite(checkpoint, path, model, optimizer)
+
+        assert not os.path.exists(path)
 
 
 def test_checkpoint_save_refreshes_stale_poisoned_model_snapshot():

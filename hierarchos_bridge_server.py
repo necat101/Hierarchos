@@ -584,7 +584,7 @@ def handle_load_model(params: dict):
         clear_ltm_working_memory(model)
         _model = model
         _model.eval()
-        _model.suppress_hebbian = False
+        _model.suppress_hebbian = True
         _config = dict(cfg) if hasattr(cfg, 'items') else {}
         _reset_runtime_state()
         emit_load_progress(0.76, "Checking saved LTM updates")

@@ -25,6 +25,19 @@ class AttrDict(dict):
         super(AttrDict, self).__init__(*args, **kwargs)
         self.__dict__ = self
 
+
+def _uses_exact_refinement_policy(config) -> bool:
+    """Match exact/full-sample control flow; quantization still changes logits."""
+    if isinstance(config, dict):
+        return bool(
+            config.get("full_sample_bptt", False)
+            or config.get("inference_logit_parity", False)
+        )
+    return bool(
+        getattr(config, "full_sample_bptt", False)
+        or getattr(config, "inference_logit_parity", False)
+    )
+
 def get_q_block_size(qtype: str) -> int:
     """Returns the block size for a given quantization type."""
     if qtype in ["INT4", "Q4_0", "Q8_0"]:
@@ -319,6 +332,12 @@ class QuantizedHierarchos:
         
         self.use_context_aware_query = (self.qproj.K == self.config.context_dim * 2)
         print(f"Initialized QuantizedHierarchos ({self.qtype}) with RWKV recurrence.")
+        if _uses_exact_refinement_policy(self.config):
+            print(
+                "INFO: Quantized inference is using the exact-checkpoint refinement "
+                "policy. Quantization changes numerical logits, so this is control-flow "
+                "compatibility rather than numerical logit parity."
+            )
 
     def __call__(self, input_ids: torch.LongTensor, 
                  h_state: torch.Tensor, l_state: torch.Tensor, 
@@ -328,6 +347,32 @@ class QuantizedHierarchos:
                  drift_state=None, ltm_memory_state=None, **kwargs):
         
         B, T = input_ids.shape
+        # Quantization necessarily changes numerical logits, but exact-BPTT
+        # checkpoints must still use the same refinement/early-exit policy and
+        # configured drift bounds as their full-precision training graph.
+        exact_refinement = _uses_exact_refinement_policy(self.config)
+        drift_state_clamp = float(getattr(self.config, "drift_state_clamp", 5.0) or 5.0)
+        drift_norm_clamp = float(getattr(self.config, "drift_norm_clamp", 0.0) or 0.0)
+        drift_delta_scale = float(getattr(self.config, "drift_delta_scale", 1.0) or 1.0)
+        recurrent_state_clamp = float(getattr(self.config, "recurrent_state_clamp", 50.0) or 50.0)
+        context_state_clamp = float(getattr(self.config, "context_state_clamp", 50.0) or 50.0)
+
+        def clamp_drift(value):
+            value = torch.nan_to_num(
+                value,
+                nan=0.0,
+                posinf=drift_state_clamp,
+                neginf=-drift_state_clamp,
+            ).clamp(min=-drift_state_clamp, max=drift_state_clamp)
+            if drift_norm_clamp > 0.0:
+                norm = torch.linalg.vector_norm(value.float(), dim=-1, keepdim=True)
+                scale = torch.clamp(
+                    value.new_tensor(drift_norm_clamp)
+                    / (norm.to(dtype=value.dtype) + 1e-6),
+                    max=1.0,
+                )
+                value = value * scale
+            return value
         allow_hebbian_update = kwargs.pop("allow_hebbian_update", False)
         suppress_hebbian = kwargs.pop("suppress_hebbian", getattr(self, "suppress_hebbian", True))
         hebbian_writer_ready = bool(getattr(self.config, "val_proj_trained", False))
@@ -450,7 +495,12 @@ class QuantizedHierarchos:
                 h_halt_probs = [torch.sigmoid(self.h_halt_proj(h_out_real, device=device).squeeze(-1))]
                 shadow_h_state = h_state.clone()
                 for step_idx in range(self.config.max_h_steps - 1):
-                    if h_halt_probs[-1].mean() > getattr(self.config, 'h_halt_thresh', 0.9): break
+                    if (
+                        not exact_refinement
+                        and h_halt_probs[-1].mean()
+                        > getattr(self.config, 'h_halt_thresh', 0.9)
+                    ):
+                        break
                     h_out_ponder, shadow_h_state = self.h_rnn(enc_with_feedback, shadow_h_state, device=device)
                     h_step_outputs.append(h_out_ponder)
                     h_halt_probs.append(torch.sigmoid(self.h_halt_proj(h_out_ponder, device=device).squeeze(-1)))
@@ -465,15 +515,26 @@ class QuantizedHierarchos:
                 weights, remainder = weights / total, remainder / total
                 final_h_out = (weights.unsqueeze(-1) * h_stack).sum(dim=0) + remainder.unsqueeze(-1) * h_stack[-1]
                 curr_target_context = self.h_to_context(final_h_out, device=device)
-                curr_target_context = torch.clamp(curr_target_context, min=-50.0, max=50.0)
+                curr_target_context = torch.clamp(
+                    curr_target_context,
+                    min=-context_state_clamp,
+                    max=context_state_clamp,
+                )
             
             alpha = (abs_t % stride) / float(stride)
             static_context = curr_prev_context + (curr_target_context - curr_prev_context) * alpha
 
             if t == 0 and drift_seed is not None:
-                current_drift = torch.clamp(drift_seed.to(device), min=-5.0, max=5.0)
+                current_drift = clamp_drift(drift_seed.to(device))
             elif self.context_drift_proj is not None:
-                current_drift = torch.clamp(torch.tanh(self.context_drift_proj(l_state[:, :, 0].to(device), device=device)), min=-5.0, max=5.0)
+                current_drift = clamp_drift(
+                    torch.tanh(
+                        self.context_drift_proj(
+                            l_state[:, :, 0].to(device),
+                            device=device,
+                        )
+                    )
+                )
             else:
                 current_drift = torch.zeros_like(static_context)
             
@@ -482,14 +543,21 @@ class QuantizedHierarchos:
                 l_input = self.l_input_proj(torch.cat([enc.to(device), (static_context + current_drift).to(device)], dim=-1), device=device)
                 l_out, shadow_l_state = self.l_rnn(l_input, shadow_l_state, device=device)
                 if self.context_drift_proj is not None:
-                    drift_delta = torch.tanh(self.context_drift_proj(l_out, device=device))
-                    current_drift = torch.clamp(current_drift + drift_delta, min=-5.0, max=5.0)
+                    drift_delta = (
+                        torch.tanh(self.context_drift_proj(l_out, device=device))
+                        * drift_delta_scale
+                    )
+                    current_drift = clamp_drift(current_drift + drift_delta)
                     if torch.mean(torch.abs(drift_delta)) < self.config.l_conv_atol: break
                 else: break
             
             l_input = self.l_input_proj(torch.cat([enc.to(device), (static_context + current_drift).to(device)], dim=-1), device=device)
             l_out, l_state = self.l_rnn(l_input, l_state, device=device)
-            l_state = torch.clamp(l_state, min=-50.0, max=50.0)
+            l_state = torch.clamp(
+                l_state,
+                min=-recurrent_state_clamp,
+                max=recurrent_state_clamp,
+            )
             enc = enc + self.l_to_out(l_out, device=device)
             logits = self.lm_head(self.out_norm(enc.cpu()), device=device)
 

@@ -534,8 +534,37 @@ def tbptt_chunk_ranges(length, chunk_size, global_offset=0):
     return ranges
 
 
-def boundary_drift_seed(drift_state, global_offset, chunk_size):
-    """Return carried drift only where training would begin a new TBPTT chunk."""
+def resolve_inference_prefill_chunk_size(config, requested=None):
+    """Choose the prefill geometry that matches the checkpoint's training graph."""
+    if requested is not None:
+        return max(0, int(requested or 0))
+    if bool(
+        getattr(config, "full_sample_bptt", False)
+        or getattr(config, "inference_logit_parity", False)
+    ):
+        # training_chunk_size is retained by exact-BPTT training for token-cache,
+        # ROSA, LTM-decay, and compile metadata.  It is not a forward boundary.
+        return 0
+    return max(0, int(getattr(config, "training_chunk_size", 0) or 0))
+
+
+def boundary_drift_seed(
+    drift_state,
+    global_offset,
+    chunk_size,
+    *,
+    exact_full_sample=False,
+):
+    """Return the drift seed used by the checkpoint's training recurrence.
+
+    Exact full-sample training has no semantic boundary at an activation-only
+    segment edge. Its next token derives drift from the attached worker state,
+    exactly as an uninterrupted forward does. Legacy TBPTT intentionally
+    carried final drift into aligned training-chunk boundaries, so retain that
+    behavior for older checkpoints.
+    """
+    if exact_full_sample:
+        return None
     chunk_size = int(chunk_size or 0)
     global_offset = int(global_offset or 0)
     if chunk_size > 0 and global_offset > 0 and global_offset % chunk_size == 0:
@@ -704,7 +733,12 @@ def generate_sample(model, tokenizer, prompt, device, max_new_tokens=100, temper
     h_state, l_state, p_ctx, t_ctx = None, None, None, None
     drift_state = None
     ltm_state = None
-    prefill_chunk_size = int(getattr(getattr(model, "config", None), "training_chunk_size", 0) or 0)
+    model_config = getattr(model, "config", None)
+    exact_full_sample = bool(
+        getattr(model_config, "full_sample_bptt", False)
+        or getattr(model_config, "inference_logit_parity", False)
+    )
+    prefill_chunk_size = resolve_inference_prefill_chunk_size(model_config)
     total_tokens_generated = 0
 
     try:
@@ -732,7 +766,12 @@ def generate_sample(model, tokenizer, prompt, device, max_new_tokens=100, temper
                 p_ctx, t_ctx = outputs['prev_context'], outputs['target_context']
                 drift_state = outputs.get('drift_state', drift_state)
                 ltm_state = outputs.get('ltm_memory_state')
-                chunk_drift_state = drift_state
+                chunk_drift_state = boundary_drift_seed(
+                    drift_state,
+                    end,
+                    prefill_chunk_size,
+                    exact_full_sample=exact_full_sample,
+                )
                 logits = outputs['logits'][:, -1, :]
             total_tokens_generated = prefill_len
 
@@ -753,12 +792,11 @@ def generate_sample(model, tokenizer, prompt, device, max_new_tokens=100, temper
                     l_state=l_state,
                     prev_context=p_ctx,
                     target_context=t_ctx,
-                    drift_state=(
-                        drift_state
-                        if prefill_chunk_size > 0
-                        and total_tokens_generated > 0
-                        and total_tokens_generated % prefill_chunk_size == 0
-                        else None
+                    drift_state=boundary_drift_seed(
+                        drift_state,
+                        total_tokens_generated,
+                        prefill_chunk_size,
+                        exact_full_sample=exact_full_sample,
                     ),
                     ltm_memory_state=ltm_state,
                     global_pos_offset=total_tokens_generated,
@@ -1365,12 +1403,14 @@ def chat(args, device, tokenizer):
         chat_input_history_chars = int(getattr(args, "chat_input_history_chars", 3000) or 0)
         carry_chat_state = bool(getattr(args, "carry_chat_state", False))
         requested_prefill_chunk = getattr(args, "chat_prefill_chunk_size", None)
-        if requested_prefill_chunk is None:
-            chat_prefill_chunk_size = int(getattr(config, "training_chunk_size", 0) or 0)
-        else:
-            chat_prefill_chunk_size = int(requested_prefill_chunk or 0)
-        if chat_prefill_chunk_size < 0:
-            chat_prefill_chunk_size = 0
+        chat_prefill_chunk_size = resolve_inference_prefill_chunk_size(
+            config,
+            requested_prefill_chunk,
+        )
+        exact_inference_recurrence = bool(
+            getattr(config, "full_sample_bptt", False)
+            or getattr(config, "inference_logit_parity", False)
+        )
         chat_turn_history = []
         if alpaca_chat_format:
             if chat_input_history_turns > 0 and chat_input_history_chars > 0:
@@ -1387,7 +1427,13 @@ def chat(args, device, tokenizer):
         else:
             print("Chat state carry: OFF (train-parity mode; use Previous Context text for turn history).")
         if chat_prefill_chunk_size > 0:
-            print(f"Chat prefill chunking: {chat_prefill_chunk_size} tokens (TBPTT train-parity mode).")
+            if exact_inference_recurrence:
+                print(
+                    f"Chat prefill chunking: {chat_prefill_chunk_size} tokens "
+                    "(exact full-sample recurrence; activation boundary only)."
+                )
+            else:
+                print(f"Chat prefill chunking: {chat_prefill_chunk_size} tokens (TBPTT train-parity mode).")
         else:
             print("Chat prefill chunking: OFF (single full prompt forward).")
 
@@ -1757,6 +1803,7 @@ def chat(args, device, tokenizer):
                             drift_state,
                             absolute_start,
                             chat_prefill_chunk_size,
+                            exact_full_sample=exact_inference_recurrence,
                         ),
                         ltm_state=ltm_state,
                         global_pos_offset=absolute_start,
@@ -1833,6 +1880,7 @@ def chat(args, device, tokenizer):
                                 drift_state,
                                 total_tokens_generated,
                                 chat_prefill_chunk_size,
+                                exact_full_sample=exact_inference_recurrence,
                             ),
                             ltm_state=ltm_state,
                             global_pos_offset=total_tokens_generated,
@@ -1907,6 +1955,7 @@ def chat(args, device, tokenizer):
                             drift_state,
                             total_tokens_generated,
                             chat_prefill_chunk_size,
+                            exact_full_sample=exact_inference_recurrence,
                         ),
                         ltm_state=ltm_state,
                         global_pos_offset=total_tokens_generated,

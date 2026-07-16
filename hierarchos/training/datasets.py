@@ -1,6 +1,7 @@
 import os
 import json
 import mmap
+import sys
 import torch
 import traceback
 import functools
@@ -9,6 +10,28 @@ from collections import OrderedDict
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader, IterableDataset, Sampler
 from typing import Optional, List, Dict, Any
+
+
+def _shared_epoch_counter():
+    """Create an epoch value that persistent DataLoader workers can observe."""
+    epoch = torch.zeros((), dtype=torch.int64)
+    try:
+        epoch.share_memory_()
+    except RuntimeError:
+        # Single-process and restricted shared-memory environments still work;
+        # only cross-process persistent-worker updates lose this fast path.
+        pass
+    return epoch
+
+
+def _set_iterable_epoch(dataset, epoch: int):
+    epoch = int(epoch)
+    dataset.epoch = epoch
+    dataset._shared_epoch.fill_(epoch)
+
+
+def _get_iterable_epoch(dataset):
+    return int(dataset._shared_epoch.item())
 
 # Helper for AttrDict access
 class AttrDict(dict):
@@ -28,7 +51,9 @@ class LengthGroupedBatchSampler(Sampler):
                  seed: Optional[int] = None, preserve_order: bool = False):
         if batch_size <= 0:
             raise ValueError("batch_size must be a positive integer")
-        self.lengths = [max(1, int(length)) for length in lengths]
+        self.lengths = _lengths_to_cpu_tensor(lengths)
+        if self.lengths is None:
+            raise ValueError("lengths must be a one-dimensional sequence of integers")
         self.batch_size = int(batch_size)
         self.shuffle = bool(shuffle)
         self.drop_last = bool(drop_last)
@@ -53,35 +78,61 @@ class LengthGroupedBatchSampler(Sampler):
     def __iter__(self):
         generator = torch.Generator()
         generator.manual_seed((self.seed + self.epoch) % (2**63 - 1))
+        sample_count = len(self.lengths)
 
-        if self.shuffle and not self.preserve_order and len(self.lengths) > 1:
-            indices = torch.randperm(len(self.lengths), generator=generator).tolist()
+        if self.shuffle and not self.preserve_order and sample_count > 1:
+            indices = torch.randperm(sample_count, generator=generator)
         else:
-            indices = list(range(len(self.lengths)))
+            indices = torch.arange(sample_count, dtype=torch.long)
 
-        batches = []
-        for bucket_start in range(0, len(indices), self.bucket_size):
-            bucket = indices[bucket_start:bucket_start + self.bucket_size]
+        # Keep the epoch permutation and sorted windows as compact tensors. The
+        # previous implementation expanded every index into Python integers and
+        # retained a Python list for every batch before it could yield the first
+        # one. At multi-million-sample scale that consumed hundreds of MiB and
+        # made epoch startup Python-sort bound.
+        for bucket_start in range(0, sample_count, self.bucket_size):
+            bucket_end = min(sample_count, bucket_start + self.bucket_size)
             if self.shuffle:
-                bucket.sort(key=self.lengths.__getitem__, reverse=True)
-            bucket_batches = []
-            for batch_start in range(0, len(bucket), self.batch_size):
-                batch = bucket[batch_start:batch_start + self.batch_size]
-                if len(batch) == self.batch_size or not self.drop_last:
-                    bucket_batches.append(batch)
-            if self.shuffle and self.preserve_order and len(bucket_batches) > 1:
-                order = torch.randperm(len(bucket_batches), generator=generator).tolist()
-                batches.extend(bucket_batches[batch_idx] for batch_idx in order)
-            else:
-                batches.extend(bucket_batches)
+                bucket = indices[bucket_start:bucket_end]
+                bucket_lengths = self.lengths.index_select(0, bucket)
+                length_order = torch.argsort(
+                    bucket_lengths,
+                    descending=True,
+                    stable=True,
+                )
+                indices[bucket_start:bucket_end] = bucket.index_select(0, length_order)
 
-        if self.shuffle and not self.preserve_order and len(batches) > 1:
-            order = torch.randperm(len(batches), generator=generator).tolist()
-            for batch_idx in order:
-                yield batches[batch_idx]
+        if self.shuffle and self.preserve_order:
+            # PT caches use this mode to keep each length window local on disk
+            # while randomizing the batches inside that window.
+            for bucket_start in range(0, sample_count, self.bucket_size):
+                bucket_end = min(sample_count, bucket_start + self.bucket_size)
+                bucket_count = bucket_end - bucket_start
+                if self.drop_last:
+                    batch_count = bucket_count // self.batch_size
+                else:
+                    batch_count = (bucket_count + self.batch_size - 1) // self.batch_size
+                if batch_count > 1:
+                    batch_order = torch.randperm(batch_count, generator=generator)
+                else:
+                    batch_order = range(batch_count)
+                for local_batch_idx in batch_order:
+                    batch_start = bucket_start + int(local_batch_idx) * self.batch_size
+                    batch_end = min(bucket_end, batch_start + self.batch_size)
+                    if batch_end - batch_start == self.batch_size or not self.drop_last:
+                        yield indices[batch_start:batch_end].tolist()
+            return
+
+        batch_count = len(self)
+        if self.shuffle and not self.preserve_order and batch_count > 1:
+            batch_order = torch.randperm(batch_count, generator=generator)
         else:
-            for batch in batches:
-                yield batch
+            batch_order = range(batch_count)
+        for batch_idx in batch_order:
+            batch_start = int(batch_idx) * self.batch_size
+            batch_end = min(sample_count, batch_start + self.batch_size)
+            if batch_end - batch_start == self.batch_size or not self.drop_last:
+                yield indices[batch_start:batch_end].tolist()
 
 class EpochShuffleSampler(Sampler):
     """Deterministic map-style sampler with an epoch hook for resume parity."""
@@ -106,14 +157,50 @@ class EpochShuffleSampler(Sampler):
         else:
             yield from range(length)
 
-def _normalize_sample_lengths(dataset, lengths):
+_INTEGER_LENGTH_DTYPES = {
+    torch.uint8,
+    torch.int8,
+    torch.int16,
+    torch.int32,
+    torch.int64,
+}
+
+
+def _lengths_to_cpu_tensor(lengths):
     if lengths is None:
         return None
     try:
-        lengths = [max(1, int(length)) for length in lengths]
-    except (TypeError, ValueError):
+        if isinstance(lengths, torch.Tensor):
+            length_tensor = lengths.detach()
+        else:
+            try:
+                length_tensor = torch.as_tensor(lengths)
+            except (TypeError, ValueError, RuntimeError):
+                length_tensor = torch.tensor(
+                    [int(length) for length in lengths],
+                    dtype=torch.long,
+                )
+        if length_tensor.is_complex():
+            return None
+        if length_tensor.is_floating_point():
+            if not bool(torch.isfinite(length_tensor).all().item()):
+                return None
+            length_tensor = length_tensor.to(dtype=torch.long)
+        elif length_tensor.dtype not in _INTEGER_LENGTH_DTYPES:
+            length_tensor = length_tensor.to(dtype=torch.long)
+        if length_tensor.device.type != "cpu":
+            length_tensor = length_tensor.to(device="cpu")
+        length_tensor = length_tensor.reshape(-1)
+        if length_tensor.numel() > 0 and bool((length_tensor < 1).any().item()):
+            length_tensor = length_tensor.clamp_min(1)
+        return length_tensor.contiguous()
+    except (TypeError, ValueError, RuntimeError, OverflowError):
         return None
-    if len(lengths) != len(dataset):
+
+
+def _normalize_sample_lengths(dataset, lengths):
+    lengths = _lengths_to_cpu_tensor(lengths)
+    if lengths is None or len(lengths) != len(dataset):
         return None
     return lengths
 
@@ -158,7 +245,8 @@ def _resolve_prefetch_factor(num_workers: int, prefetch_factor=None, pin_memory:
 
 def _create_dataloader(dataset, *, batch_size=None, collate_fn=None, num_workers=0,
                        pin_memory=False, shuffle=None, drop_last=False,
-                       batch_sampler=None, sampler=None, prefetch_factor=None):
+                       batch_sampler=None, sampler=None, prefetch_factor=None,
+                       in_order=True):
     resolved_num_workers = int(num_workers or 0)
     if resolved_num_workers < 0:
         resolved_num_workers = 0
@@ -189,8 +277,21 @@ def _create_dataloader(dataset, *, batch_size=None, collate_fn=None, num_workers
         )
     else:
         kwargs["persistent_workers"] = False
+    if not bool(in_order) and kwargs["num_workers"] > 0:
+        # Cache construction consumes every row before training and later uses
+        # an explicit shuffling sampler, so FIFO worker delivery only creates
+        # head-of-line blocking without adding a semantic guarantee.
+        kwargs["in_order"] = False
 
-    return DataLoader(**kwargs)
+    try:
+        return DataLoader(**kwargs)
+    except TypeError as exc:
+        # Keep older supported PyTorch releases functional; in_order was added
+        # after the original training code and is only a cache-build speed hint.
+        if "in_order" not in kwargs:
+            raise
+        kwargs.pop("in_order", None)
+        return DataLoader(**kwargs)
 
 def _as_long_tensor(value):
     if isinstance(value, torch.Tensor):
@@ -397,6 +498,32 @@ def _yield_length_bucket(buffer, batch_size: int, shuffle: bool, generator: torc
         for item in buffer:
             yield item
 
+
+def _attach_precomputed_rosa(sample, vocab_size: int, chunk_size: int,
+                             max_context: int = 512):
+    """Attach exact cached ROSA ids inside a loader worker."""
+    if sample is None:
+        return None
+    from hierarchos.utils.rosa import precompute_rosa_ids_for_chunks
+
+    input_ids = sample.get("input_ids")
+    if isinstance(input_ids, torch.Tensor):
+        tokens = input_ids.detach().cpu().tolist()
+    else:
+        tokens = list(input_ids or [])
+    sentinel = int(vocab_size)
+    sample["rosa_ids"] = torch.tensor(
+        precompute_rosa_ids_for_chunks(
+            tokens,
+            vocab_size=sentinel,
+            chunk_size=max(1, int(chunk_size or len(tokens) or 1)),
+            rosa_max_ctx=max(1, int(max_context or 512)),
+        ),
+        dtype=torch.long,
+    )
+    sample["_rosa_sentinel"] = sentinel
+    return sample
+
 _TEXT_COLUMN_CANDIDATES = ("text", "content")
 _PROMPT_COMPLETION_COLUMN_CANDIDATES = (
     ("instruction", "output"),
@@ -514,9 +641,16 @@ def _iter_jsonl_lines_for_worker(path: str, worker_id: int, num_workers: int):
     start_byte = (file_size * worker_id) // num_workers
     end_byte = (file_size * (worker_id + 1)) // num_workers
     with open(path, "rb") as f:
-        f.seek(start_byte)
         if start_byte > 0:
-            f.readline()
+            # Only discard a partial line. If the range starts immediately
+            # after a newline, seeking to start_byte and calling readline()
+            # would incorrectly drop the first complete record in this shard.
+            f.seek(start_byte - 1)
+            preceding_byte = f.read(1)
+            if preceding_byte != b"\n":
+                f.readline()
+        else:
+            f.seek(0)
         while True:
             if worker_id != num_workers - 1 and f.tell() >= end_byte:
                 break
@@ -528,6 +662,35 @@ def _iter_jsonl_lines_for_worker(path: str, worker_id: int, num_workers: int):
             except UnicodeDecodeError:
                 continue
 
+
+def _assign_jsonl_shards(paths, num_workers: int):
+    """Deterministically balance whole JSONL shards by byte size."""
+    paths = list(paths)
+    num_workers = max(1, int(num_workers))
+    assignments = [[] for _ in range(num_workers)]
+    loads = [0] * num_workers
+    sized_paths = []
+    for path_idx, path in enumerate(paths):
+        try:
+            size = max(0, int(os.path.getsize(path)))
+        except OSError:
+            size = 0
+        sized_paths.append((path_idx, path, size))
+
+    # Longest-processing-time scheduling sharply reduces tail-worker idle time
+    # for uneven export shards. Stable input indexes make assignment repeatable.
+    for path_idx, path, size in sorted(sized_paths, key=lambda row: (-row[2], row[0])):
+        worker_id = min(range(num_workers), key=lambda idx: (loads[idx], idx))
+        assignments[worker_id].append((path_idx, path))
+        loads[worker_id] += size
+
+    # Preserve source order within each worker so only the worker assignment,
+    # not the local record order, changes.
+    return [
+        [path for _path_idx, path in sorted(worker_paths)]
+        for worker_paths in assignments
+    ]
+
 def _iter_jsonl_shards_for_worker(paths, worker_id: int, num_workers: int):
     paths = list(paths)
     if not paths:
@@ -536,9 +699,11 @@ def _iter_jsonl_shards_for_worker(paths, worker_id: int, num_workers: int):
     # Prefer whole-file assignment when there are enough physical shards. This
     # avoids multiple workers seeking/reading the same file at once.
     if num_workers <= 1 or len(paths) >= num_workers:
-        assigned_paths = paths if num_workers <= 1 else [
-            path for path_idx, path in enumerate(paths) if path_idx % num_workers == worker_id
-        ]
+        assigned_paths = (
+            paths
+            if num_workers <= 1
+            else _assign_jsonl_shards(paths, num_workers)[worker_id]
+        )
         for path in assigned_paths:
             yield from _iter_jsonl_lines_for_worker(path, 0, 1)
         return
@@ -564,9 +729,10 @@ class IterableChunkedJSONLDataset(IterableDataset):
         self.shuffle_buckets = bool(shuffle_buckets)
         self.seed = int(torch.initial_seed()) % (2**63 - 1)
         self.epoch = 0
+        self._shared_epoch = _shared_epoch_counter()
 
     def set_epoch(self, epoch: int):
-        self.epoch = int(epoch)
+        _set_iterable_epoch(self, epoch)
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
@@ -578,7 +744,8 @@ class IterableChunkedJSONLDataset(IterableDataset):
         processed_count = 0
         bucket = []
         generator = torch.Generator()
-        generator.manual_seed((self.seed + self.epoch + worker_id) % (2**63 - 1))
+        epoch = _get_iterable_epoch(self)
+        generator.manual_seed((self.seed + epoch + worker_id) % (2**63 - 1))
 
         try:
             for _line_num, line in _iter_jsonl_shards_for_worker(self.paths, worker_id, num_workers):
@@ -732,7 +899,7 @@ def create_dataloader_pt_chunked(directory_path, max_length, batch_size, num_wor
     use_cuda = _pin_memory_for_device(device)
     drop_last = False
     lengths = _get_dataset_sample_lengths(dataset) if use_length_bucketing and batch_size > 1 else None
-    if lengths:
+    if lengths is not None and len(lengths) > 0:
         batch_sampler = LengthGroupedBatchSampler(
             lengths,
             batch_size=batch_size,
@@ -765,16 +932,20 @@ class TokenizedBinaryDataset(Dataset):
     """
     Random-access token cache backed by one binary file plus a compact index.
 
-    Each record is stored as variable-length int32 input ids followed by int32
-    labels. Attention masks are generated during collation from the record
-    length, so the cache avoids padded max_length tensors.
+    Legacy records store variable-length int32 input ids followed by int32
+    labels and optional inline weights/ROSA ids. Schema v6 records use lossless
+    uint16 ids when the vocabulary fits and keep loss weights as palette-coded
+    runs in the index. Attention masks are generated from each record length,
+    so neither format stores padded max_length tensors.
     """
-    def __init__(self, directory_path: str, max_length: Optional[int] = None):
+    def __init__(self, directory_path: str, max_length: Optional[int] = None,
+                 pad_token_id: int = 0):
         super().__init__()
         self._file = None
         self._mmap = None
         self.directory_path = directory_path
         self.max_length = int(max_length or 0)
+        self.pad_token_id = int(pad_token_id)
         index_path = os.path.join(directory_path, "index.pt")
         data_path = os.path.join(directory_path, "tokens.bin")
         if not os.path.exists(index_path):
@@ -788,57 +959,269 @@ class TokenizedBinaryDataset(Dataset):
             index = torch.load(index_path, map_location="cpu")
         if not isinstance(index, dict) or "offsets" not in index or "lengths" not in index:
             raise ValueError("Token cache index must contain offsets and lengths")
-        self.offsets = index["offsets"].to(dtype=torch.long).contiguous()
-        self.lengths = index["lengths"].to(dtype=torch.long).contiguous()
-        self.has_rosa_ids = bool(index.get("has_rosa_ids", False))
-        self.has_loss_weights = bool(index.get("has_loss_weights", False))
-        self.loss_weight_dtype = str(index.get("loss_weight_dtype", "float16"))
-        if self.loss_weight_dtype == "float32":
-            self._loss_weight_torch_dtype = torch.float32
-            self._loss_weight_bytes = 4
-        elif self.loss_weight_dtype in ("float16", "None", "none"):
-            self._loss_weight_torch_dtype = torch.float16
-            self._loss_weight_bytes = 2
-        else:
-            raise ValueError(f"Unsupported token-cache loss weight dtype: {self.loss_weight_dtype}")
-        self.rosa_sentinel = int(index.get("rosa_sentinel", 0))
-        if self.offsets.numel() != self.lengths.numel():
+        self.offsets = index["offsets"].to(device="cpu", dtype=torch.long).reshape(-1).contiguous()
+        raw_lengths = index["lengths"].to(device="cpu", dtype=torch.long).reshape(-1).contiguous()
+        if self.offsets.numel() != raw_lengths.numel():
             raise ValueError("Token cache index offsets/lengths size mismatch")
         if self.offsets.numel() == 0:
             raise ValueError("Token cache index contains no samples")
-        if bool((self.offsets < 0).any().item()) or bool((self.lengths <= 0).any().item()):
+        if bool((self.offsets < 0).any().item()) or bool((raw_lengths <= 0).any().item()):
             raise ValueError("Token cache offsets must be nonnegative and lengths must be positive")
+        try:
+            self.storage_schema_version = int(index.get("storage_schema_version", 0) or 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Token cache has an invalid storage schema version") from exc
+        if self.storage_schema_version < 0 or self.storage_schema_version > 6:
+            raise ValueError(
+                f"Unsupported token-cache storage schema version: {self.storage_schema_version}"
+            )
+        self.has_rosa_ids = bool(index.get("has_rosa_ids", False))
+        self.has_loss_weights = bool(index.get("has_loss_weights", False))
+        self.rosa_sentinel = int(index.get("rosa_sentinel", 0))
+        self.label_encoding = index.get("label_encoding")
+        if self.label_encoding in ("", "None", "none"):
+            self.label_encoding = None
+        self.labels_alias_input_ids = self.label_encoding == "input_ids_alias"
+
+        if self.storage_schema_version == 6:
+            byte_order = str(index.get("byte_order", ""))
+            if byte_order != "little":
+                raise ValueError(
+                    "Token-cache schema v6 requires byte_order='little'"
+                )
+            if sys.byteorder != "little":
+                raise RuntimeError(
+                    "Token-cache schema v6 cannot be memory-mapped on a big-endian host"
+                )
+            self._token_torch_dtype, self._token_bytes = self._parse_integer_dtype(
+                index.get("token_dtype"), "token"
+            )
+            if self.labels_alias_input_ids:
+                if index.get("label_dtype") not in (None, "None", "none", ""):
+                    raise ValueError(
+                        "Input-aliased token-cache labels cannot declare label_dtype"
+                    )
+                self._label_torch_dtype = None
+                self._label_bytes = 0
+            else:
+                if self.label_encoding is not None:
+                    raise ValueError(
+                        f"Unsupported token-cache label encoding: {self.label_encoding}"
+                    )
+                self._label_torch_dtype, self._label_bytes = self._parse_integer_dtype(
+                    index.get("label_dtype"), "label"
+                )
+            if self.has_rosa_ids:
+                self._rosa_torch_dtype, self._rosa_bytes = self._parse_integer_dtype(
+                    index.get("rosa_dtype"), "ROSA"
+                )
+            else:
+                if index.get("rosa_dtype") not in (None, "None", "none", ""):
+                    raise ValueError(
+                        "Token cache declares rosa_dtype without has_rosa_ids"
+                    )
+                self._rosa_torch_dtype = None
+                self._rosa_bytes = 0
+            if self.labels_alias_input_ids:
+                if index.get("label_ignore_sentinel") not in (None, -100):
+                    raise ValueError(
+                        "Input-aliased token-cache labels cannot declare a storage sentinel"
+                    )
+                self.label_ignore_sentinel = -100
+            else:
+                default_ignore = 65535 if self._label_torch_dtype == torch.uint16 else -100
+                self.label_ignore_sentinel = int(
+                    index.get("label_ignore_sentinel", default_ignore)
+                )
+                if self._label_torch_dtype == torch.uint16:
+                    if self.label_ignore_sentinel != 65535:
+                        raise ValueError(
+                            "uint16 token-cache labels must reserve 65535 as ignore_index"
+                        )
+                elif self.label_ignore_sentinel != -100:
+                    raise ValueError(
+                        "int32 token-cache labels must use -100 as ignore_index"
+                    )
+        else:
+            # All pre-v6 cache writers used native int32 token streams.
+            if self.label_encoding is not None:
+                raise ValueError("Legacy token caches cannot declare a label encoding")
+            self._token_torch_dtype = torch.int32
+            self._label_torch_dtype = torch.int32
+            self._rosa_torch_dtype = torch.int32 if self.has_rosa_ids else None
+            self._token_bytes = 4
+            self._label_bytes = 4
+            self._rosa_bytes = 4 if self.has_rosa_ids else 0
+            self.label_ignore_sentinel = -100
+
+        self.loss_weight_encoding = index.get("loss_weight_encoding")
+        if self.loss_weight_encoding in ("", "None", "none"):
+            self.loss_weight_encoding = None
+        self._loss_weights_are_rle = (
+            self.has_loss_weights
+            and self.loss_weight_encoding == "float32_palette_rle"
+        )
+        self.loss_weight_dtype = str(index.get("loss_weight_dtype", "float16"))
+        self._loss_weight_torch_dtype = None
+        self._loss_weight_bytes = 0
+        self.loss_weight_palette = None
+        self.loss_run_offsets = None
+        self.loss_run_ends = None
+        self.loss_run_codes = None
+        if self.has_loss_weights and self._loss_weights_are_rle:
+            if self.storage_schema_version != 6:
+                raise ValueError(
+                    "Palette-RLE loss weights require token-cache storage schema v6"
+                )
+            self._load_and_validate_loss_weight_runs(index, raw_lengths)
+        elif self.has_loss_weights:
+            if self.storage_schema_version == 6:
+                raise ValueError(
+                    "Token-cache schema v6 with loss weights requires "
+                    "loss_weight_encoding='float32_palette_rle'"
+                )
+            if self.loss_weight_encoding is not None:
+                raise ValueError(
+                    f"Unsupported token-cache loss weight encoding: {self.loss_weight_encoding}"
+                )
+            if self.loss_weight_dtype == "float32":
+                self._loss_weight_torch_dtype = torch.float32
+                self._loss_weight_bytes = 4
+            elif self.loss_weight_dtype in ("float16", "None", "none"):
+                self._loss_weight_torch_dtype = torch.float16
+                self._loss_weight_bytes = 2
+            else:
+                raise ValueError(
+                    f"Unsupported token-cache loss weight dtype: {self.loss_weight_dtype}"
+                )
+        elif self.loss_weight_encoding is not None:
+            raise ValueError(
+                "Token cache declares a loss-weight encoding without loss weights"
+            )
+        if int(raw_lengths.max().item()) <= torch.iinfo(torch.int32).max:
+            self.lengths = raw_lengths.to(dtype=torch.int32)
+        else:
+            self.lengths = raw_lengths
         if self.has_rosa_ids and self.rosa_sentinel <= 0:
             raise ValueError("ROSA token cache is missing a valid vocabulary sentinel")
 
-        bytes_per_token = 8
-        if self.has_loss_weights:
+        bytes_per_token = self._token_bytes + self._label_bytes + self._rosa_bytes
+        if self.has_loss_weights and not self._loss_weights_are_rle:
             bytes_per_token += self._loss_weight_bytes
-        if self.has_rosa_ids:
-            bytes_per_token += 4
-        offsets_list = self.offsets.tolist()
-        lengths_list = self.lengths.tolist()
-        expected_offsets = []
-        expected_offset = 0
-        for length in lengths_list:
-            expected_offsets.append(expected_offset)
-            expected_offset += int(length) * bytes_per_token
-        if offsets_list != expected_offsets:
+        record_bytes = self.lengths.to(dtype=torch.long) * int(bytes_per_token)
+        offsets_valid = int(self.offsets[0].item()) == 0
+        if self.offsets.numel() > 1:
+            offsets_valid = offsets_valid and torch.equal(
+                self.offsets[1:],
+                self.offsets[:-1] + record_bytes[:-1],
+            )
+        if not offsets_valid:
             raise ValueError(
                 "Token cache offsets do not match the declared record layout; "
                 "the cache may be stale or partially written"
             )
+        expected_offset = int((self.offsets[-1] + record_bytes[-1]).item())
         data_size = os.path.getsize(data_path)
         if data_size != expected_offset:
             raise ValueError(
                 f"Token cache data size mismatch: expected {expected_offset} bytes, "
                 f"found {data_size}. Rebuild the cache before training."
             )
-        self.sample_lengths = [
-            max(1, min(int(length), self.max_length)) if self.max_length > 0 else max(1, int(length))
-            for length in self.lengths.tolist()
-        ]
+        if self.max_length > 0:
+            self.sample_lengths = self.lengths.clamp(max=self.max_length).contiguous()
+        else:
+            self.sample_lengths = self.lengths
         self.data_path = data_path
+
+    @staticmethod
+    def _parse_integer_dtype(dtype_name, field_name):
+        dtype_name = str(dtype_name)
+        if dtype_name == "uint16":
+            return torch.uint16, 2
+        if dtype_name == "int32":
+            return torch.int32, 4
+        raise ValueError(
+            f"Unsupported token-cache {field_name} dtype: {dtype_name}"
+        )
+
+    def _load_and_validate_loss_weight_runs(self, index, raw_lengths):
+        palette_value = index.get("loss_weight_palette")
+        try:
+            palette = torch.as_tensor(palette_value, dtype=torch.float32, device="cpu").reshape(-1)
+        except (TypeError, ValueError, RuntimeError) as exc:
+            raise ValueError("Token cache has an invalid loss-weight palette") from exc
+        if palette.numel() <= 0 or palette.numel() > 255:
+            raise ValueError("Token-cache loss-weight palette must contain 1 to 255 values")
+        if not bool(torch.isfinite(palette).all().item()) or bool((palette < 0).any().item()):
+            raise ValueError("Token-cache loss-weight palette must contain finite nonnegative values")
+
+        required = ("loss_run_offsets", "loss_run_ends", "loss_run_codes")
+        if any(name not in index for name in required):
+            raise ValueError("Token cache is missing palette-RLE loss-weight metadata")
+        try:
+            run_offsets = torch.as_tensor(
+                index["loss_run_offsets"], dtype=torch.long, device="cpu"
+            ).reshape(-1).contiguous()
+            run_ends_long = torch.as_tensor(
+                index["loss_run_ends"], dtype=torch.long, device="cpu"
+            ).reshape(-1).contiguous()
+            run_codes_long = torch.as_tensor(
+                index["loss_run_codes"], dtype=torch.long, device="cpu"
+            ).reshape(-1).contiguous()
+        except (TypeError, ValueError, RuntimeError) as exc:
+            raise ValueError("Token cache has invalid palette-RLE loss-weight tensors") from exc
+
+        sample_count = int(raw_lengths.numel())
+        if run_offsets.numel() != sample_count + 1:
+            raise ValueError(
+                "Token-cache loss-run offsets must contain one entry per sample plus one"
+            )
+        if int(run_offsets[0].item()) != 0 or bool((run_offsets < 0).any().item()):
+            raise ValueError("Token-cache loss-run offsets must start at zero and be nonnegative")
+        run_counts = run_offsets[1:] - run_offsets[:-1]
+        if bool((run_counts <= 0).any().item()):
+            raise ValueError("Every token-cache sample must contain at least one loss-weight run")
+        run_count = int(run_offsets[-1].item())
+        if run_count != run_ends_long.numel() or run_count != run_codes_long.numel():
+            raise ValueError("Token-cache loss-run offsets/ends/codes size mismatch")
+        if bool((run_ends_long <= 0).any().item()):
+            raise ValueError("Token-cache loss-run ends must be positive")
+        if bool((run_codes_long < 0).any().item()) or bool(
+            (run_codes_long >= palette.numel()).any().item()
+        ):
+            raise ValueError("Token-cache loss-run code is outside the declared palette")
+
+        final_run_indices = run_offsets[1:] - 1
+        if not torch.equal(
+            run_ends_long.index_select(0, final_run_indices),
+            raw_lengths,
+        ):
+            raise ValueError(
+                "Each token-cache sample's final loss run must end at its stored length"
+            )
+        if run_count > 1:
+            starts_new_sample = torch.zeros(run_count, dtype=torch.bool)
+            if sample_count > 1:
+                starts_new_sample[run_offsets[1:-1]] = True
+            invalid_order = (
+                (run_ends_long[1:] <= run_ends_long[:-1])
+                & ~starts_new_sample[1:]
+            )
+            if bool(invalid_order.any().item()):
+                raise ValueError(
+                    "Token-cache loss-run ends must increase strictly within each sample"
+                )
+
+        self.loss_weight_palette = palette.contiguous()
+        self._loss_weight_palette_values = tuple(
+            float(value) for value in self.loss_weight_palette.tolist()
+        )
+        self.loss_run_offsets = run_offsets
+        if int(run_ends_long.max().item()) <= torch.iinfo(torch.int32).max:
+            self.loss_run_ends = run_ends_long.to(dtype=torch.int32).contiguous()
+        else:
+            self.loss_run_ends = run_ends_long
+        self.loss_run_codes = run_codes_long.to(dtype=torch.uint8).contiguous()
 
     def __len__(self):
         return int(self.lengths.numel())
@@ -853,7 +1236,24 @@ class TokenizedBinaryDataset(Dataset):
         if self._mmap is not None:
             return
         self._file = open(self.data_path, "rb")
+        # Length-grouped epoch shuffling produces random record reads. Tell the
+        # Linux kernel not to spend I/O bandwidth on sequential readahead pages
+        # that a multi-billion-token cache is unlikely to consume next.
+        posix_fadvise = getattr(os, "posix_fadvise", None)
+        random_advice = getattr(os, "POSIX_FADV_RANDOM", None)
+        if callable(posix_fadvise) and random_advice is not None:
+            try:
+                posix_fadvise(self._file.fileno(), 0, 0, random_advice)
+            except OSError:
+                pass
         self._mmap = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_COPY)
+        madvise = getattr(self._mmap, "madvise", None)
+        mmap_random = getattr(mmap, "MADV_RANDOM", None)
+        if callable(madvise) and mmap_random is not None:
+            try:
+                madvise(mmap_random)
+            except (OSError, ValueError):
+                pass
 
     def close(self):
         if self._mmap is not None:
@@ -872,7 +1272,62 @@ class TokenizedBinaryDataset(Dataset):
     def __del__(self):
         self.close()
 
+    def _integer_view(
+        self,
+        offset,
+        count,
+        dtype,
+        *,
+        decode_labels=False,
+        promote_uint16=True,
+    ):
+        view = torch.frombuffer(
+            self._mmap,
+            dtype=dtype,
+            count=count,
+            offset=offset,
+        )
+        # Preserve the legacy scalar-item contract (int32 ids/labels) while
+        # decoding the uint16 ignore sentinel before it reaches a collator.
+        if dtype == torch.uint16 and promote_uint16:
+            view = view.to(dtype=torch.int32)
+        if decode_labels and self.label_ignore_sentinel != -100:
+            if view.dtype != torch.int32:
+                view = view.to(dtype=torch.int32)
+            view = view.clone() if view._base is not None else view
+            view.masked_fill_(view == self.label_ignore_sentinel, -100)
+        return view
+
+    def _copy_rle_loss_weights(self, idx, length, destination):
+        run_start = int(self.loss_run_offsets[idx].item())
+        run_stop = int(self.loss_run_offsets[idx + 1].item())
+        run_ends = self.loss_run_ends[run_start:run_stop].tolist()
+        run_codes = self.loss_run_codes[run_start:run_stop].tolist()
+        position = 0
+        for raw_end, code in zip(run_ends, run_codes):
+            end = min(int(raw_end), int(length))
+            if end > position:
+                destination[position:end].fill_(self._loss_weight_palette_values[int(code)])
+                position = end
+            if position >= int(length):
+                break
+        if position != int(length):
+            # Initialization validates this invariant; retain a local guard so
+            # metadata modified after construction cannot produce silent loss
+            # reweighting.
+            raise RuntimeError("Token-cache loss runs do not cover the requested sample length")
+
+    def _decode_rle_loss_weights(self, idx, length):
+        weights = torch.empty(int(length), dtype=torch.float32)
+        self._copy_rle_loss_weights(idx, length, weights)
+        return weights
+
     def __getitem__(self, idx):
+        idx = int(idx)
+        if idx < 0:
+            idx += len(self)
+        if idx < 0 or idx >= len(self):
+            raise IndexError(f"Token cache index out of range: {idx}")
         self._ensure_open()
         offset = int(self.offsets[idx])
         stored_length = int(self.lengths[idx])
@@ -882,52 +1337,241 @@ class TokenizedBinaryDataset(Dataset):
         if length <= 0:
             return None
 
-        label_offset = offset + (stored_length * 4)
-        after_labels_offset = label_offset + (stored_length * 4)
-        input_ids = torch.frombuffer(self._mmap, dtype=torch.int32, count=length, offset=offset)
-        labels = torch.frombuffer(self._mmap, dtype=torch.int32, count=length, offset=label_offset)
+        label_offset = offset + (stored_length * self._token_bytes)
+        after_labels_offset = label_offset + (stored_length * self._label_bytes)
+        input_ids = self._integer_view(
+            offset,
+            length,
+            self._token_torch_dtype,
+        )
+        if self.labels_alias_input_ids:
+            labels = input_ids.clone()
+        else:
+            labels = self._integer_view(
+                label_offset,
+                length,
+                self._label_torch_dtype,
+                decode_labels=True,
+            )
         item = {
             "input_ids": input_ids,
             "labels": labels,
             "_length": length,
         }
         if self.has_loss_weights:
-            item["loss_weights"] = torch.frombuffer(
-                self._mmap,
-                dtype=self._loss_weight_torch_dtype,
-                count=length,
-                offset=after_labels_offset,
-            ).to(dtype=torch.float32)
+            if self._loss_weights_are_rle:
+                item["loss_weights"] = self._decode_rle_loss_weights(idx, length)
+            else:
+                item["loss_weights"] = torch.frombuffer(
+                    self._mmap,
+                    dtype=self._loss_weight_torch_dtype,
+                    count=length,
+                    offset=after_labels_offset,
+                ).to(dtype=torch.float32)
         if self.has_rosa_ids:
             rosa_offset = after_labels_offset
-            if self.has_loss_weights:
+            if self.has_loss_weights and not self._loss_weights_are_rle:
                 rosa_offset += stored_length * self._loss_weight_bytes
-            item["rosa_ids"] = torch.frombuffer(
-                self._mmap,
-                dtype=torch.int32,
-                count=length,
-                offset=rosa_offset,
+            item["rosa_ids"] = self._integer_view(
+                rosa_offset,
+                length,
+                self._rosa_torch_dtype,
             )
             item["_rosa_sentinel"] = self.rosa_sentinel
         return item
 
+    def __getitems__(self, indices):
+        """Fetch and collate one binary-cache batch directly from the mmap.
+
+        PyTorch's map-style fetcher passes a batch sampler's indices to this
+        method when it is available. Legacy caches retain their historical long
+        batch tensors. Compact v6 caches keep ids/labels/ROSA as int32 and masks
+        as bool through pinned-memory and H2D transfer; labels are widened on
+        the GPU immediately before the language-model objective.
+        """
+        compact_batch = self.storage_schema_version == 6
+        integer_batch_dtype = torch.int32 if compact_batch else torch.long
+        mask_batch_dtype = torch.bool if compact_batch else torch.long
+        if isinstance(indices, torch.Tensor):
+            indices = indices.reshape(-1).tolist()
+        else:
+            indices = list(indices)
+        if not indices:
+            return {
+                "input_ids": torch.empty((0, 0), dtype=integer_batch_dtype),
+                "labels": torch.empty((0, 0), dtype=integer_batch_dtype),
+                "attention_mask": torch.empty((0, 0), dtype=mask_batch_dtype),
+            }
+
+        sample_count = len(self)
+        normalized_indices = []
+        stored_lengths = []
+        effective_lengths = []
+        for raw_idx in indices:
+            idx = int(raw_idx)
+            if idx < 0:
+                idx += sample_count
+            if idx < 0 or idx >= sample_count:
+                raise IndexError(f"Token cache index out of range: {raw_idx}")
+            stored_length = int(self.lengths[idx])
+            length = min(stored_length, self.max_length) if self.max_length > 0 else stored_length
+            normalized_indices.append(idx)
+            stored_lengths.append(stored_length)
+            effective_lengths.append(length)
+
+        self._ensure_open()
+        batch_size = len(normalized_indices)
+        max_length = max(effective_lengths)
+        input_ids = torch.full(
+            (batch_size, max_length),
+            self.pad_token_id,
+            dtype=integer_batch_dtype,
+        )
+        labels = torch.full((batch_size, max_length), -100, dtype=integer_batch_dtype)
+        attention_mask = torch.zeros((batch_size, max_length), dtype=mask_batch_dtype)
+        loss_weights = (
+            torch.zeros((batch_size, max_length), dtype=torch.float32)
+            if self.has_loss_weights else None
+        )
+        rosa_ids = (
+            torch.full(
+                (batch_size, max_length),
+                self.rosa_sentinel,
+                dtype=integer_batch_dtype,
+            )
+            if self.has_rosa_ids else None
+        )
+
+        # Read each batch in file-offset order to turn 64 random mmap seeks into
+        # the most sequential access pattern available for the same batch. Rows
+        # are copied back to their original positions, so sampler order and all
+        # model inputs remain unchanged.
+        fetch_plan = [
+            (row, idx, stored_length, length)
+            for row, (idx, stored_length, length) in enumerate(zip(
+                normalized_indices,
+                stored_lengths,
+                effective_lengths,
+            ))
+        ]
+        fetch_plan.sort(key=lambda entry: int(self.offsets[entry[1]]))
+        for row, idx, stored_length, length in fetch_plan:
+            offset = int(self.offsets[idx])
+            label_offset = offset + (stored_length * self._token_bytes)
+            after_labels_offset = label_offset + (stored_length * self._label_bytes)
+
+            input_view = self._integer_view(
+                offset,
+                length,
+                self._token_torch_dtype,
+                promote_uint16=False,
+            )
+            input_ids[row, :length].copy_(input_view)
+            if self.labels_alias_input_ids:
+                labels[row, :length].copy_(input_view)
+            else:
+                label_view = self._integer_view(
+                    label_offset,
+                    length,
+                    self._label_torch_dtype,
+                    promote_uint16=False,
+                )
+                labels[row, :length].copy_(label_view)
+                if self.label_ignore_sentinel != -100:
+                    labels[row, :length].masked_fill_(
+                        labels[row, :length] == self.label_ignore_sentinel,
+                        -100,
+                    )
+            attention_mask[row, :length] = 1
+
+            if loss_weights is not None:
+                if self._loss_weights_are_rle:
+                    self._copy_rle_loss_weights(
+                        idx,
+                        length,
+                        loss_weights[row, :length],
+                    )
+                else:
+                    weight_view = torch.frombuffer(
+                        self._mmap,
+                        dtype=self._loss_weight_torch_dtype,
+                        count=length,
+                        offset=after_labels_offset,
+                    )
+                    loss_weights[row, :length].copy_(weight_view)
+
+            if rosa_ids is not None:
+                rosa_offset = after_labels_offset
+                if self.has_loss_weights and not self._loss_weights_are_rle:
+                    rosa_offset += stored_length * self._loss_weight_bytes
+                rosa_view = self._integer_view(
+                    rosa_offset,
+                    length,
+                    self._rosa_torch_dtype,
+                    promote_uint16=False,
+                )
+                rosa_ids[row, :length].copy_(rosa_view)
+
+        batch = {
+            "input_ids": input_ids,
+            "labels": labels,
+            "attention_mask": attention_mask,
+        }
+        if loss_weights is not None:
+            batch["loss_weights"] = loss_weights
+        if rosa_ids is not None:
+            batch["rosa_ids"] = rosa_ids
+        return batch
+
     def get_sample_lengths(self):
-        return self.sample_lengths
+        # Preserve the historical public list API for direct callers without
+        # retaining a second multi-million-element Python list in memory. Loader
+        # construction reads the tensor-valued ``sample_lengths`` attribute
+        # directly through _get_dataset_sample_lengths.
+        return self.sample_lengths.tolist()
 
 
 def create_dataloader_for_tokenized_cache(directory_path, max_length, batch_size, pad_token_id,
                                           num_workers=0, use_length_bucketing=True,
                                           bucket_size=None, device=None, prefetch_factor=None):
-    dataset = TokenizedBinaryDataset(directory_path, max_length=max_length)
-    return create_map_style_dataloader(
+    dataset = TokenizedBinaryDataset(
+        directory_path,
+        max_length=max_length,
+        pad_token_id=pad_token_id,
+    )
+    collate = functools.partial(_collate_tokenized_binary_batch, pad_token_id=pad_token_id)
+    use_cuda = _pin_memory_for_device(device)
+    # Keep the final incomplete batch: silently dropping up to batch_size-1
+    # samples violates complete epoch coverage. One smaller terminal batch may
+    # compile a second shape, but that once-per-epoch cost is negligible.
+    drop_last = False
+    lengths = _get_dataset_sample_lengths(dataset) if use_length_bucketing and batch_size > 1 else None
+    if lengths is not None and len(lengths) > 0:
+        batch_sampler = LengthGroupedBatchSampler(
+            lengths,
+            batch_size=batch_size,
+            shuffle=True,
+            drop_last=drop_last,
+            bucket_size=bucket_size,
+        )
+        return _create_dataloader(
+            dataset,
+            batch_sampler=batch_sampler,
+            collate_fn=collate,
+            num_workers=num_workers,
+            pin_memory=use_cuda,
+            prefetch_factor=prefetch_factor,
+        )
+
+    sampler = EpochShuffleSampler(dataset, shuffle=True)
+    return _create_dataloader(
         dataset,
         batch_size=batch_size,
-        pad_token_id=pad_token_id,
+        collate_fn=collate,
+        sampler=sampler,
         num_workers=num_workers,
-        shuffle=True,
-        use_length_bucketing=use_length_bucketing,
-        bucket_size=bucket_size,
-        device=device,
+        pin_memory=use_cuda,
+        drop_last=drop_last,
         prefetch_factor=prefetch_factor,
     )
 
@@ -1068,6 +1712,224 @@ def process_text_sample(tokenizer, text_dict: dict, max_length: int, kayla_mode:
             sample["loss_weights"] = torch.tensor(loss_weights, dtype=torch.float32)
         return sample
     except: return None
+
+
+class _BatchEncodeRecorder:
+    """Record ``encode`` calls made by the scalar sample formatter.
+
+    Reusing :func:`process_text_sample` as the planner keeps the batched path
+    tied to the exact scalar prompt formatting, special-token choices, and
+    prompt/completion BPE boundaries. The placeholder ids are never returned to
+    callers; they only let the formatter finish after all encode calls have
+    been observed.
+    """
+
+    def __init__(self, tokenizer):
+        self._tokenizer = tokenizer
+        self.eos_token_id = getattr(tokenizer, "eos_token_id", None)
+        self.requests = []
+        self.batchable = True
+
+    def __getattr__(self, name):
+        return getattr(self._tokenizer, name)
+
+    def encode(self, text, *args, **kwargs):
+        # process_text_sample currently varies only add_special_tokens. If a
+        # future formatter adds another encode option, take the safe scalar
+        # fallback until the batch implementation explicitly supports it.
+        if args or any(key != "add_special_tokens" for key in kwargs):
+            self.batchable = False
+        add_special_tokens = bool(kwargs.get("add_special_tokens", True))
+        self.requests.append((text, add_special_tokens))
+        return [0]
+
+
+class _BatchEncodeReplay:
+    """Replay pre-tokenized ids through the unchanged scalar formatter."""
+
+    def __init__(self, tokenizer, requests, encoded_ids):
+        self._tokenizer = tokenizer
+        self.eos_token_id = getattr(tokenizer, "eos_token_id", None)
+        self._requests = requests
+        self._encoded_ids = encoded_ids
+        self._position = 0
+        self._failed = False
+
+    def __getattr__(self, name):
+        return getattr(self._tokenizer, name)
+
+    def encode(self, text, *args, **kwargs):
+        if self._position >= len(self._requests):
+            self._failed = True
+            raise RuntimeError("batched tokenizer replay received an unexpected encode call")
+        expected_text, expected_special_tokens = self._requests[self._position]
+        add_special_tokens = bool(kwargs.get("add_special_tokens", True))
+        if (
+            args
+            or any(key != "add_special_tokens" for key in kwargs)
+            or text != expected_text
+            or add_special_tokens != expected_special_tokens
+        ):
+            self._failed = True
+            raise RuntimeError("batched tokenizer replay diverged from scalar formatting")
+        token_ids = self._encoded_ids[self._position]
+        self._position += 1
+        return list(token_ids)
+
+    @property
+    def complete(self):
+        return not self._failed and self._position == len(self._requests)
+
+
+def _is_supported_fast_tokenizer(tokenizer):
+    """Limit batch encoding to Hugging Face's native fast-tokenizer family."""
+    if not bool(getattr(tokenizer, "is_fast", False)) or not callable(tokenizer):
+        return False
+    try:
+        from transformers import PreTrainedTokenizerFast
+    except ImportError:
+        return False
+    return (
+        isinstance(tokenizer, PreTrainedTokenizerFast)
+        and type(tokenizer).__module__.startswith("transformers.")
+    )
+
+
+def _normalize_batched_input_ids(encoded, expected_size: int):
+    try:
+        input_ids = encoded["input_ids"]
+    except (KeyError, TypeError):
+        raise ValueError("batch tokenizer output is missing input_ids") from None
+    if isinstance(input_ids, torch.Tensor):
+        input_ids = input_ids.detach().cpu().tolist()
+    elif hasattr(input_ids, "tolist"):
+        input_ids = input_ids.tolist()
+    if not isinstance(input_ids, (list, tuple)) or len(input_ids) != expected_size:
+        raise ValueError("batch tokenizer returned the wrong number of sequences")
+
+    normalized = []
+    for row in input_ids:
+        if isinstance(row, torch.Tensor):
+            row = row.detach().cpu().tolist()
+        elif hasattr(row, "tolist"):
+            row = row.tolist()
+        if not isinstance(row, (list, tuple)):
+            raise ValueError("batch tokenizer returned malformed token ids")
+        normalized.append([int(token_id) for token_id in row])
+    return normalized
+
+
+def process_text_samples_batch(tokenizer, text_dicts, max_length: int,
+                               kayla_mode: bool = False,
+                               text_column: Optional[str] = None,
+                               prompt_column: Optional[str] = None,
+                               completion_column: Optional[str] = None,
+                               alpaca_mode: bool = False,
+                               train_prompt_tokens: bool = True,
+                               prompt_loss_weight: float = 1.0,
+                               response_loss_weight: float = 1.0,
+                               response_boundary_loss_weight: float = 1.0,
+                               response_boundary_tokens: int = 0,
+                               min_response_tokens: int = 1,
+                               drop_empty_completions: bool = True):
+    """Tokenize a map-style batch while preserving scalar sample semantics.
+
+    Each prompt, completion, thought, or response remains an independent
+    tokenizer sequence, so byte-pair merges can never cross a boundary that the
+    scalar implementation keeps separate. Slow or custom tokenizers, malformed
+    batch output, and any tokenizer exception fall back to the established
+    per-sample path.
+    """
+    samples = list(text_dicts)
+    if not samples:
+        return []
+
+    scalar_args = (
+        max_length,
+        kayla_mode,
+        text_column,
+        prompt_column,
+        completion_column,
+        alpaca_mode,
+        train_prompt_tokens,
+        prompt_loss_weight,
+        response_loss_weight,
+        response_boundary_loss_weight,
+        response_boundary_tokens,
+        min_response_tokens,
+        drop_empty_completions,
+    )
+
+    def scalar_fallback():
+        return [process_text_sample(tokenizer, sample, *scalar_args) for sample in samples]
+
+    if not _is_supported_fast_tokenizer(tokenizer):
+        return scalar_fallback()
+
+    recorders = []
+    flat_requests = []
+    request_ranges = []
+    for sample in samples:
+        recorder = _BatchEncodeRecorder(tokenizer)
+        process_text_sample(recorder, sample, *scalar_args)
+        if not recorder.batchable:
+            return scalar_fallback()
+        request_start = len(flat_requests)
+        flat_requests.extend(recorder.requests)
+        request_ranges.append((request_start, len(flat_requests)))
+        recorders.append(recorder)
+
+    if not flat_requests:
+        return scalar_fallback()
+
+    flat_encoded_ids = [None] * len(flat_requests)
+    try:
+        for add_special_tokens in (True, False):
+            positions = [
+                idx
+                for idx, (_text, request_special_tokens) in enumerate(flat_requests)
+                if request_special_tokens == add_special_tokens
+            ]
+            if not positions:
+                continue
+            texts = [flat_requests[idx][0] for idx in positions]
+            encoded = tokenizer(
+                texts,
+                add_special_tokens=add_special_tokens,
+                padding=False,
+                truncation=False,
+                return_attention_mask=False,
+                return_token_type_ids=False,
+            )
+            encoded_rows = _normalize_batched_input_ids(encoded, len(positions))
+            for request_idx, token_ids in zip(positions, encoded_rows):
+                flat_encoded_ids[request_idx] = token_ids
+        if any(token_ids is None for token_ids in flat_encoded_ids):
+            raise ValueError("batch tokenizer did not satisfy every encode request")
+    except Exception:
+        return scalar_fallback()
+
+    processed_samples = []
+    for sample, recorder, (request_start, request_end) in zip(
+        samples,
+        recorders,
+        request_ranges,
+    ):
+        if request_start == request_end:
+            # Invalid rows normally land here. Running the scalar function once
+            # gives future formatter extensions an exact fallback as well.
+            processed_samples.append(process_text_sample(tokenizer, sample, *scalar_args))
+            continue
+        replay = _BatchEncodeReplay(
+            tokenizer,
+            recorder.requests,
+            flat_encoded_ids[request_start:request_end],
+        )
+        processed = process_text_sample(replay, sample, *scalar_args)
+        if not replay.complete:
+            processed = process_text_sample(tokenizer, sample, *scalar_args)
+        processed_samples.append(processed)
+    return processed_samples
 
 def process_tokenized_sample(text_dict: dict, max_length: Optional[int] = None):
     """Load a pre-tokenized JSONL row without running the tokenizer again."""
@@ -1243,7 +2105,11 @@ class StreamingJSONLDataset(IterableDataset):
                  response_boundary_loss_weight: float = 1.0,
                  response_boundary_tokens: int = 0,
                  min_response_tokens: int = 1,
-                 drop_empty_completions: bool = True):
+                 drop_empty_completions: bool = True,
+                 precompute_rosa: bool = False,
+                 rosa_vocab_size: Optional[int] = None,
+                 rosa_chunk_size: int = 256,
+                 rosa_max_context: int = 512):
         super().__init__()
         self.path = path
         self.paths = _resolve_jsonl_paths(path)
@@ -1261,14 +2127,19 @@ class StreamingJSONLDataset(IterableDataset):
         self.response_boundary_tokens = response_boundary_tokens
         self.min_response_tokens = min_response_tokens
         self.drop_empty_completions = bool(drop_empty_completions)
+        self.precompute_rosa = bool(precompute_rosa)
+        self.rosa_vocab_size = int(rosa_vocab_size or 0)
+        self.rosa_chunk_size = max(1, int(rosa_chunk_size or 256))
+        self.rosa_max_context = max(1, int(rosa_max_context or 512))
         self.bucket_size = max(0, int(bucket_size or 0))
         self.batch_size = max(1, int(batch_size))
         self.shuffle_buckets = bool(shuffle_buckets)
         self.seed = int(torch.initial_seed()) % (2**63 - 1)
         self.epoch = 0
+        self._shared_epoch = _shared_epoch_counter()
 
     def set_epoch(self, epoch: int):
-        self.epoch = int(epoch)
+        _set_iterable_epoch(self, epoch)
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
@@ -1277,7 +2148,8 @@ class StreamingJSONLDataset(IterableDataset):
 
         bucket = []
         generator = torch.Generator()
-        generator.manual_seed((self.seed + self.epoch + worker_id) % (2**63 - 1))
+        epoch = _get_iterable_epoch(self)
+        generator.manual_seed((self.seed + epoch + worker_id) % (2**63 - 1))
 
         for _line_num, line in _iter_jsonl_shards_for_worker(self.paths, worker_id, num_workers):
             line = line.strip()
@@ -1308,6 +2180,13 @@ class StreamingJSONLDataset(IterableDataset):
                 )
             if processed is None:
                 continue
+            if self.precompute_rosa:
+                processed = _attach_precomputed_rosa(
+                    processed,
+                    self.rosa_vocab_size,
+                    self.rosa_chunk_size,
+                    self.rosa_max_context,
+                )
             if self.bucket_size > 0:
                 bucket.append(processed)
                 if len(bucket) >= self.bucket_size:
@@ -1398,26 +2277,31 @@ class HuggingFaceStreamingDataset(IterableDataset):
         self.shuffle_buffer_size = max(0, int(shuffle_buffer_size or 0))
         self.seed = int(torch.initial_seed()) % (2**32 - 1)
         self.epoch = 0
+        self._shared_epoch = _shared_epoch_counter()
 
     def set_epoch(self, epoch: int):
-        self.epoch = int(epoch)
+        _set_iterable_epoch(self, epoch)
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
         worker_id = worker_info.id if worker_info is not None else 0
         num_workers = worker_info.num_workers if worker_info is not None else 1
-        seed = int((self.seed + (self.epoch * 100003) + worker_id) % (2**32 - 1))
+        epoch = _get_iterable_epoch(self)
+        dataset_seed = int((self.seed + (epoch * 100003)) % (2**32 - 1))
+        bucket_seed = int((dataset_seed + worker_id) % (2**32 - 1))
         dataset = _maybe_shuffle_hf_dataset(
             self.hf_dataset,
             shuffle=self.shuffle,
             shuffle_buffer_size=self.shuffle_buffer_size,
-            seed=seed,
+            # Every worker must shuffle the same logical stream before it is
+            # sharded. Per-worker shuffle seeds can duplicate/omit samples.
+            seed=dataset_seed,
         )
         iterator = _iter_hf_worker_samples(dataset, worker_id, num_workers)
 
         bucket = []
         generator = torch.Generator()
-        generator.manual_seed(seed)
+        generator.manual_seed(bucket_seed)
 
         for sample in iterator:
             processed = process_text_sample(
@@ -1451,7 +2335,7 @@ class HuggingFaceStreamingDataset(IterableDataset):
             yield from _yield_length_bucket(bucket, self.batch_size, self.shuffle, generator)
 
 class HuggingFaceMapStyleDataset(Dataset):
-    def __init__(self, hf_dataset, tokenizer, max_length, kayla_mode=False, text_column=None, prompt_column=None, completion_column=None, alpaca_mode: bool = False, train_prompt_tokens: bool = True, prompt_loss_weight: float = 1.0, response_loss_weight: float = 1.0, response_boundary_loss_weight: float = 1.0, response_boundary_tokens: int = 0, min_response_tokens: int = 1, drop_empty_completions: bool = True):
+    def __init__(self, hf_dataset, tokenizer, max_length, kayla_mode=False, text_column=None, prompt_column=None, completion_column=None, alpaca_mode: bool = False, train_prompt_tokens: bool = True, prompt_loss_weight: float = 1.0, response_loss_weight: float = 1.0, response_boundary_loss_weight: float = 1.0, response_boundary_tokens: int = 0, min_response_tokens: int = 1, drop_empty_completions: bool = True, precompute_rosa: bool = False, rosa_vocab_size: Optional[int] = None, rosa_chunk_size: int = 256, rosa_max_context: int = 512):
         super().__init__()
         self.hf_dataset, self.tokenizer, self.max_length, self.kayla_mode = hf_dataset, tokenizer, max_length, kayla_mode
         self.text_column, self.prompt_column, self.completion_column = text_column, prompt_column, completion_column
@@ -1463,10 +2347,94 @@ class HuggingFaceMapStyleDataset(Dataset):
         self.response_boundary_tokens = response_boundary_tokens
         self.min_response_tokens = min_response_tokens
         self.drop_empty_completions = bool(drop_empty_completions)
+        self.precompute_rosa = bool(precompute_rosa)
+        self.rosa_vocab_size = int(rosa_vocab_size or 0)
+        self.rosa_chunk_size = max(1, int(rosa_chunk_size or 256))
+        self.rosa_max_context = max(1, int(rosa_max_context or 512))
         self.sample_lengths = None
     def __len__(self): return len(self.hf_dataset)
     def __getitem__(self, idx):
-        return process_text_sample(self.tokenizer, self.hf_dataset[idx], self.max_length, self.kayla_mode, self.text_column, self.prompt_column, self.completion_column, self.alpaca_mode, self.train_prompt_tokens, self.prompt_loss_weight, self.response_loss_weight, self.response_boundary_loss_weight, self.response_boundary_tokens, self.min_response_tokens, self.drop_empty_completions)
+        try:
+            sample = process_text_sample(self.tokenizer, self.hf_dataset[idx], self.max_length, self.kayla_mode, self.text_column, self.prompt_column, self.completion_column, self.alpaca_mode, self.train_prompt_tokens, self.prompt_loss_weight, self.response_loss_weight, self.response_boundary_loss_weight, self.response_boundary_tokens, self.min_response_tokens, self.drop_empty_completions)
+            if self.precompute_rosa:
+                sample = _attach_precomputed_rosa(
+                    sample,
+                    self.rosa_vocab_size,
+                    self.rosa_chunk_size,
+                    self.rosa_max_context,
+                )
+            return sample
+        except Exception:
+            # The dynamic collator filters malformed samples. Returning None
+            # keeps worker pools alive instead of aborting a multi-hour build.
+            return None
+    def __getitems__(self, indices):
+        """Fetch Arrow rows and fast-tokenize the whole DataLoader batch."""
+        if isinstance(indices, torch.Tensor):
+            indices = indices.detach().cpu().tolist()
+        else:
+            indices = list(indices)
+        if not indices:
+            return []
+
+        try:
+            # Hugging Face Dataset supports list indexing and returns a
+            # column-oriented dict. One Arrow lookup is substantially cheaper
+            # than one Python lookup per row during a multi-billion-token build.
+            fetched = self.hf_dataset[indices]
+            if isinstance(fetched, dict):
+                for values in fetched.values():
+                    if (
+                        isinstance(values, (str, bytes))
+                        or not hasattr(values, "__len__")
+                        or len(values) != len(indices)
+                    ):
+                        raise TypeError("dataset batch column has an unsupported shape")
+                rows = []
+                for position in range(len(indices)):
+                    rows.append({key: values[position] for key, values in fetched.items()})
+            elif isinstance(fetched, (list, tuple)) and len(fetched) == len(indices):
+                rows = list(fetched)
+            else:
+                raise TypeError("dataset batch indexing returned an unsupported shape")
+        except Exception:
+            try:
+                rows = [self.hf_dataset[idx] for idx in indices]
+            except Exception:
+                return [self[idx] for idx in indices]
+
+        try:
+            processed_rows = process_text_samples_batch(
+                self.tokenizer,
+                rows,
+                self.max_length,
+                self.kayla_mode,
+                self.text_column,
+                self.prompt_column,
+                self.completion_column,
+                self.alpaca_mode,
+                self.train_prompt_tokens,
+                self.prompt_loss_weight,
+                self.response_loss_weight,
+                self.response_boundary_loss_weight,
+                self.response_boundary_tokens,
+                self.min_response_tokens,
+                self.drop_empty_completions,
+            )
+            if self.precompute_rosa:
+                processed_rows = [
+                    _attach_precomputed_rosa(
+                        sample,
+                        self.rosa_vocab_size,
+                        self.rosa_chunk_size,
+                        self.rosa_max_context,
+                    )
+                    for sample in processed_rows
+                ]
+            return processed_rows
+        except Exception:
+            # Keep the cache build resilient to third-party Dataset wrappers.
+            return [self[idx] for idx in indices]
     def get_sample_lengths(self):
         if self.sample_lengths is not None:
             return self.sample_lengths
@@ -1555,6 +2523,16 @@ def _collate_training_batch(batch, pad_token_id):
 def _collate_fn_dynamic_padding(batch, pad_token_id):
     return _collate_training_batch(batch, pad_token_id)
 
+
+def _collate_tokenized_binary_batch(batch, pad_token_id):
+    # Modern PyTorch forwards a batch sampler's complete index list to
+    # Dataset.__getitems__. TokenizedBinaryDataset returns the already-collated
+    # dictionary, so the hot path is an identity operation. Keep the generic
+    # fallback for older PyTorch versions that only call __getitem__.
+    if isinstance(batch, dict):
+        return batch
+    return _collate_training_batch(batch, pad_token_id)
+
 def create_dataloader_for_jsonl(path, tokenizer, max_length, batch_size, pad_token_id,
                                 num_workers=0, kayla_mode=False,
                                 text_column: Optional[str] = None,
@@ -1569,7 +2547,12 @@ def create_dataloader_for_jsonl(path, tokenizer, max_length, batch_size, pad_tok
                                 response_boundary_loss_weight: float = 1.0,
                                 response_boundary_tokens: int = 0,
                                 min_response_tokens: int = 1,
-                                drop_empty_completions: bool = True):
+                                drop_empty_completions: bool = True,
+                                precompute_rosa: bool = False,
+                                rosa_vocab_size: Optional[int] = None,
+                                rosa_chunk_size: int = 256,
+                                rosa_max_context: int = 512,
+                                in_order: bool = True):
     dataset = StreamingJSONLDataset(
         path,
         tokenizer,
@@ -1586,6 +2569,10 @@ def create_dataloader_for_jsonl(path, tokenizer, max_length, batch_size, pad_tok
         response_boundary_tokens=response_boundary_tokens,
         min_response_tokens=min_response_tokens,
         drop_empty_completions=drop_empty_completions,
+        precompute_rosa=precompute_rosa,
+        rosa_vocab_size=rosa_vocab_size,
+        rosa_chunk_size=rosa_chunk_size,
+        rosa_max_context=rosa_max_context,
         bucket_size=_streaming_bucket_size(batch_size, use_length_bucketing, bucket_size),
         batch_size=batch_size,
         shuffle_buckets=True,
@@ -1599,6 +2586,7 @@ def create_dataloader_for_jsonl(path, tokenizer, max_length, batch_size, pad_tok
         num_workers=num_workers,
         pin_memory=pin_memory,
         prefetch_factor=prefetch_factor,
+        in_order=in_order,
     )
 
 def create_dataloader_for_hf_streaming(hf_dataset, tokenizer, max_length, batch_size, pad_token_id,
@@ -1649,12 +2637,12 @@ def create_dataloader_for_hf_streaming(hf_dataset, tokenizer, max_length, batch_
 
 def create_map_style_dataloader(dataset, batch_size, pad_token_id, num_workers=0, shuffle=True,
                                 use_length_bucketing=True, bucket_size=None,
-                                device=None, prefetch_factor=None):
+                                device=None, prefetch_factor=None, in_order=True):
     collate = functools.partial(_collate_fn_dynamic_padding, pad_token_id=pad_token_id)
     use_cuda = _pin_memory_for_device(device)
-    drop_last = use_cuda and len(dataset) > batch_size
+    drop_last = False
     lengths = _get_dataset_sample_lengths(dataset) if use_length_bucketing and shuffle and batch_size > 1 else None
-    if lengths:
+    if lengths is not None and len(lengths) > 0:
         batch_sampler = LengthGroupedBatchSampler(
             lengths,
             batch_size=batch_size,
@@ -1669,6 +2657,7 @@ def create_map_style_dataloader(dataset, batch_size, pad_token_id, num_workers=0
             num_workers=num_workers,
             pin_memory=use_cuda,
             prefetch_factor=prefetch_factor,
+            in_order=in_order,
         )
 
     sampler = EpochShuffleSampler(dataset, shuffle=shuffle)
@@ -1681,4 +2670,5 @@ def create_map_style_dataloader(dataset, batch_size, pad_token_id, num_workers=0
         pin_memory=use_cuda,
         drop_last=drop_last,
         prefetch_factor=prefetch_factor,
+        in_order=in_order,
     )

@@ -13,6 +13,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import torch
 import torch.nn.functional as F
 
+from ..inference.chat import boundary_drift_seed, resolve_inference_prefill_chunk_size
+
 
 Grid = List[List[int]]
 
@@ -163,7 +165,12 @@ def generate_text(
     target_context = None
     drift_state = None
     ltm_state = None
-    prefill_chunk_size = int(getattr(getattr(model, "config", None), "training_chunk_size", 0) or 0)
+    model_config = getattr(model, "config", None)
+    prefill_chunk_size = resolve_inference_prefill_chunk_size(model_config)
+    exact_full_sample = bool(
+        getattr(model_config, "full_sample_bptt", False)
+        or getattr(model_config, "inference_logit_parity", False)
+    )
     total_tokens_seen = 0
 
     model.eval()
@@ -190,7 +197,12 @@ def generate_text(
             target_context = outputs.get("target_context")
             drift_state = outputs.get("drift_state")
             ltm_state = outputs.get("ltm_memory_state")
-            chunk_drift_state = drift_state
+            chunk_drift_state = boundary_drift_seed(
+                drift_state,
+                end,
+                prefill_chunk_size,
+                exact_full_sample=exact_full_sample,
+            )
         total_tokens_seen = len(context)
         logits = outputs["logits"][0, -1, :]
 
@@ -207,13 +219,12 @@ def generate_text(
                 break
 
             next_input = next_token.reshape(1, 1).to(device)
-            generation_drift_state = None
-            if (
-                prefill_chunk_size > 0
-                and total_tokens_seen > 0
-                and total_tokens_seen % prefill_chunk_size == 0
-            ):
-                generation_drift_state = drift_state
+            generation_drift_state = boundary_drift_seed(
+                drift_state,
+                total_tokens_seen,
+                prefill_chunk_size,
+                exact_full_sample=exact_full_sample,
+            )
             outputs = model(
                 input_ids=next_input,
                 h_state=h_state,

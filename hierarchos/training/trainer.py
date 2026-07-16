@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import LambdaLR
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 import time
 import random
 from tqdm import tqdm
@@ -273,6 +274,10 @@ _RUNTIME_MODEL_CONFIG_KEYS = (
     "commitment_threshold",
     "l_conv_atol",
     "detach_every_n_steps",
+    "full_sample_bptt",
+    "full_sample_activation_checkpointing",
+    "full_sample_checkpoint_segment_size",
+    "inference_logit_parity",
     "h_halt_thresh",
     "gradient_checkpointing",
     "debug_numerics",
@@ -285,13 +290,163 @@ _RUNTIME_MODEL_CONFIG_KEYS = (
     "cpu_loss_chunk_rows",
 )
 
+def _normalize_detach_every_n_steps(value):
+    """Normalize the documented 0/negative sentinel without changing checkpoints."""
+    if value is None:
+        return None
+    try:
+        value = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"detach_every_n_steps must be an integer or None, got {value!r}"
+        ) from exc
+    return value if value > 0 else None
+
+
 def _apply_runtime_model_config_overrides(model_config, args):
     for key in _RUNTIME_MODEL_CONFIG_KEYS:
         if hasattr(args, key):
-            model_config[key] = getattr(args, key)
+            value = getattr(args, key)
+            if key == "detach_every_n_steps":
+                value = _normalize_detach_every_n_steps(value)
+            model_config[key] = value
     if hasattr(args, "compile_static_worker_loop") and getattr(args, "compile_static_worker_loop") is not None:
         model_config.compile_static_worker_loop = getattr(args, "compile_static_worker_loop")
     return model_config
+
+
+def configure_full_sample_bptt(args, config=None, *, announce=False):
+    """Apply exact per-sample BPTT invariants without changing model tensors.
+
+    The persisted ``training_chunk_size`` remains untouched because it also keys
+    token caches, ROSA precomputation, LTM decay calibration, and compile shapes.
+    Without activation checkpointing, ``train_step`` uses one whole-sample
+    forward. With checkpointing, it retains attached recurrent boundary states
+    between activation-only temporal segments and performs one backward pass after
+    the complete sample graph has been assembled. Segmenting therefore bounds
+    saved activations without truncating the gradient horizon.
+    """
+    enabled = bool(getattr(args, "full_sample_bptt", False))
+    checkpoint_enabled = getattr(
+        args,
+        "full_sample_activation_checkpointing",
+        None,
+    )
+    checkpoint_enabled = enabled if checkpoint_enabled is None else bool(checkpoint_enabled)
+    checkpoint_segment_size = int(
+        getattr(args, "full_sample_checkpoint_segment_size", 128) or 128
+    )
+    if checkpoint_segment_size <= 0:
+        raise ValueError("full_sample_checkpoint_segment_size must be positive")
+
+    if enabled:
+        args.detach_every_n_steps = 0
+        args.persist_state = False
+        args.full_sample_activation_checkpointing = checkpoint_enabled
+        args.full_sample_checkpoint_segment_size = checkpoint_segment_size
+        # Persist the execution contract needed by chat/eval: no inference-only
+        # early exits or artificial-boundary drift seeding may change logits from
+        # the dynamics optimized by exact full-sample training.
+        args.inference_logit_parity = True
+
+        # With one isolated forward, the legacy Titans write happens only after
+        # backward and cannot affect the sample that produced it. The next sample
+        # resets working memory, so retaining every raw retrieval gradient and
+        # then writing a terminal state is pure overhead. Read-only still routes
+        # LTM per token and keeps all ordinary parameter/score gradients.
+        terminal_ltm_update_disabled = (
+            normalize_ltm_training_mode(
+                getattr(args, "ltm_training_mode", "inner-update")
+            ) == "inner-update"
+        )
+        if terminal_ltm_update_disabled:
+            args.ltm_training_mode = "read-only"
+            if announce:
+                print(
+                    "INFO: Skipping the terminal post-backward LTM fast-memory write: "
+                    "it is discarded before the next isolated sample and cannot "
+                    "change this sample's gradients. Per-token LTM routing remains active."
+                )
+
+        # Attached temporal-segment checkpoints already rematerialize every
+        # WorkerLoop invocation. Nesting the older per-token WorkerLoop
+        # checkpoint adds redundant recomputation without extending the
+        # gradient horizon.
+        nested_worker_checkpoint = bool(getattr(args, "gradient_checkpointing", False))
+        if checkpoint_enabled and nested_worker_checkpoint:
+            args.gradient_checkpointing = False
+            if announce:
+                print(
+                    "INFO: Attached full-sample activation checkpointing supersedes the "
+                    "nested WorkerLoop checkpoint."
+                )
+
+        if announce:
+            memory_mode = (
+                "attached temporal-segment activation recomputation"
+                if checkpoint_enabled
+                else "saved full-sample activations"
+            )
+            print(
+                "INFO: Full-sample BPTT enabled: one end-to-end attached graph per "
+                f"trimmed sample batch, recurrent detach disabled, {memory_mode}."
+            )
+            print(
+                "INFO: Configured training_chunk_size remains cache/ROSA/LTM/compile "
+                "geometry; activation-only segment length is "
+                f"{checkpoint_segment_size}."
+            )
+    elif checkpoint_enabled:
+        raise ValueError(
+            "full_sample_activation_checkpointing requires full_sample_bptt"
+        )
+
+    if config is not None:
+        config.full_sample_bptt = enabled
+        config.full_sample_activation_checkpointing = bool(checkpoint_enabled)
+        config.full_sample_checkpoint_segment_size = checkpoint_segment_size
+        if enabled:
+            config.inference_logit_parity = True
+        config.detach_every_n_steps = _normalize_detach_every_n_steps(
+            getattr(args, "detach_every_n_steps", None)
+        )
+        if enabled:
+            config.persist_state = False
+            config.ltm_training_mode = getattr(args, "ltm_training_mode", "read-only")
+            if checkpoint_enabled:
+                config.gradient_checkpointing = False
+
+    return enabled
+
+
+def _checkpointed_training_model_call(model, model_kwargs):
+    """Checkpoint one pure training forward while retaining nested outputs.
+
+    Non-reentrant checkpointing supports dictionaries/lists and records the
+    autograd graph needed by the gradient-derived LTM tensors. Training forwards
+    suppress Hebbian writes; the trainer commits any LTM inner update exactly
+    once after backward, so rematerialization has no persistent model side effect.
+    """
+    # Pass every value explicitly. In attached segmented BPTT, recurrent states
+    # are differentiable inputs from the preceding segment; making them checkpoint
+    # arguments avoids relying on closure capture and lets non-reentrant
+    # checkpointing discover tensors nested inside the LTM state tuple.
+    keys = tuple(model_kwargs)
+    values = tuple(model_kwargs[key] for key in keys)
+
+    def run(*replay_values):
+        return model(**dict(zip(keys, replay_values)))
+
+    return activation_checkpoint(
+        run,
+        *values,
+        use_reentrant=False,
+        # Hierarchos' training forward has no dropout or random sampling. Avoid
+        # stashing/restoring CPU+CUDA RNG state roughly max_length/segment_size
+        # times per batch; direct-vs-segmented gradient tests guard this premise.
+        preserve_rng_state=False,
+        determinism_check="default",
+    )
 
 
 def _restore_resume_component_state(component, state, component_name: str, checkpoint_path: str):
@@ -467,18 +622,30 @@ def _summarize_nonfinite_gradient_tensors(model, limit: int = 8):
         )
     return "; ".join(parts)
 
-def _manual_clip_grad_norm_(params, max_norm: float):
+def _manual_clip_grad_norm_(params, max_norm: float, *, return_finite: bool = False):
+    params = list(params)
     norms = []
+    dense_float32_groups = {}
     for param in params:
         grad = param.grad.detach()
         if grad.is_sparse:
             grad = grad.coalesce()._values()
-        norms.append(grad.float().norm(2))
+        if not grad.is_sparse and grad.dtype == torch.float32:
+            dense_float32_groups.setdefault(grad.device, []).append(grad)
+        else:
+            norms.append(grad.float().norm(2))
+    for device_grads in dense_float32_groups.values():
+        try:
+            norms.extend(torch._foreach_norm(device_grads, 2.0))
+        except (RuntimeError, TypeError):
+            norms.extend(grad.norm(2) for grad in device_grads)
     if norms:
         total_norm = torch.stack(norms).norm(2)
     else:
         total_norm = torch.zeros(())
-    if torch.is_tensor(total_norm) and not bool(torch.isfinite(total_norm).all().item()):
+    total_norm_value = float(total_norm.item())
+    total_norm_finite = math.isfinite(total_norm_value)
+    if torch.is_tensor(total_norm) and not total_norm_finite:
         # Fast fp32 norm can overflow when gradients are finite but huge. Fall back
         # to a max-scaled norm so finite gradients still get clipped instead of
         # being treated like NaN/Inf gradients.
@@ -489,7 +656,8 @@ def _manual_clip_grad_norm_(params, max_norm: float):
                 grad = grad.coalesce()._values()
             local_max = grad.float().abs().max()
             max_abs = local_max if max_abs is None else torch.maximum(max_abs.to(local_max.device), local_max)
-        if max_abs is not None and bool(torch.isfinite(max_abs).all().item()) and float(max_abs.item()) > 0.0:
+        max_abs_value = float(max_abs.item()) if max_abs is not None else 0.0
+        if max_abs is not None and math.isfinite(max_abs_value) and max_abs_value > 0.0:
             sum_sq = None
             for param in params:
                 grad = param.grad.detach()
@@ -500,32 +668,37 @@ def _manual_clip_grad_norm_(params, max_norm: float):
                 sum_sq = local_sq if sum_sq is None else sum_sq + local_sq.to(sum_sq.device)
             if sum_sq is not None:
                 total_norm = max_abs.to(dtype=torch.float64) * torch.sqrt(sum_sq.to(max_abs.device))
-    if max_norm > 0.0:
-        if not bool(torch.isfinite(total_norm).all().item()):
-            for param in params:
-                param.grad.detach().zero_()
-            return total_norm
-        clip_coef = max_norm / (float(total_norm.item()) + 1e-6)
-        if clip_coef < 1.0:
-            for param in params:
-                param.grad.detach().mul_(clip_coef)
+                total_norm_value = float(total_norm.item())
+                total_norm_finite = math.isfinite(total_norm_value)
+    if max_norm > 0.0 and total_norm_finite:
+        # This public foreach-backed helper applies the same L2 coefficient while
+        # avoiding a host-side `clip_coef < 1` branch and one kernel per tensor.
+        torch.nn.utils.clip_grads_with_norm_(params, max_norm, total_norm, foreach=None)
+    if return_finite:
+        return total_norm, total_norm_finite
     return total_norm
 
 
-def _prepare_ltm_update_gradients(grads: torch.Tensor, max_norm: float):
+def _prepare_ltm_update_gradients(grads: torch.Tensor, max_norm: float, *, inplace: bool = False):
     """Reject NaN/Inf LTM gradients, then clip finite gradients like model grads."""
     if not torch.is_tensor(grads):
         return None
-    prepared = grads.detach().float().clone()
-    if not bool(torch.isfinite(prepared).all().item()):
-        return None
+    prepared = grads.detach()
+    if prepared.dtype != torch.float32:
+        prepared = prepared.float()
+    elif not inplace:
+        prepared = prepared.clone()
     max_norm = _positive_float(max_norm, 1.0)
+    values_are_finite = torch.isfinite(prepared).all()
     if max_norm > 0:
         prepared.clamp_(min=-max_norm, max=max_norm)
         grad_norm = prepared.norm()
-        if not bool(torch.isfinite(grad_norm).all().item()):
+        checks_are_finite = torch.stack((values_are_finite, torch.isfinite(grad_norm))).all()
+        if not bool(checks_are_finite.item()):
             return None
         prepared.mul_(torch.clamp(prepared.new_tensor(max_norm) / (grad_norm + 1e-8), max=1.0))
+    elif not bool(values_are_finite.item()):
+        return None
     return prepared
 
 def save_training_checkpoint_if_finite(checkpoint_dict, path: str, model, optimizer=None) -> bool:
@@ -576,21 +749,24 @@ def _clip_gradients_and_check(model, max_norm: float, max_sanitized_values: int 
     if not params:
         return True, None
     max_norm = float(max_norm or 0.0)
-    issue = _find_first_nonfinite_gradient_tensor(model)
-    if issue:
+    # The old healthy path scanned every parameter twice with `.item()`, which
+    # serialized the CPU with CUDA once per gradient tensor. The global L2 norm
+    # is non-finite whenever any dense gradient contains NaN/Inf, so use its one
+    # host decision as the fast path and reserve detailed per-tensor scans for
+    # the exceptional diagnostic path.
+    total_norm, total_norm_finite = _manual_clip_grad_norm_(
+        params,
+        max_norm,
+        return_finite=True,
+    )
+    if not total_norm_finite:
+        issue = _find_first_nonfinite_gradient_tensor(model)
         summary = _summarize_nonfinite_gradient_tensors(model)
-        if summary:
+        if issue and summary:
             return False, f"{issue}. Top non-finite gradient tensors: {summary}"
-        return False, issue
-    total_norm = _manual_clip_grad_norm_(params, max_norm)
-    if torch.is_tensor(total_norm) and not bool(torch.isfinite(total_norm).all().item()):
+        if issue:
+            return False, issue
         return False, "gradient norm became non-finite during finite-gradient clipping"
-    issue = _find_first_nonfinite_gradient_tensor(model)
-    if issue:
-        summary = _summarize_nonfinite_gradient_tensors(model)
-        if summary:
-            return False, f"{issue}. Top non-finite gradient tensors: {summary}"
-        return False, issue
     return True, total_norm
 
 def _has_pending_gradients(model) -> bool:
@@ -653,7 +829,8 @@ def mark_val_proj_trained(model):
 
 
 def compute_chunk_training_weights(labels: torch.Tensor, attention_mask: torch.Tensor = None,
-                                   chunk_size: int = 128, loss_weights: torch.Tensor = None):
+                                   chunk_size: int = 128, loss_weights: torch.Tensor = None,
+                                   h_stride: int = None):
     """
     Build TBPTT chunk weights that match the causal objective.
 
@@ -672,6 +849,7 @@ def compute_chunk_training_weights(labels: torch.Tensor, attention_mask: torch.T
     total_valid_predictions = 0
     total_prediction_weight = 0.0
     total_real_tokens = 0
+    total_ponder_tokens = 0
 
     for start_t in range(0, T, chunk_size):
         end_t = min(start_t + chunk_size, T)
@@ -695,16 +873,42 @@ def compute_chunk_training_weights(labels: torch.Tensor, attention_mask: torch.T
         else:
             real_tokens = B * (end_t - start_t)
 
+        # Manager ponder cost is emitted only at absolute h_stride positions.
+        # Tracking that mass separately makes attached segmented full BPTT
+        # mathematically match a single whole-sample forward, including a short
+        # final segment whose manager-step density can differ from earlier ones.
+        if h_stride is not None and int(h_stride) > 0:
+            ponder_positions = [
+                position - start_t
+                for position in range(start_t, end_t)
+                if position % int(h_stride) == 0
+            ]
+            if ponder_positions:
+                if attention_mask is not None:
+                    ponder_tokens = int(
+                        attention_mask[:, start_t:end_t][:, ponder_positions].sum().item()
+                    )
+                else:
+                    ponder_tokens = B * len(ponder_positions)
+            else:
+                ponder_tokens = 0
+        else:
+            # Preserve the historical TBPTT weighting when callers do not
+            # provide architecture stride information.
+            ponder_tokens = real_tokens
+
         chunks.append({
             "start": start_t,
             "end": end_t,
             "valid_predictions": valid_predictions,
             "prediction_weight": prediction_weight,
             "real_tokens": real_tokens,
+            "ponder_tokens": ponder_tokens,
         })
         total_valid_predictions += valid_predictions
         total_prediction_weight += prediction_weight
         total_real_tokens += real_tokens
+        total_ponder_tokens += ponder_tokens
 
     for chunk in chunks:
         chunk["label_ratio"] = (
@@ -714,6 +918,10 @@ def compute_chunk_training_weights(labels: torch.Tensor, attention_mask: torch.T
         chunk["token_ratio"] = (
             chunk["real_tokens"] / float(total_real_tokens)
             if total_real_tokens > 0 else 0.0
+        )
+        chunk["ponder_ratio"] = (
+            chunk["ponder_tokens"] / float(total_ponder_tokens)
+            if total_ponder_tokens > 0 else 0.0
         )
 
     return chunks
@@ -1150,6 +1358,79 @@ def set_dataloader_epoch(dataloader, epoch: int):
         if callable(set_epoch):
             set_epoch(epoch)
 
+
+class CUDABatchPrefetcher:
+    """Overlap one pinned host batch transfer with the current CUDA step."""
+
+    def __init__(self, iterable, device):
+        self.iterator = iter(iterable)
+        self.device = torch.device(device)
+        self.stream = torch.cuda.Stream(device=self.device)
+        self._next = None
+        self._preload()
+
+    def __iter__(self):
+        return self
+
+    def _preload(self):
+        try:
+            cpu_batch = next(self.iterator)
+        except StopIteration:
+            self._next = None
+            return
+
+        if cpu_batch is None:
+            self._next = (None, {})
+            return
+
+        device_tensors = {}
+        with torch.cuda.stream(self.stream):
+            for key, value in cpu_batch.items():
+                if torch.is_tensor(value):
+                    device_tensors[key] = value.to(self.device, non_blocking=True)
+        self._next = (cpu_batch, device_tensors)
+
+    def __next__(self):
+        while self._next is not None:
+            current_stream = torch.cuda.current_stream(self.device)
+            current_stream.wait_stream(self.stream)
+            cpu_batch, device_tensors = self._next
+            if cpu_batch is not None:
+                for tensor in device_tensors.values():
+                    tensor.record_stream(current_stream)
+                cpu_batch["_cuda_prefetched_tensors"] = device_tensors
+            self._preload()
+            if cpu_batch is not None:
+                return cpu_batch
+        raise StopIteration
+
+
+def _batch_tensor_to_device(batch, key, cpu_tensor, device, *, pad_value=0):
+    """Use a lookahead copy and reproduce any CPU-side trim/pad on device."""
+    if cpu_tensor is None:
+        return None
+    prefetched = batch.get("_cuda_prefetched_tensors")
+    candidate = prefetched.get(key) if isinstance(prefetched, dict) else None
+    if (
+        torch.is_tensor(candidate)
+        and candidate.device == device
+        and candidate.ndim == cpu_tensor.ndim
+        and candidate.shape[0] == cpu_tensor.shape[0]
+    ):
+        if candidate.shape == cpu_tensor.shape:
+            return candidate
+        if candidate.ndim == 2 and candidate.shape[1] >= cpu_tensor.shape[1]:
+            return candidate[:, :cpu_tensor.shape[1]].contiguous()
+        if candidate.ndim == 2 and candidate.shape[1] < cpu_tensor.shape[1]:
+            pad_cols = cpu_tensor.shape[1] - candidate.shape[1]
+            padding = candidate.new_full(
+                (candidate.shape[0], pad_cols),
+                pad_value,
+            )
+            return torch.cat((candidate, padding), dim=1)
+    return cpu_tensor.to(device, non_blocking=(device.type == "cuda"))
+
+
 def should_update_progress(step: int, args, total_steps: int = None, first_step: int = 0) -> bool:
     """Throttle CUDA-to-CPU metric syncs caused by progress-bar scalar logging."""
     interval = max(1, int(getattr(args, 'progress_log_steps', 10) or 1))
@@ -1489,37 +1770,110 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
         if ltm_state is not None: 
             ltm_state = tuple(s.detach() if isinstance(s, torch.Tensor) else s for s in ltm_state)
 
-    # Temporal chunking (critical for RWKV-based models). Build this on CPU before
-    # moving labels/masks to CUDA so per-chunk .item() accounting does not sync GPU.
-    if chunk_size <= 0 or chunk_size > T: chunk_size = T
+    # Temporal chunking is critical for RWKV-based models. Exact full-sample BPTT
+    # uses a single forward when activations are saved normally. When activation
+    # checkpointing is enabled it instead builds one attached graph from bounded
+    # activation-only temporal segments, carries recurrent states without detaching,
+    # and backpropagates only after the last segment. This bounds peak activations
+    # while preserving the complete gradient horizon.
+    # Build weights before moving labels/masks to CUDA so accounting cannot sync GPU.
+    full_sample_bptt = bool(getattr(args, "full_sample_bptt", False))
+    if full_sample_bptt:
+        if bool(getattr(args, "persist_state", False)):
+            raise ValueError(
+                "full_sample_bptt requires persist_state=False so unrelated samples "
+                "cannot share a graph or recurrent values"
+            )
+        if bool(getattr(args, "full_sample_activation_checkpointing", False)):
+            chunk_size = int(
+                getattr(args, "full_sample_checkpoint_segment_size", 128) or 128
+            )
+        else:
+            chunk_size = T
+    elif chunk_size <= 0 or chunk_size > T:
+        chunk_size = T
     chunk_plan = compute_chunk_training_weights(
         full_labels,
         full_attention_mask,
         chunk_size,
         loss_weights=full_loss_weights,
+        h_stride=(
+            getattr(model.config, "h_stride", None)
+            if full_sample_bptt
+            else None
+        ),
     )
     num_chunks = len(chunk_plan)
 
-    full_input_ids = full_input_ids.to(device, non_blocking=_nb)
-    if full_attention_mask is not None: full_attention_mask = full_attention_mask.to(device, non_blocking=_nb)
-    full_labels = full_labels.to(device, non_blocking=_nb)
-    if full_rosa_ids is not None: full_rosa_ids = full_rosa_ids.to(device, non_blocking=_nb)
-    if full_loss_weights is not None: full_loss_weights = full_loss_weights.to(device, non_blocking=_nb)
+    full_input_ids = _batch_tensor_to_device(
+        batch,
+        "input_ids",
+        full_input_ids,
+        device,
+        pad_value=int(getattr(args, 'pad_token_id', 0)),
+    )
+    full_attention_mask = _batch_tensor_to_device(
+        batch,
+        "attention_mask",
+        full_attention_mask,
+        device,
+        pad_value=0,
+    )
+    full_labels = _batch_tensor_to_device(
+        batch,
+        "labels",
+        full_labels,
+        device,
+        pad_value=-100,
+    )
+    # Compact caches keep labels as int32 through pinned-memory transfer to
+    # halve PCIe traffic. Cross-entropy requires int64 targets, so widen only
+    # after the tensor reaches the accelerator.
+    full_labels = full_labels.to(dtype=torch.long)
+    rosa_sentinel = int(getattr(model.config, 'vocab_size', getattr(args, 'vocab_size', 0)))
+    full_rosa_ids = _batch_tensor_to_device(
+        batch,
+        "rosa_ids",
+        full_rosa_ids,
+        device,
+        pad_value=rosa_sentinel,
+    )
+    full_loss_weights = _batch_tensor_to_device(
+        batch,
+        "loss_weights",
+        full_loss_weights,
+        device,
+        pad_value=0.0,
+    )
     
-    total_loss = torch.zeros((), device=device, dtype=torch.float32)
-    total_ponder = torch.zeros((), device=device, dtype=torch.float32)
-    total_commit = torch.zeros((), device=device, dtype=torch.float32)
-    total_ltm_value_alignment = torch.zeros((), device=device, dtype=torch.float32)
+    # Reporting math is intentionally absent on non-log steps. At the default
+    # progress interval this avoids four allocations plus several detached CUDA
+    # scalar kernels on 24 out of every 25 batches.
+    total_loss = torch.zeros((), device=device, dtype=torch.float32) if collect_metrics else None
+    total_ponder = torch.zeros((), device=device, dtype=torch.float32) if collect_metrics else None
+    total_commit = torch.zeros((), device=device, dtype=torch.float32) if collect_metrics else None
+    total_ltm_value_alignment = (
+        torch.zeros((), device=device, dtype=torch.float32) if collect_metrics else None
+    )
     has_ponder = False
     has_commitment = False
     has_ltm_value_alignment = False
     chunks_processed = 0
     final_outputs = None
+    full_ce_terms = []
+    full_ponder_terms = []
+    full_commitment_terms = []
+    full_ltm_alignment_terms = []
     fast_lm_loss = (
         (device.type == 'cuda' and getattr(args, 'cuda_chunked_lm_loss', True))
         or (device.type == 'cpu' and getattr(args, 'cpu_chunked_lm_loss', True))
     )
     use_ltm_inner_updates = ltm_inner_updates_enabled(args)
+    if full_sample_bptt and use_ltm_inner_updates:
+        raise RuntimeError(
+            "full_sample_bptt requires read-only LTM during the attached graph; "
+            "run configure_full_sample_bptt before training"
+        )
     ltm_value_alignment_weight = _nonnegative_float(
         getattr(args, 'ltm_value_alignment_weight', 0.0),
         0.0,
@@ -1531,6 +1885,7 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
             end_t = chunk_info["end"]
             label_ratio = chunk_info["label_ratio"]
             token_ratio = chunk_info["token_ratio"]
+            ponder_ratio = chunk_info.get("ponder_ratio", token_ratio)
 
             # Dynamic padding can create trailing chunks with no real tokens and
             # no supervised labels. Skip them entirely so padding cannot decay or
@@ -1547,7 +1902,7 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
             loss_weights = full_loss_weights[:, start_t:loss_end_t] if full_loss_weights is not None else None
             
             with autocast(device_type=autocast_device, dtype=amp_dtype, enabled=args.amp):
-                outputs = model(
+                model_kwargs = dict(
                     input_ids=input_ids, attention_mask=attention_mask, labels=labels,
                     h_state=h_state, l_state=l_state, prev_context=prev_ctx,
                     target_context=target_ctx, drift_state=drift_state, ltm_memory_state=ltm_state,
@@ -1560,6 +1915,14 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                     rosa_ids=rosa_ids,
                     loss_weights=loss_weights,
                 )
+                if bool(getattr(args, "full_sample_activation_checkpointing", False)):
+                    if not full_sample_bptt:
+                        raise RuntimeError(
+                            "Full-sample activation checkpointing requires full-sample BPTT"
+                        )
+                    outputs = _checkpointed_training_model_call(model, model_kwargs)
+                else:
+                    outputs = model(**model_kwargs)
                 
                 # LTM fast-memory update needs gradients from the exact tensors used
                 # by the forward graph. retrieve_topk already keeps them float32.
@@ -1574,110 +1937,136 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                 commitment_cost = outputs.get('commitment_cost')
                 ltm_value_alignment_cost = outputs.get('ltm_value_alignment_cost')
 
-                ce_valid = _component_is_finite(ce_loss)
-                ponder_valid = ponder_cost is None or _component_is_finite(ponder_cost)
-                commitment_valid = commitment_cost is None or _component_is_finite(commitment_cost)
-                alignment_valid = (
-                    ltm_value_alignment_weight <= 0.0
-                    or _component_is_finite(ltm_value_alignment_cost)
-                )
-                if not (ce_valid and ponder_valid and commitment_valid and alignment_valid):
-                    print(
-                        f"\nCRITICAL: Non-finite training loss at step {step+1}, "
-                        f"chunk {chunk_idx} ({start_t}:{end_t})."
-                    )
-                    if not ce_valid and ce_loss is not None:
-                        print("  " + _describe_tensor_issue("cross_entropy_loss", ce_loss))
-                    if not ponder_valid and ponder_cost is not None:
-                        print("  " + _describe_tensor_issue("ponder_cost", ponder_cost))
-                    if not commitment_valid and commitment_cost is not None:
-                        print("  " + _describe_tensor_issue("commitment_cost", commitment_cost))
-                    if not alignment_valid:
-                        print("  " + _describe_tensor_issue("ltm_value_alignment_cost", ltm_value_alignment_cost))
-                    print("  Skipping this batch and clearing recurrent/LTM state before it can poison optimizer state.")
-                    args._train_step_had_nonfinite = True
-                    return None, _reset_after_nonfinite(optimizer, model)
+                if full_sample_bptt:
+                    # Defer loss composition and backward until every attached
+                    # segment exists. Aggregating raw components first exactly
+                    # matches a single whole-sample forward: caps and adaptive
+                    # ponder targets are applied once to global sample means.
+                    full_ce_terms.append(ce_loss * label_ratio)
+                    if ponder_cost is not None:
+                        full_ponder_terms.append(ponder_cost * ponder_ratio)
+                    if commitment_cost is not None:
+                        full_commitment_terms.append(commitment_cost * token_ratio)
+                    if ltm_value_alignment_cost is not None:
+                        full_ltm_alignment_terms.append(
+                            ltm_value_alignment_cost * token_ratio
+                        )
+                else:
+                    finite_components = [("ce", ce_loss)]
+                    if ponder_cost is not None:
+                        finite_components.append(("ponder", ponder_cost))
+                    if commitment_cost is not None:
+                        finite_components.append(("commitment", commitment_cost))
+                    if ltm_value_alignment_weight > 0.0:
+                        finite_components.append(("alignment", ltm_value_alignment_cost))
+                    finite_checks = [
+                        torch.isfinite(value).all()
+                        if value is not None else torch.tensor(False, device=device)
+                        for _name, value in finite_components
+                    ]
 
-                ce_loss_for_backward = _cap_loss_component_for_backward(
-                    ce_loss,
-                    getattr(args, 'max_ce_loss_for_backward', 0.0),
-                )
-                
-                aux_loss = torch.zeros_like(ce_loss)
-                
-                # --- ACT Sensitivity: Adaptive Ponder Loss ---
-                if ponder_cost is not None:
-                    ponder_weight = getattr(args, 'ponder_loss_weight', 0.01)
-                    ponder_cost_for_backward = _cap_loss_component_for_backward(
-                        ponder_cost,
-                        getattr(args, 'max_ponder_cost_for_backward', 0.0),
-                    )
-                    
-                    if getattr(args, 'encourage_thinking', False):
-                        # RECOVERY MODE: Invert ponder penalty to REWARD thinking
-                        # Negative weight means higher ponder = lower loss
-                        aux_loss = aux_loss - (abs(ponder_weight) * ponder_cost_for_backward)
-                    elif getattr(args, 'adaptive_ponder', False):
-                        # ADAPTIVE MODE: Scale ponder target with loss
-                        # Higher CE loss = more thinking needed
-                        max_h_steps = getattr(args, 'max_h_steps', 5)
-                        target_scale = getattr(args, 'ponder_target_scale', 0.5)
-                        target_ponder = torch.clamp(ce_loss.detach() * target_scale, min=1.0, max=float(max_h_steps))
-                        ponder_diff = target_ponder - ponder_cost_for_backward
-                        # Penalize under-thinking (when ponder < target), ignore over-thinking
-                        ponder_penalty = torch.relu(ponder_diff) * ponder_weight
-                        aux_loss = aux_loss + ponder_penalty
-                    else:
-                        # STANDARD MODE: Original additive penalty (penalizes thinking)
-                        aux_loss = aux_loss + (ponder_weight * ponder_cost_for_backward)
-                
-                if commitment_cost is not None:
-                    commitment_cost_for_backward = _cap_loss_component_for_backward(
-                        commitment_cost,
-                        getattr(args, 'max_commitment_cost_for_backward', 2.0),
-                        preserve_gradient=True,
-                    )
-                    aux_loss = aux_loss + (getattr(args, 'commitment_loss_weight', 0.5) * commitment_cost_for_backward)
-
-                if ltm_value_alignment_weight > 0.0:
-                    aux_loss = aux_loss + (
-                        ltm_value_alignment_weight * ltm_value_alignment_cost
+                    ce_loss_for_backward = _cap_loss_component_for_backward(
+                        ce_loss,
+                        getattr(args, 'max_ce_loss_for_backward', 0.0),
                     )
 
-                # CE is already averaged over valid shifted labels within this
-                # chunk. Weight it by supervised token count so chunk boundaries
-                # and masked legacy labels cannot dilute the actual learning
-                # signal.
-                chunk_loss = ((ce_loss_for_backward * label_ratio) + (aux_loss * token_ratio)) / loss_divisor
+                    aux_loss = torch.zeros_like(ce_loss)
 
-                chunk_loss_valid = _component_is_finite(chunk_loss)
-                if not chunk_loss_valid:
-                    print(
-                        f"\nCRITICAL: Non-finite training loss at step {step+1}, "
-                        f"chunk {chunk_idx} ({start_t}:{end_t})."
-                    )
-                    print("  " + _describe_tensor_issue("chunk_loss", chunk_loss))
-                    print("  Skipping this batch and clearing recurrent/LTM state before it can poison optimizer state.")
-                    args._train_step_had_nonfinite = True
-                    return None, _reset_after_nonfinite(optimizer, model)
-            
-            # Backprop per chunk (TBPTT)
-            # retain_grad() is now handled inside autocast block above (BUG #1 fix)
+                    # --- ACT Sensitivity: Adaptive Ponder Loss ---
+                    if ponder_cost is not None:
+                        ponder_weight = getattr(args, 'ponder_loss_weight', 0.01)
+                        ponder_cost_for_backward = _cap_loss_component_for_backward(
+                            ponder_cost,
+                            getattr(args, 'max_ponder_cost_for_backward', 0.0),
+                        )
 
-            if scaler is not None: scaler.scale(chunk_loss).backward()
-            else: chunk_loss.backward()
-            args._train_step_had_backward = True
+                        if getattr(args, 'encourage_thinking', False):
+                            # RECOVERY MODE: Invert ponder penalty to REWARD thinking
+                            aux_loss = aux_loss - (abs(ponder_weight) * ponder_cost_for_backward)
+                        elif getattr(args, 'adaptive_ponder', False):
+                            max_h_steps = getattr(args, 'max_h_steps', 5)
+                            target_scale = getattr(args, 'ponder_target_scale', 0.5)
+                            target_ponder = torch.clamp(
+                                ce_loss.detach() * target_scale,
+                                min=1.0,
+                                max=float(max_h_steps),
+                            )
+                            ponder_diff = target_ponder - ponder_cost_for_backward
+                            aux_loss = aux_loss + torch.relu(ponder_diff) * ponder_weight
+                        else:
+                            aux_loss = aux_loss + (ponder_weight * ponder_cost_for_backward)
+
+                    if commitment_cost is not None:
+                        commitment_cost_for_backward = _cap_loss_component_for_backward(
+                            commitment_cost,
+                            getattr(args, 'max_commitment_cost_for_backward', 2.0),
+                            preserve_gradient=True,
+                        )
+                        aux_loss = aux_loss + (
+                            getattr(args, 'commitment_loss_weight', 0.5)
+                            * commitment_cost_for_backward
+                        )
+
+                    if ltm_value_alignment_weight > 0.0:
+                        aux_loss = aux_loss + (
+                            ltm_value_alignment_weight * ltm_value_alignment_cost
+                        )
+
+                    # Historical TBPTT semantics: CE is weighted by supervised
+                    # labels while token-level auxiliary costs use real tokens.
+                    chunk_loss = (
+                        (ce_loss_for_backward * label_ratio)
+                        + (aux_loss * token_ratio)
+                    ) / loss_divisor
+
+                    all_loss_checks = finite_checks + [torch.isfinite(chunk_loss).all()]
+                    losses_valid = bool(torch.stack(all_loss_checks).all().item())
+                    if not losses_valid:
+                        flag_values = torch.stack(all_loss_checks).tolist()
+                        component_flags = {
+                            name: bool(flag)
+                            for (name, _value), flag in zip(finite_components, flag_values)
+                        }
+                        print(
+                            f"\nCRITICAL: Non-finite training loss at step {step+1}, "
+                            f"chunk {chunk_idx} ({start_t}:{end_t})."
+                        )
+                        if not component_flags.get("ce", True) and ce_loss is not None:
+                            print("  " + _describe_tensor_issue("cross_entropy_loss", ce_loss))
+                        if not component_flags.get("ponder", True) and ponder_cost is not None:
+                            print("  " + _describe_tensor_issue("ponder_cost", ponder_cost))
+                        if not component_flags.get("commitment", True) and commitment_cost is not None:
+                            print("  " + _describe_tensor_issue("commitment_cost", commitment_cost))
+                        if not component_flags.get("alignment", True):
+                            print("  " + _describe_tensor_issue("ltm_value_alignment_cost", ltm_value_alignment_cost))
+                        if not bool(flag_values[-1]):
+                            print("  " + _describe_tensor_issue("chunk_loss", chunk_loss))
+                        print("  Skipping this batch and clearing recurrent/LTM state before it can poison optimizer state.")
+                        args._train_step_had_nonfinite = True
+                        return None, _reset_after_nonfinite(optimizer, model)
+
+            if not full_sample_bptt:
+                # Historical TBPTT backpropagates each detached temporal chunk.
+                if scaler is not None:
+                    scaler.scale(chunk_loss).backward()
+                else:
+                    chunk_loss.backward()
+                args._train_step_had_backward = True
             
             # --- GRADIENT-BASED LTM UPDATE (Titans Parity) ---
             if use_ltm_inner_updates and outputs.get("raw_topk_vals") is not None:
                 with torch.no_grad():
                     valid_grads = []
+                    current_scale = (
+                        scaler.get_scale()
+                        if getattr(args, 'amp', False) and scaler is not None
+                        else None
+                    )
                     for t_val in outputs["raw_topk_vals"]:
                         g = t_val.grad
                         if g is not None:
                             # Unscale if using AMP
-                            if getattr(args, 'amp', False) and scaler is not None:
-                                current_scale = scaler.get_scale()
+                            if current_scale is not None:
                                 if current_scale > 1e-6:
                                     g = g / current_scale
                             valid_grads.append(g.detach())
@@ -1690,7 +2079,13 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                         t_val.grad = None
                     outputs["raw_topk_vals"] = None  # Free tensor references (BUG #3: memory leak fix)
                     _clip_val = _positive_float(getattr(args, 'grad_clip', 1.0), 1.0)
-                    ltm_grads_tensor = _prepare_ltm_update_gradients(ltm_grads_tensor, _clip_val)
+                    # torch.stack above produced a fresh disposable fp32 tensor;
+                    # clip it in place instead of cloning tens of MiB per chunk.
+                    ltm_grads_tensor = _prepare_ltm_update_gradients(
+                        ltm_grads_tensor,
+                        _clip_val,
+                        inplace=True,
+                    )
                     if ltm_grads_tensor is None:
                         print(
                             f"\nCRITICAL: Non-finite LTM gradient at step {step+1}, "
@@ -1736,42 +2131,210 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                 # In read-only/inference-like LTM mode, carry ROSA/past-token
                 # continuity across TBPTT chunks but do not write supervised fast
                 # memory that chat-time generation cannot reproduce.
-                ltm_state = detach_ltm_state_from_outputs(outputs)
+                if full_sample_bptt:
+                    # Keep tensor state attached until the single end-to-end
+                    # backward. The current read-only LTM payload is mostly
+                    # non-differentiable cache metadata, but avoiding a blanket
+                    # detach preserves any trainable routing path added later.
+                    ltm_state = outputs.get('ltm_memory_state')
+                else:
+                    ltm_state = detach_ltm_state_from_outputs(outputs)
 
-            # Update states for next chunk (TBPTT - detach to limit gradient flow)
+            # Carry exact attached states for full BPTT; historical TBPTT detaches
+            # at every boundary. Do not carry final_drift into an attached segment:
+            # core.forward treats a non-None local-t=0 drift as an external seed,
+            # while an uninterrupted absolute-t>0 step derives drift from l_state.
             recurrent_state_clamp = getattr(args, 'recurrent_state_clamp', 50.0)
             context_state_clamp = getattr(args, 'context_state_clamp', 50.0)
             drift_state_clamp = getattr(args, 'drift_state_clamp', 5.0)
             drift_norm_clamp = getattr(args, 'drift_norm_clamp', 0.0)
-            if outputs.get('h_state') is not None:
-                h_state = _detach_finite_clamp(outputs['h_state'], recurrent_state_clamp)
-            if outputs.get('l_state') is not None:
-                l_state = _detach_finite_clamp(outputs['l_state'], recurrent_state_clamp)
-            if outputs.get('prev_context') is not None:
-                prev_ctx = _detach_finite_clamp(outputs['prev_context'], context_state_clamp)
-            if outputs.get('target_context') is not None:
-                target_ctx = _detach_finite_clamp(outputs['target_context'], context_state_clamp)
-            if outputs.get('drift_state') is not None:
-                drift_state = _detach_finite_l2_clamp(outputs['drift_state'], drift_state_clamp, drift_norm_clamp)
+            if full_sample_bptt:
+                h_state = outputs.get('h_state')
+                l_state = outputs.get('l_state')
+                prev_ctx = outputs.get('prev_context')
+                target_ctx = outputs.get('target_context')
+                drift_state = outputs.get('drift_state') if chunk_idx == num_chunks - 1 else None
+            else:
+                if outputs.get('h_state') is not None:
+                    h_state = _detach_finite_clamp(outputs['h_state'], recurrent_state_clamp)
+                if outputs.get('l_state') is not None:
+                    l_state = _detach_finite_clamp(outputs['l_state'], recurrent_state_clamp)
+                if outputs.get('prev_context') is not None:
+                    prev_ctx = _detach_finite_clamp(outputs['prev_context'], context_state_clamp)
+                if outputs.get('target_context') is not None:
+                    target_ctx = _detach_finite_clamp(outputs['target_context'], context_state_clamp)
+                if outputs.get('drift_state') is not None:
+                    drift_state = _detach_finite_l2_clamp(
+                        outputs['drift_state'],
+                        drift_state_clamp,
+                        drift_norm_clamp,
+                    )
             
-            # Accumulate for display
-            total_loss = total_loss + ce_loss.detach().float() * label_ratio
-            if ponder_cost is not None: 
-                total_ponder = total_ponder + ponder_cost.detach().float() * token_ratio
-                has_ponder = True
-            if commitment_cost is not None: 
-                total_commit = total_commit + commitment_cost.detach().float() * token_ratio
-                has_commitment = True
-            if ltm_value_alignment_cost is not None:
-                total_ltm_value_alignment = (
-                    total_ltm_value_alignment
-                    + ltm_value_alignment_cost.detach().float() * token_ratio
-                )
-                has_ltm_value_alignment = True
+            # Accumulate display-only scalars only when this batch will actually
+            # update tqdm; these values never participate in backward or state.
+            if collect_metrics:
+                total_loss = total_loss + ce_loss.detach().float() * label_ratio
+                if ponder_cost is not None:
+                    ponder_display_ratio = ponder_ratio if full_sample_bptt else token_ratio
+                    total_ponder = (
+                        total_ponder
+                        + ponder_cost.detach().float() * ponder_display_ratio
+                    )
+                    has_ponder = True
+                if commitment_cost is not None:
+                    total_commit = total_commit + commitment_cost.detach().float() * token_ratio
+                    has_commitment = True
+                if ltm_value_alignment_cost is not None:
+                    total_ltm_value_alignment = (
+                        total_ltm_value_alignment
+                        + ltm_value_alignment_cost.detach().float() * token_ratio
+                    )
+                    has_ltm_value_alignment = True
             
             chunks_processed += 1
             # final_outputs = outputs # REMOVED: Memory Leak Fix
-        
+
+        if full_sample_bptt and chunks_processed > 0:
+            # Reconstruct the exact whole-sample scalar objective before the one
+            # backward pass. Each component was normalized by the same mass used
+            # in an uninterrupted forward (supervised label weight, manager-step
+            # weight, or real-token weight respectively).
+            whole_ce_loss = torch.stack(full_ce_terms).sum()
+            whole_ponder_cost = (
+                torch.stack(full_ponder_terms).sum()
+                if full_ponder_terms
+                else None
+            )
+            whole_commitment_cost = (
+                torch.stack(full_commitment_terms).sum()
+                if full_commitment_terms
+                else None
+            )
+            whole_ltm_alignment_cost = (
+                torch.stack(full_ltm_alignment_terms).sum()
+                if full_ltm_alignment_terms
+                else None
+            )
+
+            finite_components = [("ce", whole_ce_loss)]
+            if whole_ponder_cost is not None:
+                finite_components.append(("ponder", whole_ponder_cost))
+            if whole_commitment_cost is not None:
+                finite_components.append(("commitment", whole_commitment_cost))
+            if ltm_value_alignment_weight > 0.0:
+                finite_components.append(("alignment", whole_ltm_alignment_cost))
+
+            ce_loss_for_backward = _cap_loss_component_for_backward(
+                whole_ce_loss,
+                getattr(args, 'max_ce_loss_for_backward', 0.0),
+            )
+            aux_loss = torch.zeros_like(whole_ce_loss)
+
+            if whole_ponder_cost is not None:
+                ponder_weight = getattr(args, 'ponder_loss_weight', 0.01)
+                ponder_cost_for_backward = _cap_loss_component_for_backward(
+                    whole_ponder_cost,
+                    getattr(args, 'max_ponder_cost_for_backward', 0.0),
+                )
+                if getattr(args, 'encourage_thinking', False):
+                    aux_loss = aux_loss - (
+                        abs(ponder_weight) * ponder_cost_for_backward
+                    )
+                elif getattr(args, 'adaptive_ponder', False):
+                    max_h_steps = getattr(args, 'max_h_steps', 5)
+                    target_scale = getattr(args, 'ponder_target_scale', 0.5)
+                    target_ponder = torch.clamp(
+                        whole_ce_loss.detach() * target_scale,
+                        min=1.0,
+                        max=float(max_h_steps),
+                    )
+                    aux_loss = aux_loss + (
+                        torch.relu(target_ponder - ponder_cost_for_backward)
+                        * ponder_weight
+                    )
+                else:
+                    aux_loss = aux_loss + (
+                        ponder_weight * ponder_cost_for_backward
+                    )
+
+            if whole_commitment_cost is not None:
+                commitment_cost_for_backward = _cap_loss_component_for_backward(
+                    whole_commitment_cost,
+                    getattr(args, 'max_commitment_cost_for_backward', 2.0),
+                    preserve_gradient=True,
+                )
+                aux_loss = aux_loss + (
+                    getattr(args, 'commitment_loss_weight', 0.5)
+                    * commitment_cost_for_backward
+                )
+
+            if ltm_value_alignment_weight > 0.0:
+                aux_loss = aux_loss + (
+                    ltm_value_alignment_weight * whole_ltm_alignment_cost
+                )
+
+            whole_sample_loss = (ce_loss_for_backward + aux_loss) / loss_divisor
+            all_loss_checks = [
+                torch.isfinite(value).all()
+                if value is not None else torch.tensor(False, device=device)
+                for _name, value in finite_components
+            ] + [torch.isfinite(whole_sample_loss).all()]
+            losses_valid = bool(torch.stack(all_loss_checks).all().item())
+            if not losses_valid:
+                flag_values = torch.stack(all_loss_checks).tolist()
+                component_flags = {
+                    name: bool(flag)
+                    for (name, _value), flag in zip(finite_components, flag_values)
+                }
+                print(
+                    f"\nCRITICAL: Non-finite full-sample training loss at step {step+1}."
+                )
+                if not component_flags.get("ce", True):
+                    print("  " + _describe_tensor_issue("cross_entropy_loss", whole_ce_loss))
+                if not component_flags.get("ponder", True):
+                    print("  " + _describe_tensor_issue("ponder_cost", whole_ponder_cost))
+                if not component_flags.get("commitment", True):
+                    print("  " + _describe_tensor_issue("commitment_cost", whole_commitment_cost))
+                if not component_flags.get("alignment", True):
+                    print("  " + _describe_tensor_issue("ltm_value_alignment_cost", whole_ltm_alignment_cost))
+                if not bool(flag_values[-1]):
+                    print("  " + _describe_tensor_issue("whole_sample_loss", whole_sample_loss))
+                print("  Skipping this batch and clearing recurrent/LTM state before it can poison optimizer state.")
+                args._train_step_had_nonfinite = True
+                return None, _reset_after_nonfinite(optimizer, model)
+
+            if scaler is not None:
+                scaler.scale(whole_sample_loss).backward()
+            else:
+                whole_sample_loss.backward()
+            args._train_step_had_backward = True
+
+            # Backward has consumed the attached segment graph. Return only
+            # detached finite terminal state (normally discarded because
+            # persist_state is forced off) so no graph can leak into a new sample.
+            if h_state is not None:
+                h_state = _detach_finite_clamp(h_state, recurrent_state_clamp)
+            if l_state is not None:
+                l_state = _detach_finite_clamp(l_state, recurrent_state_clamp)
+            if prev_ctx is not None:
+                prev_ctx = _detach_finite_clamp(prev_ctx, context_state_clamp)
+            if target_ctx is not None:
+                target_ctx = _detach_finite_clamp(target_ctx, context_state_clamp)
+            if drift_state is not None:
+                drift_state = _detach_finite_l2_clamp(
+                    drift_state,
+                    drift_state_clamp,
+                    drift_norm_clamp,
+                )
+            ltm_state = detach_ltm_state_from_outputs(
+                {"ltm_memory_state": ltm_state}
+            )
+            outputs = None
+            full_ce_terms.clear()
+            full_ponder_terms.clear()
+            full_commitment_terms.clear()
+            full_ltm_alignment_terms.clear()
+
         # Optimizer step after all chunks
         should_step_optimizer = ((step + 1) % accumulation_steps == 0) or bool(force_optimizer_step)
         if should_step_optimizer and _has_pending_gradients(model):
@@ -1833,13 +2396,88 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
             
     except RuntimeError as e:
         if "out of memory" in str(e).lower():
-            print("WARNING: OOM detected. Clearing cache.")
+            optimizer.zero_grad(set_to_none=True)
+            if hasattr(model, "reset_memory"):
+                model.reset_memory()
             torch.cuda.empty_cache()
+            if bool(getattr(args, "full_sample_bptt", False)):
+                raise RuntimeError(
+                    "Full-sample BPTT ran out of memory even with its configured "
+                    "activation policy. Refusing to silently truncate the gradient. "
+                    "First lower --full-sample-checkpoint-segment-size (this preserves "
+                    "the objective and outer batch); otherwise lower --batch-size with "
+                    "matching accumulation, shorten --max_length, or enable full-sample "
+                    "activation checkpointing."
+                ) from e
+            print("WARNING: OOM detected. Clearing cache and skipping the batch.")
             return None, running_states
         raise e
 
 
-def train(args, device, tokenizer, dataloader, dataloader_len):
+def configure_cuda_training_runtime(args, config, device, *, mode_name="training"):
+    """Apply the shared throughput-safe CUDA policy to pretraining and LoRA."""
+    if getattr(device, "type", None) != "cuda":
+        return False
+
+    gpu_name = torch.cuda.get_device_name(device)
+    gpu_mem = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
+    gpu_capability = torch.cuda.get_device_capability(device)
+    print(
+        f"INFO: CUDA GPU: {gpu_name} "
+        f"({gpu_mem:.1f} GB, SM {gpu_capability[0]}.{gpu_capability[1]})"
+    )
+
+    if gpu_capability[0] >= 8:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
+        print(f"INFO: TF32 matmul enabled for CUDA {mode_name}.")
+    torch.backends.cudnn.benchmark = True
+
+    amp_was_explicitly_set = any(
+        value in sys.argv for value in ("--amp", "--no-amp", "--no_amp")
+    )
+    if not amp_was_explicitly_set:
+        args.amp = True
+        config.amp = True
+        print(f"INFO: AMP auto-enabled for CUDA {mode_name} (use --no-amp to disable).")
+
+    compile_was_explicitly_disabled = any(
+        value in sys.argv for value in ("--no-compile", "--no_compile")
+    )
+    if compile_was_explicitly_disabled:
+        args.compile = False
+        config.compile = False
+        print("INFO: torch.compile explicitly disabled.")
+    elif not getattr(args, "compile", False) and not getattr(args, "force_compile", False):
+        args.compile = True
+        config.compile = True
+        print(f"INFO: torch.compile auto-enabled for CUDA {mode_name}.")
+
+    # Core.compile() already selects the fixed masked WorkerLoop for CUDA when
+    # this option is auto. Persist that decision in exported config so parity
+    # inference can execute the same refinement dynamics instead of a distinct
+    # eval-only early-exit loop.
+    if (
+        (getattr(args, "compile", False) or getattr(args, "force_compile", False))
+        and getattr(args, "compile_static_worker_loop", None) is None
+    ):
+        args.compile_static_worker_loop = True
+        config.compile_static_worker_loop = True
+        print(f"INFO: Fixed masked WorkerLoop enabled for CUDA {mode_name} parity.")
+
+    if gpu_capability[0] >= 8 and torch.cuda.is_bf16_supported():
+        args.amp_dtype = "bfloat16"
+        config.amp_dtype = "bfloat16"
+        print(f"INFO: Using bfloat16 AMP for CUDA {mode_name}.")
+    else:
+        args.amp_dtype = "float16"
+        config.amp_dtype = "float16"
+        print(f"INFO: Using float16 AMP with GradScaler for CUDA {mode_name}.")
+    return compile_was_explicitly_disabled
+
+
+def train(args, device, tokenizer, dataloader, dataloader_len, model_override=None):
     print("Running in TRAIN mode...")
     if dataloader_len <= 0:
         print("ERROR: dataloader_len must be > 0. If automatic detection failed, please specify --dataset-size.")
@@ -1849,6 +2487,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     if getattr(args, 'out_dir', None):
         os.makedirs(args.out_dir, exist_ok=True)
     config = AttrDict(vars(args))
+    configure_full_sample_bptt(args, config, announce=True)
     _apply_runtime_model_config_overrides(config, args)
     args.ltm_training_mode = normalize_ltm_training_mode(getattr(args, "ltm_training_mode", "inner-update"))
     config.ltm_training_mode = args.ltm_training_mode
@@ -1922,48 +2561,28 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     # CUDA DATACENTER OPTIMIZATIONS
     # =================================================================
     if device.type == 'cuda':
-        gpu_name = torch.cuda.get_device_name(device)
-        gpu_mem = torch.cuda.get_device_properties(device).total_memory / (1024**3)
-        gpu_capability = torch.cuda.get_device_capability(device)
-        print(f"INFO: CUDA GPU: {gpu_name} ({gpu_mem:.1f} GB, SM {gpu_capability[0]}.{gpu_capability[1]})")
+        _compile_was_explicitly_disabled = configure_cuda_training_runtime(
+            args,
+            config,
+            device,
+            mode_name="training",
+        )
 
         # TF32 matmul (Ampere+, SM >= 8.0) — 3-8x faster matmuls with negligible accuracy loss
-        if gpu_capability[0] >= 8:
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-            torch.set_float32_matmul_precision('high')  # OPT #4: Canonical TF32 API
-            print("INFO: TF32 matmul enabled (Ampere+ GPU detected).")
+        # Common TF32/cuDNN setup was applied by configure_cuda_training_runtime.
 
         # cuDNN benchmark — auto-tunes convolution algorithms for the hardware
-        torch.backends.cudnn.benchmark = True
+        
 
         # Auto-enable AMP on CUDA unless the user explicitly passed --amp or --no-amp.
         # Must check all argparse-accepted forms (hyphen and underscore variants).
-        _amp_was_explicitly_set = any(a in sys.argv for a in ('--amp', '--no-amp', '--no_amp'))
-        if not _amp_was_explicitly_set:
-            args.amp = True
-            config.amp = True
-            print("INFO: AMP auto-enabled for CUDA training (use --no-amp to disable).")
+        
 
         # Auto-enable torch.compile on CUDA unless the user explicitly disables it.
-        if _compile_was_explicitly_disabled:
-            args.compile = False
-            config.compile = False
-            print("INFO: torch.compile explicitly disabled.")
-        elif not getattr(args, 'compile', False) and not getattr(args, 'force_compile', False):
-            args.compile = True
-            config.compile = True
-            print("INFO: torch.compile auto-enabled for CUDA training.")
+        
 
         # Prefer bfloat16 on Ampere+ for better dynamic range (no GradScaler needed)
-        if gpu_capability[0] >= 8 and torch.cuda.is_bf16_supported():
-            args.amp_dtype = 'bfloat16'
-            config.amp_dtype = 'bfloat16'
-            print("INFO: Using bfloat16 AMP (Ampere+ native support).")
-        else:
-            args.amp_dtype = 'float16'
-            config.amp_dtype = 'float16'
-            print("INFO: Using float16 AMP with GradScaler.")
+        
 
         if getattr(args, 'cuda_chunked_lm_loss', True):
             loss_chunk_rows = int(getattr(args, 'cuda_loss_chunk_rows', 0) or 0)
@@ -2003,7 +2622,47 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
     )
     
     # 1. Loading/Resuming Logic
-    if args.resume_from_ckpt:
+    if model_override is not None:
+        if getattr(args, "resume_from_ckpt", None):
+            raise ValueError(
+                "model_override cannot be combined with resume_from_ckpt; use the "
+                "checkpoint loader for an exact same-run resume"
+            )
+        print("Using preloaded model as a weights-only training base.")
+        model = model_override.to(device)
+        loaded_config = dict(getattr(model, "config", {}) or {})
+        runtime_config = AttrDict(loaded_config)
+        runtime_config.update(dict(config))
+        for key in (
+            'vocab_size',
+            'context_dim',
+            'persistent_dim',
+            'ltm_slots',
+            'ltm_key_dim',
+            'ltm_val_dim',
+            'ltm_topk',
+            'h_hidden',
+            'l_hidden',
+            'h_stride',
+            'max_h_steps',
+            'max_l_steps',
+            'use_deepembed',
+            'use_rosa',
+            'memory_token_routers',
+            'rosa_max_context',
+            'rwkv_head_size',
+        ):
+            if key in loaded_config:
+                runtime_config[key] = loaded_config[key]
+        model_config = runtime_config
+        model_config.compile = args.compile
+        _apply_runtime_model_config_overrides(model_config, args)
+        model.config = model_config
+        optimizer = build_hierarchos_optimizer(model, args, device)
+        if use_amp and getattr(config, 'amp_dtype', 'float16') == 'float16':
+            scaler = GradScaler()
+
+    elif args.resume_from_ckpt:
         print(f"Resuming from checkpoint: {args.resume_from_ckpt}")
         checkpoint = torch.load(args.resume_from_ckpt, map_location='cpu', weights_only=False)
         
@@ -2336,6 +2995,11 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         else:
             epoch_desc = f"Epoch {epoch+1}/{args.epochs}"
         pbar = tqdm(dataloader, desc=epoch_desc, total=dataloader_len)
+        batch_source = (
+            CUDABatchPrefetcher(pbar, device)
+            if device.type == 'cuda' and bool(getattr(args, 'cuda_prefetch', True))
+            else pbar
+        )
         
         # Restore recurrent/LTM states only for true mid-epoch checkpoints.
         if epoch == start_epoch and start_step > 0 and checkpoint and 'running_states' in checkpoint:
@@ -2347,7 +3011,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len):
         else:
             running_states = (None, None, None, None, None, None)
         
-        for step, batch in enumerate(pbar):
+        for step, batch in enumerate(batch_source):
             # Mid-Epoch Resumption: Skip steps already processed
             if epoch == start_epoch and step < start_step:
                 if step == start_step - 1: # Print only once when we are about to start processing
@@ -2622,6 +3286,13 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
         model_config.h_stride = h_stride
 
     _apply_runtime_model_config_overrides(model_config, args)
+    if device.type == 'cuda':
+        configure_cuda_training_runtime(
+            args,
+            model_config,
+            device,
+            mode_name="LoRA fine-tuning",
+        )
     model.config = model_config
     if hasattr(model, "refresh_runtime_config"):
         model.refresh_runtime_config()
@@ -2705,6 +3376,14 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
             args.resume_from_ckpt,
         )
         print("Successfully loaded optimizer state.")
+
+    # Compile the Hierarchos hot path after PEFT has injected LoRA modules, so
+    # the optimized graph includes the adapters instead of compiling the base
+    # Linear layers before they are replaced.
+    peft_base_model = getattr(getattr(model, "base_model", None), "model", None)
+    compile_base_model = getattr(peft_base_model, "compile", None)
+    if callable(compile_base_model):
+        compile_base_model()
 
     os.makedirs(args.out_dir, exist_ok=True)
 
@@ -2794,14 +3473,17 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
         print(f"\n--- LoRA Finetune Epoch {epoch + 1} / {args.epochs} ---")
         set_dataloader_epoch(dataloader, epoch)
         pbar = tqdm(dataloader, desc=f"Finetune Epoch {epoch + 1}", total=dataloader_len)
-        total_loss = 0.0
-        total_ponder_cost = 0.0
-        total_commitment_cost = 0.0
+        batch_source = (
+            CUDABatchPrefetcher(pbar, device)
+            if device.type == 'cuda' and bool(getattr(args, 'cuda_prefetch', True))
+            else pbar
+        )
+        metric_totals = torch.zeros(3, device=device, dtype=torch.float32)
         
         backward_called_in_cycle = False
         steps_in_epoch = 0
 
-        for i, batch in enumerate(pbar):
+        for i, batch in enumerate(batch_source):
             # Mid-Epoch Resumption: Skip steps already processed
             if epoch == start_epoch and i < start_step:
                 if i == start_step - 1:
@@ -2823,15 +3505,45 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                 rosa_ids = rosa_ids[:, :input_ids.shape[1]].contiguous()
             if loss_weights is not None:
                 loss_weights = loss_weights[:, :input_ids.shape[1]].contiguous()
-            non_blocking = device.type == 'cuda'
-            input_ids = input_ids.to(device, non_blocking=non_blocking)
-            if attention_mask is not None:
-                attention_mask = attention_mask.to(device, non_blocking=non_blocking)
-            labels = labels.to(device, non_blocking=non_blocking)
-            if rosa_ids is not None:
-                rosa_ids = rosa_ids.to(device, non_blocking=non_blocking)
-            if loss_weights is not None:
-                loss_weights = loss_weights.to(device, non_blocking=non_blocking)
+            input_ids = _batch_tensor_to_device(
+                batch,
+                "input_ids",
+                input_ids,
+                device,
+                pad_value=int(getattr(args, 'pad_token_id', 0)),
+            )
+            attention_mask = _batch_tensor_to_device(
+                batch,
+                "attention_mask",
+                attention_mask,
+                device,
+                pad_value=0,
+            )
+            labels = _batch_tensor_to_device(
+                batch,
+                "labels",
+                labels,
+                device,
+                pad_value=-100,
+            )
+            labels = labels.to(dtype=torch.long)
+            rosa_sentinel = int(
+                getattr(model_config, 'vocab_size', getattr(args, 'vocab_size', 0))
+            )
+            rosa_ids = _batch_tensor_to_device(
+                batch,
+                "rosa_ids",
+                rosa_ids,
+                device,
+                pad_value=rosa_sentinel,
+            )
+            loss_weights = _batch_tensor_to_device(
+                batch,
+                "loss_weights",
+                loss_weights,
+                device,
+                pad_value=0.0,
+            )
             set_model_training_step(model, epoch * dataloader_len + i)
 
             autocast_device_type = 'cpu' if is_directml_device(device) else device.type
@@ -2859,56 +3571,63 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                 ltm_value_alignment_cost = outputs.get("ltm_value_alignment_cost")
 
                 combined_loss = None
-                ce_valid = cross_entropy_loss is not None and torch.isfinite(cross_entropy_loss).all()
-                pc_valid = ponder_cost is not None and torch.isfinite(ponder_cost).all()
-                cc_valid = commitment_cost is not None and torch.isfinite(commitment_cost).all()
-                alignment_valid = (
-                    ltm_value_alignment_weight <= 0.0
-                    or (
-                        ltm_value_alignment_cost is not None
-                        and torch.isfinite(ltm_value_alignment_cost).all()
-                    )
-                )
-
-                loss_accum = 0.0
-
-                if ce_valid:
-                    loss_accum = loss_accum + _cap_loss_component_for_backward(
+                if cross_entropy_loss is not None:
+                    loss_accum = _cap_loss_component_for_backward(
                         cross_entropy_loss,
                         getattr(args, 'max_ce_loss_for_backward', 0.0),
                     )
-                elif i % accumulation_steps == 0:
-                    print(f"\nWarning: CE loss is NaN/Inf at step {i+1}. Skipping.")
-
-                if pc_valid:
+                    zero = torch.zeros_like(cross_entropy_loss)
+                    pc_valid = (
+                        torch.isfinite(ponder_cost).all()
+                        if ponder_cost is not None else torch.tensor(False, device=device)
+                    )
+                    cc_valid = (
+                        torch.isfinite(commitment_cost).all()
+                        if commitment_cost is not None else torch.tensor(False, device=device)
+                    )
+                    safe_ponder = (
+                        torch.where(pc_valid, ponder_cost, zero)
+                        if ponder_cost is not None else zero
+                    )
+                    safe_commitment = (
+                        torch.where(cc_valid, commitment_cost, zero)
+                        if commitment_cost is not None else zero
+                    )
                     loss_accum = loss_accum + (
                         ponder_loss_weight
                         * _cap_loss_component_for_backward(
-                            ponder_cost,
+                            safe_ponder,
                             getattr(args, 'max_ponder_cost_for_backward', 0.0),
                         )
                     )
-                
-                if cc_valid:
                     loss_accum = loss_accum + (
                         commitment_loss_weight
                         * _cap_loss_component_for_backward(
-                            commitment_cost,
+                            safe_commitment,
                             getattr(args, 'max_commitment_cost_for_backward', 2.0),
                             preserve_gradient=True,
                         )
                     )
-
-                if ltm_value_alignment_weight > 0.0 and alignment_valid:
-                    loss_accum = loss_accum + (
-                        ltm_value_alignment_weight * ltm_value_alignment_cost
-                    )
-
-                if ce_valid:
+                    if ltm_value_alignment_weight > 0.0:
+                        alignment_valid = (
+                            torch.isfinite(ltm_value_alignment_cost).all()
+                            if ltm_value_alignment_cost is not None
+                            else torch.tensor(False, device=device)
+                        )
+                        safe_alignment = (
+                            torch.where(alignment_valid, ltm_value_alignment_cost, zero)
+                            if ltm_value_alignment_cost is not None else zero
+                        )
+                        loss_accum = loss_accum + (
+                            ltm_value_alignment_weight * safe_alignment
+                        )
                     combined_loss = loss_accum
 
-                combined_valid = combined_loss is not None and torch.isfinite(combined_loss).all()
-                if combined_loss is not None and not bool(combined_valid.item()):
+                combined_valid = (
+                    combined_loss is not None
+                    and bool(torch.isfinite(combined_loss).all().item())
+                )
+                if combined_loss is not None and not combined_valid:
                     print(
                         f"\nCRITICAL: Non-finite fine-tune loss at step {i+1}; "
                         "skipping batch and clearing gradients."
@@ -2928,12 +3647,11 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
 
                 backward_called_in_cycle = True
 
-                if ce_valid:
-                    total_loss += cross_entropy_loss.item()
-                if pc_valid:
-                    total_ponder_cost += ponder_cost.item()
-                if cc_valid:
-                    total_commitment_cost += commitment_cost.item()
+                metric_totals.add_(torch.stack([
+                    cross_entropy_loss.detach().float(),
+                    safe_ponder.detach().float(),
+                    safe_commitment.detach().float(),
+                ]))
                 steps_in_epoch += 1
 
             if should_step_accumulation(i, dataloader_len, accumulation_steps):
@@ -2966,7 +3684,11 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
 
                         if valid_update:
                             ltm_clip = _positive_float(grad_clip, 1.0)
-                            ltm_grads_copy = _prepare_ltm_update_gradients(ltm_grads_copy, ltm_clip)
+                            ltm_grads_copy = _prepare_ltm_update_gradients(
+                                ltm_grads_copy,
+                                ltm_clip,
+                                inplace=True,
+                            )
                             if ltm_grads_copy is None:
                                 print(
                                     f"\nCRITICAL: Non-finite fine-tune LTM gradient at step {i+1}. "
@@ -3049,19 +3771,22 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                     optimizer.zero_grad(set_to_none=True)
                     backward_called_in_cycle = False
 
-            # Update progress bar
-            avg_loss = total_loss / steps_in_epoch if steps_in_epoch > 0 else 0.0
-            avg_ponder = total_ponder_cost / steps_in_epoch if steps_in_epoch > 0 else 0.0
-            avg_commit = total_commitment_cost / steps_in_epoch if steps_in_epoch > 0 else 0.0
-            current_lr = scheduler.get_last_lr()[0] if scheduler else args.starting_lr
-            
-            pbar.set_postfix({
-                "loss": f"{avg_loss:.4f}",
-                "ponder": f"{avg_ponder:.2f}",
-                "commit": f"{avg_commit:.2e}",
-                "lr": f"{current_lr:.2e}",
-                "ltm_lr": f"{get_current_ltm_lr(args):.2e}" if use_ltm_inner_updates else "off"
-            })
+            # One device-to-host metric read at the same throttled cadence as
+            # pretraining, instead of three `.item()` synchronizations per batch.
+            first_logged_step = start_step if epoch == start_epoch else 0
+            if should_update_progress(i, args, dataloader_len, first_logged_step):
+                divisor = max(1, steps_in_epoch)
+                avg_loss, avg_ponder, avg_commit = (
+                    metric_totals / divisor
+                ).tolist()
+                current_lr = scheduler.get_last_lr()[0] if scheduler else args.starting_lr
+                pbar.set_postfix({
+                    "loss": f"{avg_loss:.4f}",
+                    "ponder": f"{avg_ponder:.2f}",
+                    "commit": f"{avg_commit:.2e}",
+                    "lr": f"{current_lr:.2e}",
+                    "ltm_lr": f"{get_current_ltm_lr(args):.2e}" if use_ltm_inner_updates else "off"
+                })
 
     # Save LoRA adapter
     print(f"Saving LoRA adapter to {args.out_dir}")

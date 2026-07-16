@@ -9,6 +9,8 @@ import torch.nn.functional as F
 from typing import List, Optional, Tuple, Union
 from tqdm import tqdm
 
+from ..inference.chat import boundary_drift_seed, resolve_inference_prefill_chunk_size
+
 try:
     from lm_eval.api.model import LM
     from lm_eval.api.instance import Instance
@@ -69,7 +71,9 @@ class HierarchosLM(LM):
         self.device = device
         self._batch_size = batch_size
         self._max_length = max_length or getattr(model.config, 'max_length', 1024)
-        self._prefill_chunk_size = int(getattr(getattr(model, "config", None), "training_chunk_size", 0) or 0)
+        self._prefill_chunk_size = resolve_inference_prefill_chunk_size(
+            getattr(model, "config", None)
+        )
         
         # Cache the eot token id
         if tokenizer.eos_token_id is not None:
@@ -162,6 +166,11 @@ class HierarchosLM(LM):
             drift_state = None
             ltm_state = None
             logits_parts = []
+            model_config = getattr(self.model, "config", None)
+            exact_full_sample = bool(
+                getattr(model_config, "full_sample_bptt", False)
+                or getattr(model_config, "inference_logit_parity", False)
+            )
 
             for start in range(0, input_ids.shape[1], chunk_size):
                 outputs = self.model(
@@ -170,7 +179,12 @@ class HierarchosLM(LM):
                     l_state=l_state,
                     prev_context=prev_context,
                     target_context=target_context,
-                    drift_state=drift_state,
+                    drift_state=boundary_drift_seed(
+                        drift_state,
+                        start,
+                        self._prefill_chunk_size,
+                        exact_full_sample=exact_full_sample,
+                    ),
                     ltm_memory_state=ltm_state,
                     suppress_hebbian=True,
                     global_pos_offset=start,
@@ -358,7 +372,12 @@ class HierarchosLM(LM):
             target_context = None
             drift_state = None
             ltm_state = None
-            prefill_chunk_size = int(getattr(getattr(self.model, "config", None), "training_chunk_size", 0) or 0)
+            model_config = getattr(self.model, "config", None)
+            prefill_chunk_size = resolve_inference_prefill_chunk_size(model_config)
+            exact_full_sample = bool(
+                getattr(model_config, "full_sample_bptt", False)
+                or getattr(model_config, "inference_logit_parity", False)
+            )
             total_tokens_seen = 0
             
             with torch.no_grad():
@@ -386,7 +405,12 @@ class HierarchosLM(LM):
                     target_context = outputs.get('target_context')
                     drift_state = outputs.get('drift_state')
                     ltm_state = outputs.get('ltm_memory_state')
-                    chunk_drift_state = drift_state
+                    chunk_drift_state = boundary_drift_seed(
+                        drift_state,
+                        end,
+                        prefill_chunk_size,
+                        exact_full_sample=exact_full_sample,
+                    )
                 total_tokens_seen = len(context_enc)
                 
                 # Get last logits for next token prediction
@@ -417,13 +441,12 @@ class HierarchosLM(LM):
                     
                     # Next step
                     next_input = next_token.unsqueeze(0).unsqueeze(0)
-                    generation_drift_state = None
-                    if (
-                        prefill_chunk_size > 0
-                        and total_tokens_seen > 0
-                        and total_tokens_seen % prefill_chunk_size == 0
-                    ):
-                        generation_drift_state = drift_state
+                    generation_drift_state = boundary_drift_seed(
+                        drift_state,
+                        total_tokens_seen,
+                        prefill_chunk_size,
+                        exact_full_sample=exact_full_sample,
+                    )
                     outputs = self.model(
                         input_ids=next_input,
                         h_state=h_state,

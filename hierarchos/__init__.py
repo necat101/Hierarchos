@@ -11,6 +11,7 @@ from .training.datasets import (
     HuggingFaceStreamingDataset,
     HuggingFaceMapStyleDataset,
     process_text_sample,
+    process_text_samples_batch,
     process_tokenized_sample,
     create_dataloader_for_jsonl,
     create_dataloader_for_hf_streaming,

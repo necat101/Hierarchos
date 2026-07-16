@@ -29,6 +29,22 @@ def _set_config_value(config, name: str, value) -> None:
         setattr(config, name, value)
 
 
+def _normalize_detach_frequency(config):
+    """Normalize the public 0 sentinel used to request untruncated BPTT."""
+    detach_every = _config_value(config, "detach_every_n_steps", 32)
+    if detach_every is not None:
+        try:
+            detach_every = int(detach_every)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"detach_every_n_steps must be an integer or None, got {detach_every!r}"
+            ) from exc
+        if detach_every <= 0:
+            detach_every = None
+    _set_config_value(config, "detach_every_n_steps", detach_every)
+    return detach_every
+
+
 def _positive_config_int(config, name: str, default=None) -> int:
     value = _config_value(config, name, None)
     if value is None and default is not None:
@@ -88,17 +104,7 @@ def _validate_architecture_config(config) -> None:
                     f"rwkv_head_size={requested_head} does not divide {width_name}={values[width_name]}."
                 )
 
-    detach_every = _config_value(config, "detach_every_n_steps", 32)
-    if detach_every is not None:
-        try:
-            detach_every = int(detach_every)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"detach_every_n_steps must be an integer or None, got {detach_every!r}"
-            ) from exc
-        if detach_every <= 0:
-            detach_every = None
-    _set_config_value(config, "detach_every_n_steps", detach_every)
+    _normalize_detach_frequency(config)
 
 def _config_float(config, name: str, default: float) -> float:
     try:
@@ -249,8 +255,17 @@ class WorkerLoop:
         l_input = _finite_clamp(l_input, self.recurrent_state_clamp)
         
         check_idx = [0, 1, 2]
+        # Full-sample BPTT checkpoints must execute the same refinement policy
+        # during inference that produced their training logits.  The legacy eval
+        # path also stops on state convergence, while training stops/masks only
+        # on drift convergence; that can change the final drift and logits.
+        inference_logit_parity = bool(
+            getattr(self.config, 'inference_logit_parity', False)
+            or getattr(self.config, 'full_sample_bptt', False)
+        )
+        use_training_refinement = self.l_rnn.training or inference_logit_parity
 
-        if not self.l_rnn.training:
+        if not use_training_refinement:
             prev_shadow = shadow_l_state.clone()
             for step_idx in range(self.max_l_steps):
                 l_out, shadow_l_state = self.l_rnn(l_input, shadow_l_state, timestep=-(step_idx+1), deepemb_vec=l_deepemb_vec)
@@ -309,7 +324,7 @@ class WorkerLoop:
             else:
                 commitment_cost_static = None
 
-        if self.l_rnn.training and not self.compile_static_worker_loop:
+        if use_training_refinement and not self.compile_static_worker_loop:
             for step_idx in range(self.max_l_steps):
                 l_out, shadow_l_state = self.l_rnn(l_input, shadow_l_state, timestep=None, deepemb_vec=l_deepemb_vec)
                 l_out = _finite_clamp(l_out, self.activation_clamp)
@@ -345,7 +360,7 @@ class WorkerLoop:
         final_enc = current_enc + self.l_to_out(final_l_out)
         final_enc = _finite_clamp(final_enc, self.activation_clamp)
         commitment_cost = torch.zeros(enc.shape[0], device=enc.device, dtype=enc.dtype)
-        if self.l_rnn.training and self.compile_static_worker_loop and commitment_cost_static is not None:
+        if use_training_refinement and self.compile_static_worker_loop and commitment_cost_static is not None:
             commitment_cost = commitment_cost_static
         elif len(drift_costs) > 0:
             commitment_cost = torch.stack(drift_costs, dim=0).mean(dim=0)
@@ -364,6 +379,7 @@ class HierarchosCore(nn.Module):
         self.ltm.reset_working_memory()
 
     def refresh_runtime_config(self):
+        detach_freq = _normalize_detach_frequency(self.config)
         rwkv_channel_mix_key_clamp = _config_nonnegative_float(
             self.config,
             'rwkv_channel_mix_key_clamp',
@@ -377,6 +393,7 @@ class HierarchosCore(nn.Module):
         for cell_name in ("h_rnn", "l_rnn"):
             cell = getattr(self, cell_name, None)
             if cell is not None:
+                cell.detach_every_n_steps = detach_freq
                 if hasattr(cell, "channel_mix_key_clamp"):
                     cell.channel_mix_key_clamp = rwkv_channel_mix_key_clamp
                 if hasattr(cell, "channel_mix_deepembed_clamp"):
@@ -931,8 +948,16 @@ class HierarchosCore(nn.Module):
                 shadow_h_state = _finite_clamp(h_state.clone(), recurrent_state_clamp)
                 current_enc_h = enc_with_feedback
 
+                inference_logit_parity = bool(
+                    getattr(self.config, 'inference_logit_parity', False)
+                    or getattr(self.config, 'full_sample_bptt', False)
+                )
                 for step_idx in range(self.config.max_h_steps - 1):
-                    if not self.training and h_halt_probs[-1].mean() > getattr(self.config, 'h_halt_thresh', 0.9): 
+                    if (
+                        not self.training
+                        and not inference_logit_parity
+                        and h_halt_probs[-1].mean() > getattr(self.config, 'h_halt_thresh', 0.9)
+                    ):
                         break
                     h_out_ponder, shadow_h_state = self.h_rnn(current_enc_h, shadow_h_state, timestep=None, deepemb_vec=h_deepemb_vec)
                     h_out_ponder = _finite_clamp(h_out_ponder, activation_clamp)

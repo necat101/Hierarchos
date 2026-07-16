@@ -1,6 +1,20 @@
 -----
 
-# Hierarchos v0.20.7 (alpha): Epoch-13 Compatibility + Safe LTM Writers
+# Hierarchos v0.21 (alpha): Exact Full-Sample BPTT + Blackwell Training Pipeline
+
+**v0.21 focus**: add checkpoint-compatible exact per-sample BPTT, train/chat recurrence parity, and a compact high-throughput input pipeline for multi-billion-token training. The learned architecture is unchanged: the reference `448/448/448` model remains `232,516,229` unique parameters with `95` state tensors, so coherent v0.20.x checkpoints strict-load without tensor conversion.
+
+**Exact per-sample gradient connectivity**: `--full-sample-bptt` removes recurrent gradient detachment across every active token in a dataset sample. Non-reentrant activation checkpointing rematerializes bounded temporal segments during one global backward pass; segment boundaries never truncate gradients or externally reseed drift. This gives full BPTT within each row up to `max_length`, but deliberately does not connect unrelated dataset rows or guarantee semantic coherence by itself.
+
+**RTX PRO 6000 Blackwell profile**: keep `--batch_size 64 --training-chunk-size 256` and explicitly use `--full-sample-checkpoint-segment-size 224` after a worst-case memory preflight. An 8,880-token row is compile-padded to 8,960 tokens, exactly `40` segments of `224`. This setting should run closer to `256`-segment throughput while retaining more OOM headroom; `128` remains the safe general default and `64` is the first OOM fallback. Segment size changes speed and VRAM only, not the full-sample gradient horizon.
+
+**Input-pipeline savings**: Hugging Face revisions are pinned to immutable SHAs, fast tokenizers process native batches, Arrow rows use batched fetches, compact schema-v6 caches are mmap-backed, and length buckets are deterministically auto-tuned. The weighted GPT-2+ROSA profile with prompt-token training uses about 4 token-data bytes/token, approximately 20 GB decimal for 5B tokens before index/RLE metadata.
+
+**Precision, clipping, and parity**: Blackwell training uses BF16 autocast while parameters, AdamW state, sensitive recurrence, LTM math, and loss accumulation retain FP32 precision. Finite loss/gradient rejection, unscale-before-clip ordering, global gradient clipping, state/context/drift bounds, and channel-mix clamps remain active. Exact checkpoints use the aligned full-precision chat/evaluation recurrence; quantized inference follows the same control flow but cannot claim numerical logit parity.
+
+**Verification**: `python -m pytest -q` reports `283 passed, 4 skipped`; `python tools/check_architecture_integrity.py` reports `65 passed, 1` documented legacy-quantization warning, and `0 failures`. Direct-versus-checkpointed exact-BPTT tests preserve all gradients with maximum observed parameter-gradient delta `1.49e-08`; correct segmented recurrence matches monolithic logits within `2.38e-07` in the boundary control.
+
+## Previous v0.20.7 Notes: Epoch-13 Compatibility + Safe LTM Writers
 
 **v0.20.7 focus**: validate the coherent epoch-13 release weights as a real control and close the remaining untrained Hebbian-writer path without changing a learned parameter name or shape. The reference model remains `232,516,229` parameters and `95` state tensors. See [EPOCH13_CHECKPOINT_AUDIT.md](EPOCH13_CHECKPOINT_AUDIT.md) and the machine-readable [epoch-13 control report](checkpoint_audits/epoch13-control.json).
 
@@ -241,13 +255,13 @@ This project introduces a novel hybrid model where a deep reasoning engine opera
 Hierarchos is built on three revolutionary, brain-inspired pillars:
 
 🔄 **RWKV v8 Backbone (The Neural Engine)**
-A modernized RNN with linear attention that achieves the parallel training speed of Transformers with the O(1) inference cost of RNNs. Features Time Mixing (WKV recurrence with exponential decay), ReLU-squared Channel Mixing, DeepEmbed gating, and ROSA neurosymbolic embeddings.
+A modernized recurrent model with linear-attention-style state and O(1) generation-state memory per token. It features Time Mixing (WKV recurrence with exponential decay), ReLU-squared Channel Mixing, DeepEmbed gating, and ROSA neurosymbolic embeddings. Training throughput is implementation- and hardware-dependent and is not claimed to match a Transformer without a controlled benchmark.
 
 🧠 **Titans Architecture (The Cognitive Substrate)**
 A sophisticated, multi-tiered memory workspace that enables dynamic, lifelong learning. It learns *what to remember* based on the principle of "surprise," and its memory slots are now structured with timestamps and source metadata, allowing for sophisticated, context-aware queries.
 
 ⚙️ **Hierarchical Reasoning Model (The Cognitive Process)**
-A powerful, data-efficient, and deep reasoning engine. Its dual-module design (a high-level "Manager" and low-level "Worker") allows for profound computational depth through **iterative convergence**. This enables it to solve complex, multi-step algorithmic problems where massive LLMs fail.
+An experimental dual-module design in which a high-level "Manager" and low-level "Worker" add computational depth through iterative refinement. Whether this improves complex reasoning relative to Transformer baselines must be established with held-out evaluations rather than assumed from the architecture.
 
 ## Architecture Diagram
 
@@ -284,7 +298,7 @@ A powerful, data-efficient, and deep reasoning engine. Its dual-module design (a
   * 📊 **Integrated Benchmarking**: Optional support for `lm-evaluation-harness`. Track model accuracy on standard benchmarks (HellaSwag, ARC, etc.) during or after training with `--eval-tasks`, or use `--benchmark-preset rog-ally` for a bounded local CPU smoke test.
   * 🎮 **AMD GPU Support (DirectML/ZLUDA)**: Train on AMD Radeon GPUs using DirectML backend on Windows. Opt-in via `--device dml` with automatic compatibility handling and optimized fallbacks.
   * 🎓 **Proper Temporal Learning**: Configurable truncated BPTT (`--detach-every-n-steps`) enables learning across multiple timesteps while managing memory. Default 32-step gradients flow allows the model to **learn temporal dependencies** effectively.
-  * 🔗 **End-to-End Gradient Flow**: All architectural components (Manager, Worker, LTM) receive proper gradients during training. No more detachment-induced coherence problems or NaN errors.
+  * 🔗 **Exact Per-Sample Gradient Connectivity**: `--full-sample-bptt` connects Manager, Worker, routed memory, and recurrent state across every retained token in a sample. It removes deliberate TBPTT truncation but does not guarantee semantic coherence or eliminate numerical failures.
   * 🎯 **Train/Test Consistency**: Fixes train/test mismatch from unconditional state detachment, improving model coherence and stability.
   * 🌐 **Hugging Face `datasets` Integration**: Load datasets directly from the HF Hub or local paths in various formats (CSV, Parquet, JSON, etc.) using `--hf_dataset`.
   * 💾 **Optimized Consolidated Chunk Loading**: Dramatically reduces RAM usage and speeds up training startup for large datasets using pre-processed, consolidated `.pt` tensor files and a manifest (`--pre_pt_dataset`). Includes file caching for efficiency.
@@ -295,11 +309,11 @@ A powerful, data-efficient, and deep reasoning engine. Its dual-module design (a
   * 🕰️ **Structured & Queryable Memory**: LTM slots are augmented with timestamps and source data, enabling powerful temporal and contextual queries during chat.
   * 🧠 **Dynamic "Online" Learning**: Learns from experience during chat with a Cosine Annealing LR schedule by default for more stable knowledge consolidation.
   * 🚀 **PyTorch 2.0+ torch.compile Support**: Auto-enabled on CUDA, optional on CPU with `--compile` / `--force-compile`.
-  * 🛡️ **Stable Training**: Built-in gradient clipping (`--grad-clip`), Z-loss regularization, and state clamping to prevent instability.
+  * 🛡️ **Training Guardrails**: Finite-gradient rejection, gradient clipping (`--grad-clip`), Z-loss regularization, and state/activation clamps reduce instability risk. Clamps intentionally alter values when triggered and cannot guarantee convergence.
   * 📦 **Self-Contained & Portable Models**: Models are saved as HuggingFace-style directories containing weights, tokenizer, and architecture config for easy sharing and deployment.
   * 💾 **Automatic Re-quantization**: After a learning session, Hierarchos can automatically re-quantize a model to persist the new knowledge (`--enable-quantized-learning` in `chat`). *(Requires compiled kernel)*
   * 🌱 **Enhanced Model Expansion**: Includes `expand_model.py` script to transplant weights from smaller models to larger ones.
-  * ⚡ **High-Performance Inference**: Utilizes a custom C++ kernel inspired by `llama.cpp` for state-of-the-art quantization (`INT4`, `Q4_0`, `Q8_0`, `Q2_K`). *(Requires compiled kernel)*
+  * ⚡ **Optional Quantized Inference**: Uses a legacy custom C++ kernel inspired by `llama.cpp` for supported formats (`INT4`, `Q4_0`, `Q8_0`, `Q2_K`). Full precision remains the v0.21 parity reference. *(Requires compiled kernel)*
   * 💻 **CPU & GPU Support**: Runs quantized inference on CPUs (AVX/NEON) or GPUs via Vulkan. *(Requires compiled kernel)*
   * 🐍 **Python 3.13 Support**: Full compatibility with Python 3.13, including automatic build environment setup.
 
@@ -504,11 +518,68 @@ python hierarchos_cli.py train \
 -----
 
 💡 **CUDA Auto-Optimization:** On NVIDIA GPUs, AMP, TF32, cuDNN benchmark, and torch.compile are **auto-enabled**. Long CUDA runs default to `--compile-mode max-autotune-no-cudagraphs`, static RWKV worker-loop capture, and H-RNN cell compilation. This keeps autotuned CUDA kernels while avoiding CUDA graph fast-path warnings from TBPTT submodule calls. Use `--compile-mode max-autotune --compile-cudagraphs` only when benchmarking CUDA graphs explicitly.
-💾 **Training on Low Memory:** Use `--gradient-checkpointing` to significantly reduce VRAM usage at the cost of some extra computation.
+💾 **Training on Low Memory:** For TBPTT/finetuning, `--gradient-checkpointing` reduces VRAM at the cost of recomputation. Exact full-sample training instead uses `--full-sample-activation-checkpointing`; lower `--full-sample-checkpoint-segment-size` when exact-mode VRAM is tight.
 🎮 **AMD GPU Training:** Use `--device dml` to train on AMD Radeon GPUs via DirectML. AMP is automatically disabled for stability.
-🚀 **Datacenter Training:** the default CUDA profile targets the 232M `448/448/448` run on a 96GB Blackwell-class NVIDIA card: `--batch_size 64`, `--training-chunk-size 256`, HF token cache, length bucketing, auto CUDA workers up to 8, BF16 AMP, TF32, and `torch.compile --compile-mode max-autotune-no-cudagraphs`. With the HF token cache, CUDA batch>=64 auto-tunes the length bucket window from cached sample lengths to reduce padding; runtime `tok_eff` diagnostics are opt-in via `--padding-metric-steps N`.
+🚀 **Datacenter Training:** the default CUDA profile targets the 232M `448/448/448` run on a 96GB Blackwell-class NVIDIA card: `--batch_size 64`, `--training-chunk-size 256`, HF token cache, length bucketing, auto CUDA workers up to 8, BF16 AMP, TF32, and `torch.compile --compile-mode max-autotune-no-cudagraphs`. The v0.21 exact-gradient profile additionally sets `--full-sample-bptt --full-sample-activation-checkpointing --full-sample-checkpoint-segment-size 224`, with `224` conditional on a longest-batch memory preflight. With the HF token cache, CUDA batch>=64 auto-tunes the length bucket window from cached sample lengths to reduce padding; runtime `tok_eff` diagnostics are opt-in via `--padding-metric-steps N`.
 
 ## ⚠️ **HRM Convergence & Training Speed:** Higher `--max_h_steps` and `--max_l_steps` allow deeper reasoning but **significantly increase training time** per batch due to the iterative HRM process. Adjust based on your task and compute resources.
+
+The HF cache builder pins a mutable Hub branch/tag to its resolved commit SHA, parallelizes Arrow preparation, fetches Arrow rows and fast-tokenizes them in batches, and lets completed worker batches arrive out of FIFO order because every row is materialized before training. The runtime cache is mmap-backed, reads each sampled batch in file-offset order, retains the final incomplete batch, and overlaps pinned nonblocking transfers on a dedicated CUDA stream. These change storage and scheduling only; token IDs, sample boundaries, loss weights, and model equations are preserved.
+
+GPT-2-sized vocabularies use compact uint16 input/ROSA streams and exact float32-palette RLE loss weights. With `--train-prompt-tokens`, the writer also verifies that every real label equals its input ID and stores labels as a checked alias instead of a duplicate stream. For the weighted+ROSA profile this is about 4 data bytes/token, so 5B tokens require about 20 GB decimal (18.6 GiB) for `tokens.bin`, plus the run/index metadata and Hugging Face source cache. Without label aliasing it is about 30 GB; the previous int32+inline-fp16 representation was about 70 GB. Put the cache root on instance-local NVMe when the rental exposes it.
+
+### Exact Per-Sample Gradient Connectivity (Full BPTT)
+
+Use `--full-sample-bptt` when every supervised token in a sample must remain connected to one autograd graph. The trainer disables recurrent detachment and cross-sample state persistence. By default it partitions that graph into attached 128-token activation-checkpoint segments, carries differentiable H/L/context state across every boundary, composes the global sample loss once, and performs one backward pass after the last segment. The safe default remains `128`; the explicit v0.21 profile for batch `64`, `max_length=8880`, and a 96GB RTX PRO 6000 recommends `224` only after the rental passes a maximum-length memory preflight. This follows PyTorch's recommended explicit `use_reentrant=False` checkpoint API and the standard recomputation-for-memory method described by Chen et al.: [PyTorch activation checkpointing](https://docs.pytorch.org/docs/stable/checkpoint.html), [Training Deep Nets with Sublinear Memory Cost](https://arxiv.org/abs/1604.06174).
+
+The current forward contains no dropout or random sampling, so exact checkpoint segments disable RNG-state save/restore overhead. Direct-versus-segmented tests compare the complete recurrent state, objective, and every parameter gradient; a future stochastic forward must re-enable RNG preservation before using this optimization.
+
+`--no-persist-state` refers only to model H/L/context/LTM values crossing from one shuffled training batch into unrelated samples. It does not disable hierarchical drift, and it is unrelated to PyTorch DataLoader `persistent_workers`; CUDA loader workers remain persistent and prefetched for throughput. Drift is still computed, trained, and clamped at every worker step. At an activation-only segment boundary, the attached L-state derives the next drift exactly as an uninterrupted forward would, so the previous segment's terminal drift is not injected a second time.
+
+The configured `--training-chunk-size` is deliberately left unchanged. It remains cache/ROSA/LTM-decay/compile geometry, so enabling full-sample BPTT does **not** invalidate an existing multi-billion-token token cache. `--full-sample-checkpoint-segment-size` controls only recomputation boundaries; it never detaches state or changes the forward objective. There is still one attached gradient graph across the complete active sample.
+
+Segment length is therefore a speed/VRAM control, not a gradient-horizon control. At the worst-case compiled length of `8,960`, segment `128` creates `70` attached checkpoints, `224` creates exactly `40`, and `256` creates `35`. Relative to `256`, `224` reduces the activation-dominated segment length by `12.5%` while adding only a small amount of retained boundary state. Relative to `128`, it removes `30` checkpoint invocations but rematerializes a `1.75x` larger segment. The exact optimum remains GPU/runtime dependent; judge steady-state throughput only after compilation and test peak memory on a genuinely maximum-length batch.
+
+```bash
+python hierarchos_cli.py train \
+    --model-path "./pre_chat_model/hierarchos_epoch_4.pt" \
+    --tokenizer-path "./pre_chat_model" \
+    --hf_dataset "your_org/larger_dataset" \
+    --out-dir "./full_bptt_continuation" \
+    --max_length 8880 \
+    --training-chunk-size 256 \
+    --full-sample-bptt \
+    --full-sample-checkpoint-segment-size 224 \
+    --batch_size 64 \
+    --accumulation-steps 1
+```
+
+`--model-path` is a weights-only continuation: it loads the older tensors unchanged, starts a fresh optimizer/schedule for the larger dataset, and leaves the source checkpoint untouched. Keep the original tokenizer/vocabulary. The attached 224-token checkpoint segments target a practical speed/headroom balance without retaining 8,880 tokens of activations at once. The audited epoch-13 checkpoint used a real 256-token TBPTT boundary; on the same hardware and tokens, budget approximately `1.25-1.45x` its wall time (`70-80%` throughput) for checkpointed full BPTT at `224`, while treating those figures as planning estimates until the rental is measured. If the rental OOMs at batch 64, lower only the checkpoint segment to `128`, then `64`; this preserves the mathematical objective and full gradient horizon, although floating-point roundoff can differ slightly. If `224` leaves ample measured headroom, `256` is the next speed trial. An OOM never silently falls back to truncated gradients.
+
+Adding more dataset rows does not itself consume more VRAM. Shorter conversations reduce typical padding and memory, but the longest batch still determines the peak; a dataset with no row above the previous `max_length` can still produce a full `64 x 8,960` compiled batch. Loader prefetch and compact input tensors are small compared with recurrent activations, so do not use average short-sample memory to certify the longest bucket.
+
+Per-token ROSA/LTM routing remains active. The isolated one-forward mode skips only the terminal post-backward LTM fast-memory write: that write cannot affect the sample that produced it and would be reset before the next sample. Ordinary routed parameter gradients and optional LTM value-alignment gradients are unchanged.
+
+Validate the rented Blackwell runtime before starting the paid dataset pass:
+
+```bash
+python benchmark_full_sample_bptt.py \
+    --device cuda \
+    --amp \
+    --require-blackwell \
+    --batch-size 64 \
+    --sequence-length 1024 \
+    --checkpoint-segment-size 224 \
+    --repeats 5
+```
+
+The benchmark uses synchronized device timing and `torch.cuda.max_memory_allocated()` peak tracking. `--require-blackwell` rejects a runtime unless the visible GPU reports compute capability 12.0 and the PyTorch build advertises `sm_120`, preventing an incompatible wheel from consuming rental time. It uses a deliberately small parity model, so it validates CUDA compatibility and checkpoint behavior but does **not** certify production `448/448/448`, batch-64, 8,880-token VRAM. Measure that peak with the actual profile before committing the full rental budget.
+
+### Blackwell Precision Contract
+
+Keep AMP mixed precision enabled. On supported Blackwell CUDA builds, Hierarchos selects BF16 autocast for eligible Tensor Core work while keeping FP32 parameters, gradients, AdamW moments, recurrent matrix state, LTM updates, ACT weighting, and language-loss accumulation. PyTorch explicitly recommends leaving the model in default precision under autocast rather than calling `model.half()` or `model.bfloat16()`: [PyTorch AMP documentation](https://docs.pytorch.org/docs/stable/amp.html).
+
+Pure FP16/BF16 model and optimizer state would save only about `1.73 GiB` for the 232.5M model and would not remove checkpoint recomputation. At the v0.21 continuation LR (`1e-5` down to `1e-7`), low-precision parameter storage can round updates away; pure FP16 also risks second-moment underflow. Quantization-aware training is intended to adapt a model for later quantized serving, not to accelerate this exact pretraining loop: [TorchAO QAT documentation](https://docs.pytorch.org/ao/stable/workflows/qat.html). Hierarchos v0.21 implements neither a QAT training flag nor a validated FP8 recipe; FP8 remains a separate architecture-specific experiment for eligible linear layers: [TorchAO quantized-training documentation](https://docs.pytorch.org/ao/stable/workflows/training.html).
 
 ### Assistant SFT Profile for 232M / ~1B Tokens
 
@@ -529,6 +600,11 @@ python hierarchos_cli.py train \
     --rwkv-head-size 64 \
     --max_length 8880 \
     --training-chunk-size 256 \
+    --full-sample-bptt \
+    --full-sample-activation-checkpointing \
+    --full-sample-checkpoint-segment-size 224 \
+    --detach-every-n-steps 0 \
+    --no-persist-state \
     --batch_size 64 \
     --accumulation-steps 1 \
     --hf-token-cache \
@@ -537,7 +613,7 @@ python hierarchos_cli.py train \
     --padding-metric-steps 50
 ```
 
-`--assistant-recovery` keeps prompt tokens in the language-model objective but downweights them to `0.10`, weights assistant response tokens at `1.0`, boosts the first `32` response tokens by `2.0x`, uses warmup+cosine LR, lowers the ponder penalty to `0.003`, lengthens memory-gate warmup to `5000` steps, and reserves at least `16` answer tokens when overlong prompts are truncated. Blank completions are dropped by default; pass `--allow-empty-completions` only if empty answers are intentional labels. Keep `--max-ce-loss-for-backward 0` for from-scratch LM training. The default 4-epoch preset gives a 232.5M model about 17.2 training tokens per parameter on a 1B-token dataset; `--epochs 10` is about 43 training tokens per parameter.
+`--assistant-recovery` keeps prompt tokens in the language-model objective but downweights them to `0.10`, weights assistant response tokens at `1.0`, boosts the first `32` response tokens by `2.0x`, uses warmup+cosine LR, lowers the ponder penalty to `0.003`, lengthens memory-gate warmup to `5000` steps, and reserves at least `16` answer tokens when overlong prompts are truncated. The added v0.21 flags make this an exact per-sample gradient-connectivity profile; segment `224` targets a 96GB rental but must pass a maximum-length preflight there and should be reduced on smaller cards. Blank completions are dropped by default; pass `--allow-empty-completions` only if empty answers are intentional labels. Keep `--max-ce-loss-for-backward 0` for from-scratch LM training. The default 4-epoch preset gives a 232.5M model about 17.2 training tokens per parameter on a 1B-token dataset; `--epochs 10` is about 43 training tokens per parameter.
 
 #### v0.20.4 Stability Rescue Resume
 
@@ -604,6 +680,8 @@ python hierarchos_cli.py merge-lora \
 
 Convert a full-precision model to a quantized format for faster, lower-resource inference.
 
+This is post-training quantization, not quantization-aware training. Quantization changes numerical logits; keep the original full-precision checkpoint as the coherence/parity reference and quantize only a copy for deployment experiments.
+
 ```bash
 python hierarchos_cli.py quantize \
     --model-path "./my_model_merged_squad" \
@@ -637,7 +715,7 @@ python hierarchos_cli.py chat \
     --chat-input-history-turns 0
 ```
 
-Use this profile as the static coherence baseline before enabling chat history or passive learning. It keeps inference close to the training/benchmark path: no passive LTM writes, no previous-turn text injected into the Alpaca `### Input:` field, and the checkpoint's saved TBPTT chunk size used for prompt prefill. Leave recurrent chat-state carry disabled unless you are intentionally testing multi-turn stateful behavior.
+Use this profile as the static coherence baseline before enabling chat history or passive learning. It keeps inference close to the training/benchmark path: no passive LTM writes and no previous-turn text injected into the Alpaca `### Input:` field. Exact v0.21 checkpoints default to monolithic prompt prefill, fixed refinement policy, and no external drift seed at artificial boundaries; legacy TBPTT checkpoints retain their saved chunk-boundary behavior. Leave recurrent chat-state carry disabled unless you are intentionally testing multi-turn stateful behavior. Full-precision parity means the same checkpoint, tokenizer, runtime policy, dtype/backend, and state boundaries within floating tolerance—not bitwise equality across different hardware, AMP versus FP32, sampling, or quantization.
 
 **Quantized *(Requires Compiled Kernel)*:**
 
@@ -905,10 +983,10 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.4 --top-
 | `--completion_column`          | `train`, `finetune`                 | Column name for completion/response in HF dataset. Use with `--prompt_column`.                                                           | `None`                  |
 | `--pre_chunked_dataset`        | `train`, `finetune`                 | Load pre-chunked **JSONL** dataset iteratively (requires `--max_length`). Mutually Exclusive with `--pre_pt_dataset` & `--hf_dataset`.     | `False`                 |
 | `--pre_pt_dataset`             | `train`, `finetune`                 | Load pre-chunked **consolidated `.pt` tensor** dataset from directory specified in `--train` (requires `--max_length`). Mutually Exclusive with `--pre_chunked_dataset` & `--hf_dataset`. | `False`                 |
-| `--model-path`                 | `train`, `finetune`, `merge`, `quantize`, `chat` | Path to model directory. **[Train]**: Loads weights only (starts fresh training). **[Other]**: Loads for the specified mode. | `None`                  |
+| `--model-path`                 | `train`, `finetune`, `merge`, `quantize`, `chat` | Path to model directory. **[Train]**: Loads old weights unchanged as a clean base with a fresh optimizer/schedule; use a new output directory. **[Other]**: Loads for the specified mode. | `None`                  |
 | `--out-dir`                    | `train`, `finetune`, `merge`, `quantize` | Directory to save new models, checkpoints, or adapters.                                                                                | `./Hierarchos_model`       |
 | `--tokenizer-path`             | `train`, `finetune`, `merge`, `quantize` | Path or HF name of tokenizer (if not loading from model-path).                                                                           | `openai-community/gpt2` |
-| `--resume-from-ckpt`           | `train`                             | Path to `.pt` checkpoint to **resume full training state** (optimizer, etc.).                                                            | `None`                  |
+| `--resume-from-ckpt`           | `train`                             | Path to a training `.pt` checkpoint for exact same-run continuation, including optimizer/scheduler/scaler/data state. Do not use it to warm-start a different dataset/schedule. | `None`                  |
 | `--shadow-model-path`          | `chat`                              | Path to full-precision model dir for online learning with quantized model.                                                               | `None`                  |
 | `--lora-adapter-path`          | `merge`, `finetune`                 | Path to the trained LoRA adapter directory.                                                                                            | `None`                  |
 | **Training/Fine-Tuning** |                                     |                                                                                                                                          |                         |
@@ -916,7 +994,11 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.4 --top-
 | `--batch_size`                 | `train`, `finetune`                 | Number of samples per forward pass. Default targets the 96GB Blackwell 232M training profile.                                             | `64`                    |
 | `--accumulation-steps`         | `train`, `finetune`                 | Number of steps to accumulate gradients over (simulates larger batch size).                                                              | `1`                     |
 | `--gradient-checkpointing`     | `train`, `finetune`                 | **Enable gradient checkpointing to save VRAM (trades compute for memory).** | `False`                 |
-| `--grad-clip`                  | `train`, `finetune`                 | Gradient clipping value. Prevents gradient explosion (0 to disable).                                                                     | `1.0`                   |
+| `--full-sample-bptt`           | `train`                             | Use one attached graph over each complete active sample; forces `detach_every_n_steps=0`, disables unrelated cross-sample recurrent carry, and preserves cache metadata. | `False` |
+| `--full-sample-activation-checkpointing` | `train`                    | Recompute attached temporal segments during one full-sample backward, bounding activations without truncating state gradients. Defaults on with full-sample BPTT. | `Auto` |
+| `--full-sample-checkpoint-segment-size` | `train`                    | Activation-only segment length for exact checkpointed full BPTT; does not alter token-cache/ROSA/LTM geometry or detach recurrent state. Safe default `128`; v0.21 RTX PRO 6000 96GB B64/T8880 profile `224` after longest-batch preflight. | `128` |
+| `--no-persist-state`           | `train`                             | Prevent unrelated DataLoader batches from sharing recurrent values. Within-sample recurrence and learned drift remain active; exact full BPTT forces this mode. | `False`                  |
+| `--grad-clip`                  | `train`, `finetune`                 | Bound the global norm of finite gradients after FP16 unscale when applicable (`0` disables). Reduces explosion risk but cannot guarantee stability. | `1.0`                   |
 | `--max-ce-loss-for-backward`   | `train`, `finetune`                 | Optional finite cap on CE used for backward only. `0` disables the cap and is recommended for from-scratch LM/assistant SFT training.     | `0.0`                   |
 | `--ponder-loss-weight`         | `train`, `finetune`                 | Weight for the Ponder Cost auxiliary loss.                                                                                               | `0.01`                  |
 | `--encourage-thinking`         | `train`                             | **Invert ponder loss to REWARD thinking.** Useful for ACT recovery training.                                                              | `False`                 |
@@ -928,6 +1010,10 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.4 --top-
 | `--drift-state-clamp`          | `train`, `finetune`                 | Per-element clamp for worker drift states. Useful as a hard finite-value guard during unstable resumes.                                  | `5.0`                   |
 | `--drift-norm-clamp`           | `train`, `finetune`                 | Optional L2 norm clamp for worker drift states. `0` disables it; use `3.5-4.0` for commit/drift rescue resumes.                         | `0.0`                   |
 | `--drift-delta-scale`          | `train`, `finetune`                 | Scale applied to each worker drift update before accumulation. Values below `1.0` slow runaway drift growth.                            | `1.0`                   |
+| `--recurrent-state-clamp`      | `train`, `finetune`                 | Per-element finite clamp for H/L recurrent states; changes values only when the bound is reached.                                       | `50.0`                  |
+| `--context-state-clamp`        | `train`, `finetune`                 | Per-element finite clamp for manager context state.                                                                                      | `50.0`                  |
+| `--activation-clamp`           | `train`, `finetune`                 | Per-element finite clamp for internal manager/worker activations.                                                                        | `100.0`                 |
+| `--halt-logit-clamp`           | `train`, `finetune`                 | Per-element finite clamp for ACT halt logits.                                                                                            | `30.0`                  |
 | `--rwkv-channel-mix-key-clamp` | `train`, `finetune`                 | Clamp RWKV `key_cm` preactivation before ReLU-squared channel mixing. `12.0` is the recommended stability default; `0` disables it.      | `12.0`                  |
 | `--rwkv-channel-mix-deepembed-clamp` | `train`, `finetune`          | Clamp DeepEmbed's multiplicative RWKV channel-mix modulation before `value_cm`. `4.0` is the recommended stability default; `0` disables it. | `4.0`                |
 | `--override-scheduling`        | `train`                             | **[If resuming]** Ignore checkpoint's schedule state and use new LR args.                                                                | `False`                 |
@@ -966,7 +1052,12 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.4 --top-
 | `--progress-log-steps`         | `train`                             | Update tqdm scalar metrics every N steps to reduce CUDA sync overhead from progress logging (`1` = every step).                         | `25`                    |
 | `--hf-token-cache`             | `train`, `finetune`                 | Build/reuse a random-access binary token cache for HF datasets. Enabled by default; use `--no-hf-token-cache` to disable.               | `True`                  |
 | `--hf-token-cache-dir`         | `train`, `finetune`                 | Directory for random-access HF token caches. Cache keys include formatter, weights, response guardrails, chunking, and architecture settings. | `None`              |
+| `--hf-dataset-revision`        | `train`, `finetune`                 | Optional Hub commit/tag/branch; online cache builds resolve it to an immutable commit SHA before cache lookup.                         | `None`                  |
 | `--refresh-hf-token-cache`     | `train`, `finetune`                 | Rebuild the random-access HF token cache once. This one-shot flag is not persisted by resume hydration.                                  | `False`                 |
+| `--token-cache-build-batch-size` | `train`, `finetune`               | Batch size for Arrow fetch, fast tokenization, ROSA precompute, and compact cache encoding (`0` = auto, up to 512).                    | `0`                     |
+| `--token-cache-only`           | `train`, `finetune`                 | Build/reuse the cache and exit before model allocation, suitable for a cheaper CPU preprocessing machine.                              | `False`                 |
+| `--length-bucket-auto-sample-size` | `train`, `finetune`              | Maximum cached lengths sampled for one-time bucket tuning; the chosen window is persisted (`0` = all).                                | `1000000`               |
+| `--cuda-loss-chunk-rows`       | `train`                             | Rows per CUDA vocabulary-loss chunk (`0` = choose once from live free VRAM). Lower values reduce loss-workspace peak at additional launch cost. | `0`                     |
 | `--pt-cache-size`              | `train`, `finetune`                 | Number of `.pt` chunk files to keep hot per worker when using `--pre_pt_dataset`.                                                       | `2`                     |
 | `--lora_r`                     | `finetune`                          | LoRA rank 'r'.                                                                                                                           | `8`                     |
 | `--lora_alpha`                 | `finetune`                          | LoRA alpha scaling factor.                                                                                                               | `16`                    |
@@ -974,8 +1065,8 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.4 --top-
 | `--kayla`                      | `train`, `finetune`                 | Enable Kayla-style instruction tuning format (with thought-process). **Ignored if using pre-chunked formats or --text\_column.** | `False`                 |
 | `--alpaca`                     | `train`, `finetune`                 | Enable Alpaca `instruction`/`input`/`output` formatting. Defaults prompt/completion columns to `instruction`/`output` and includes `input` as a `### Input:` context block. | `False`                 |
 | **Quantization/Inference** |                                     |                                                                                                                                          |                         |
-| `--qtype`                      | `quantize`, `train`                 | Quantization format (`INT4`, `Q4_0`, `Q8_0`, `Q2_K`). Used by `quantize` or `--quantize-on-complete`. **Requires compiled kernel.** | `INT4`                  |
-| `--quantize-on-complete`       | `train`                             | Automatically run quantization after training finishes. **Requires compiled kernel.** | `False`                 |
+| `--qtype`                      | `quantize`, `train`                 | Post-training quantization format (`INT4`, `Q4_0`, `Q8_0`, `Q2_K`). Used by `quantize` or `--quantize-on-complete`; this is not QAT and cannot preserve numerical logit parity. **Requires compiled kernel.** | `INT4`                  |
+| `--quantize-on-complete`       | `train`                             | After training, quantize a deployment copy. Preserve the original full-precision checkpoint as the v0.21 reference. **Requires compiled kernel.** | `False`                 |
 | `--device`                     | `chat`, `train`                     | Device for inference/training (`cpu`, `cuda`, `dml`/`directml`, `vulkan`). **Note:** `dml` requires `torch-directml` and Windows. DirectML requires explicit opt-in. | `auto`                   |
 | `--h-halt-thresh`              | `chat`                              | Probability threshold for early exiting the HRM reasoning loop during inference.                                                         | `0.9`                   |
 | `--max-new-tokens`             | `chat`                              | Maximum number of tokens to generate in chat mode.                                                                                       | `512`                   |
@@ -1003,8 +1094,8 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.4 --top-
 | `--max_l_steps`                | `train`                             | **Maximum** number of iterations for L-module convergence per H-step. **Impacts training speed.** | `5`                     |
 | `--l_conv_atol`                | `train`                             | Absolute tolerance for checking L-module state convergence.                                                                              | `1e-4`                  |
 | `--ltm_topk`                   | `train`                             | Number of LTM slots to retrieve per token.                                                                                               | `4`                     |
-| `--detach-every-n-steps`       | `train`                             | **Truncated BPTT:** Detach RNN state gradients every N timesteps. Lower values = less memory, less temporal learning.                   | `32`                    |
-| `--training-chunk-size`        | `train`, `finetune`                 | TBPTT chunk length. Default 256 targets batch 64 on 96GB Blackwell-class CUDA; use 128 if memory gets tight.                            | `256`                   |
+| `--detach-every-n-steps`       | `train`                             | **Truncated BPTT:** detach RNN state gradients every N timesteps (`0` disables). Exact full-sample BPTT forces `0`.                     | `32`                    |
+| `--training-chunk-size`        | `train`, `finetune`                 | TBPTT length and cache/ROSA/LTM/compile geometry. In exact mode it remains `256` while the separate checkpoint-segment flag controls activation replay and never the gradient horizon. | `256`                   |
 | `--max_length`                 | `train`, `finetune`                 | Maximum sequence length. **Required if using pre-chunked formats.** Set via scan (`--auto-max-length`), manually, or loaded from config. | `1024`                  |
 | `--auto-max-length`            | `train`, `finetune`                 | Automatically scan dataset (`--train` or `--hf_dataset`) to set `max_length`. **Ignored if using pre-chunked formats.** | `False`                 |
 | **Other** |                                     |                                                                                                                                          |                         |
@@ -1064,6 +1155,16 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
   * **DirectML/ZLUDA communities** for enabling AMD GPU acceleration on Windows.
 
 ## Changelog
+
+### v0.21 (alpha)
+
+  * **Exact Full-Sample BPTT**: `--full-sample-bptt` forces recurrent detachment off and prevents unrelated batches from sharing recurrent values. Attached non-reentrant activation checkpoints preserve one mathematical objective and gradient horizon across every retained token in each sample.
+  * **96GB Blackwell Reference Profile**: Documents BF16 AMP, batch `64`, `max_length=8880`, training/cache geometry `256`, and activation segment `224`, subject to a required longest-batch preflight on the rental GPU. The padded 8,960-token maximum divides into 40 equal segments; `128` remains the safe default and `64` the first OOM fallback.
+  * **Drift and Inference Parity**: Drift remains a learned, clipped part of the hierarchy. Exact activation boundaries derive drift from attached L-state instead of injecting terminal drift twice; full-precision chat, lm-eval, ARC-AGI, and the GUI bridge honor the saved exact recurrence/refinement policy.
+  * **Compact Multi-Billion-Token Pipeline**: Pins mutable Hub revisions to immutable SHAs, batches Arrow fetch/tokenization, adds mmap schema-v6 uint16/RLE caches with checked label aliasing, auto-tunes length buckets, keeps persistent workers, and overlaps pinned transfers on a dedicated CUDA stream.
+  * **Precision and Numeric Guardrails**: Keeps FP32 parameters/AdamW/sensitive state with BF16 autocast on supported Blackwell CUDA. Finite loss/gradient rejection, unscale-before-clip ordering, global gradient clipping, state/context/drift/activation/halt bounds, and channel-mix clamps remain active. QAT/FP8 are not release training modes, and quantized inference is not numerically logit-identical.
+  * **Checkpoint-Compatible Promotion**: No learned tensor name or shape changed. The reference model remains `232,516,229` unique parameters and `95` state-dict entries; older coherent checkpoints remain valid weights-only bases through `--model-path` with their original tokenizer.
+  * **Expanded Verification**: `283 passed, 4 skipped`; architecture integrity `65 passed`, `1` documented legacy-quantization warning, `0 failures`. Direct-versus-checkpointed full-BPTT gradient and inference-boundary parity controls pass.
 
 ### v0.20.7 (alpha)
 

@@ -685,7 +685,12 @@ def handle_generate(params: dict):
 
         try:
             import torch
-            from hierarchos.inference.chat import wrap_for_hierarchos
+            from hierarchos.inference.chat import (
+                boundary_drift_seed,
+                resolve_inference_prefill_chunk_size,
+                tbptt_chunk_ranges,
+                wrap_for_hierarchos,
+            )
 
             max_new = int(sampling.get("max_new_tokens", 512))
             prompt = wrap_for_hierarchos(message)
@@ -697,27 +702,47 @@ def handle_generate(params: dict):
             # autoregressive token. Per-token Hebbian writes can compound and
             # pull the model into repeated/off-topic text.
             _model.suppress_hebbian = True
+            model_config = getattr(_model, "config", _config)
+            prefill_chunk_size = resolve_inference_prefill_chunk_size(model_config)
+            exact_full_sample = bool(
+                getattr(model_config, "full_sample_bptt", False)
+                or getattr(model_config, "inference_logit_parity", False)
+            )
 
             with torch.no_grad():
-                outputs = _model(
-                    prompt_ids,
-                    h_state=_h_state,
-                    l_state=_l_state,
-                    prev_context=_prev_context,
-                    target_context=_target_context,
-                    drift_state=_drift_state,
-                    ltm_memory_state=_ltm_state,
-                    global_pos_offset=_total_tokens_generated,
-                    suppress_hebbian=True,
-                )
+                prompt_offset = _total_tokens_generated
+                outputs = None
+                for prefill_start, prefill_end in tbptt_chunk_ranges(
+                    int(prompt_ids.shape[1]),
+                    prefill_chunk_size,
+                    prompt_offset,
+                ):
+                    absolute_start = prompt_offset + prefill_start
+                    outputs = _model(
+                        prompt_ids[:, prefill_start:prefill_end],
+                        h_state=_h_state,
+                        l_state=_l_state,
+                        prev_context=_prev_context,
+                        target_context=_target_context,
+                        drift_state=boundary_drift_seed(
+                            _drift_state,
+                            absolute_start,
+                            prefill_chunk_size,
+                            exact_full_sample=exact_full_sample,
+                        ),
+                        ltm_memory_state=_ltm_state,
+                        global_pos_offset=absolute_start,
+                        suppress_hebbian=True,
+                    )
+
+                    _h_state = outputs.get("h_state", _h_state)
+                    _l_state = outputs.get("l_state", _l_state)
+                    _prev_context = outputs.get("prev_context", _prev_context)
+                    _target_context = outputs.get("target_context", _target_context)
+                    _drift_state = outputs.get("drift_state", _drift_state)
+                    _ltm_state = outputs.get("ltm_memory_state", _ltm_state)
 
                 logits = outputs["logits"]
-                _h_state = outputs.get("h_state", _h_state)
-                _l_state = outputs.get("l_state", _l_state)
-                _prev_context = outputs.get("prev_context", _prev_context)
-                _target_context = outputs.get("target_context", _target_context)
-                _drift_state = outputs.get("drift_state", _drift_state)
-                _ltm_state = outputs.get("ltm_memory_state", _ltm_state)
                 _total_tokens_generated += prompt_ids.shape[1]
 
                 current_ids = _sample_next_token(logits, response_ids, sampling, _tokenizer)
@@ -741,7 +766,12 @@ def handle_generate(params: dict):
                         l_state=_l_state,
                         prev_context=_prev_context,
                         target_context=_target_context,
-                        drift_state=_drift_state,
+                        drift_state=boundary_drift_seed(
+                            _drift_state,
+                            _total_tokens_generated,
+                            prefill_chunk_size,
+                            exact_full_sample=exact_full_sample,
+                        ),
                         ltm_memory_state=_ltm_state,
                         global_pos_offset=_total_tokens_generated,
                         suppress_hebbian=True,
@@ -914,6 +944,15 @@ def handle_start_training(params: dict):
 
             train_batch_size = int(params.get("batch_size", 64))
             train_chunk_size = int(params.get("training_chunk_size", 256))
+            full_sample_bptt = _bool_param("full_sample_bptt", False)
+            full_sample_activation_checkpointing = _bool_param(
+                "full_sample_activation_checkpointing",
+                True,
+            )
+            full_sample_checkpoint_segment_size = max(
+                1,
+                int(params.get("full_sample_checkpoint_segment_size", 128)),
+            )
             default_workers = 8 if str(_device).startswith("cuda") and train_batch_size >= 64 else 0
             default_bucket_size = 8192 if str(_device).startswith("cuda") and train_batch_size >= 64 else None
 
@@ -950,8 +989,15 @@ def handle_start_training(params: dict):
                 starting_lr=float(params.get("learning_rate", 1e-4)),
                 min_lr=float(params.get("min_lr", 1e-6)),
                 training_chunk_size=train_chunk_size,
+                full_sample_bptt=full_sample_bptt,
+                full_sample_activation_checkpointing=(
+                    full_sample_activation_checkpointing if full_sample_bptt else False
+                ),
+                full_sample_checkpoint_segment_size=full_sample_checkpoint_segment_size,
                 grad_clip=float(params.get("grad_clip", 1.0)),
-                persist_state=bool(params.get("persist_state", False)),
+                persist_state=(
+                    False if full_sample_bptt else bool(params.get("persist_state", False))
+                ),
                 amp=bool(params.get("amp", True)),
                 save_steps=int(params.get("save_steps", 0)),
                 num_workers=max(0, int(params.get("num_workers", default_workers))),
@@ -973,7 +1019,10 @@ def handle_start_training(params: dict):
                 commitment_loss_weight=0.5,
                 commitment_threshold=0.05,
                 l_conv_atol=1e-4,
-                detach_every_n_steps=32,
+                detach_every_n_steps=(
+                    0 if full_sample_bptt else _config.get("detach_every_n_steps", 32)
+                ),
+                gradient_checkpointing=False,
                 h_halt_thresh=0.9,
                 encourage_thinking=False,
                 adaptive_ponder=False,
@@ -1122,7 +1171,14 @@ def handle_start_training(params: dict):
             tqdm_module.tqdm = GUITqdm
 
             try:
-                hierarchos_train(train_args, _device, _tokenizer, dataloader, dataloader_len)
+                hierarchos_train(
+                    train_args,
+                    _device,
+                    _tokenizer,
+                    dataloader,
+                    dataloader_len,
+                    model_override=_model,
+                )
                 emit_status("Training complete!")
             except StopIteration:
                 emit_status("Training stopped by user.")

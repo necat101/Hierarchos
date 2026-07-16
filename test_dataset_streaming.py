@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import types
 import tempfile
 
@@ -12,6 +13,7 @@ from hierarchos.training.datasets import (
     OriginalJSONLDataset,
     StreamingJSONLDataset,
     TokenizedBinaryDataset,
+    _assign_jsonl_shards,
     _iter_hf_worker_samples,
     _iter_jsonl_lines_for_worker,
     _iter_jsonl_shards_for_worker,
@@ -22,7 +24,7 @@ from hierarchos.training.datasets import (
     process_text_sample,
 )
 from hierarchos.inference.chat import wrap_for_hierarchos
-from hierarchos.training.trainer import pad_training_batch_to_multiple
+from hierarchos.training.trainer import pad_training_batch_to_multiple, set_dataloader_epoch
 
 
 class TinyTokenizer:
@@ -396,6 +398,104 @@ def test_jsonl_file_shards_assign_whole_files_to_workers():
     assert sorted(seen) == sorted(expected)
 
 
+def test_jsonl_whole_shards_are_size_balanced_and_deterministic():
+    sizes = [1000, 900, 800, 700, 600, 500]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        paths = []
+        for shard_idx, size in enumerate(sizes):
+            path = os.path.join(tmpdir, f"shard_{shard_idx:05d}.jsonl")
+            with open(path, "wb") as shard_file:
+                shard_file.write(b"x" * size)
+            paths.append(path)
+
+        assignments = _assign_jsonl_shards(paths, 3)
+        repeated = _assign_jsonl_shards(paths, 3)
+        balanced_loads = [sum(os.path.getsize(path) for path in group) for group in assignments]
+        modulo_loads = [sum(sizes[idx::3]) for idx in range(3)]
+
+    assert assignments == repeated
+    assert sorted(path for group in assignments for path in group) == sorted(paths)
+    assert max(balanced_loads) < max(modulo_loads)
+    assert max(balanced_loads) - min(balanced_loads) == 0
+
+
+def test_persistent_jsonl_workers_observe_epoch_updates():
+    rows = []
+    for row_idx in range(48):
+        length = 2 + (row_idx % 12)
+        ids = [1000 + row_idx] + [10 + row_idx] * (length - 1)
+        rows.append({
+            "input_ids": ids,
+            "labels": list(ids),
+            "attention_mask": [1] * length,
+        })
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "train.jsonl")
+        _write_jsonl(path, rows)
+        loader = create_dataloader_for_jsonl(
+            path,
+            TinyTokenizer(),
+            max_length=32,
+            batch_size=2,
+            pad_token_id=0,
+            num_workers=2,
+            use_length_bucketing=True,
+            bucket_size=24,
+        )
+        loader.dataset.seed = 9137
+
+        set_dataloader_epoch(loader, 0)
+        epoch_zero = [
+            int(sample_id)
+            for batch in loader
+            for sample_id in batch["input_ids"][:, 0].tolist()
+        ]
+        set_dataloader_epoch(loader, 1)
+        epoch_one = [
+            int(sample_id)
+            for batch in loader
+            for sample_id in batch["input_ids"][:, 0].tolist()
+        ]
+
+    expected = list(range(1000, 1048))
+    assert sorted(epoch_zero) == expected
+    assert sorted(epoch_one) == expected
+    assert epoch_one != epoch_zero
+
+
+def test_hf_workers_share_shuffle_seed_before_sharding(monkeypatch):
+    import hierarchos.training.datasets as dataset_module
+
+    dataset = HuggingFaceStreamingDataset(
+        FakeHFStream([{"text": "a"}, {"text": "b"}]),
+        TinyTokenizer(),
+        max_length=16,
+        batch_size=1,
+        shuffle=True,
+    )
+    dataset.seed = 41
+    dataset.set_epoch(3)
+    shuffle_seeds = []
+    original_shuffle = dataset_module._maybe_shuffle_hf_dataset
+
+    def record_shuffle(hf_dataset, shuffle, shuffle_buffer_size, seed):
+        shuffle_seeds.append(seed)
+        return original_shuffle(hf_dataset, shuffle, shuffle_buffer_size, seed)
+
+    monkeypatch.setattr(dataset_module, "_maybe_shuffle_hf_dataset", record_shuffle)
+    for worker_id in range(2):
+        monkeypatch.setattr(
+            dataset_module.torch.utils.data,
+            "get_worker_info",
+            lambda worker_id=worker_id: types.SimpleNamespace(id=worker_id, num_workers=2),
+        )
+        list(dataset)
+
+    assert len(shuffle_seeds) == 2
+    assert shuffle_seeds[0] == shuffle_seeds[1]
+
+
 def test_streaming_jsonl_directory_shards_batch_once():
     tokenizer = TinyTokenizer()
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -713,6 +813,11 @@ def test_hf_token_cache_preserves_alpaca_input_and_all_token_labels():
                 use_rosa=False,
                 rosa_max_context=512,
                 training_chunk_size=256,
+                batch_size=2,
+                num_workers=2,
+                prefetch_factor=2,
+                token_cache_build_batch_size=2,
+                token_cache_write_buffer_mb=1,
             )
             cache_dir = hierarchos_cli.materialize_hf_token_cache(args, RecordingTokenizer())
             with open(os.path.join(cache_dir, "_SUCCESS"), "r", encoding="utf-8") as f:
@@ -742,7 +847,7 @@ def test_hf_token_cache_preserves_alpaca_input_and_all_token_labels():
         + TinyTokenizer().encode("The cache keeps instruction, input, and output tokens.", add_special_tokens=False)
         + [TinyTokenizer.eos_token_id]
     )
-    assert success["format"] == "map-token-bin-v4"
+    assert success["format"] == hierarchos_cli._hf_token_cache_format(args)
     assert success["formatter"] == hierarchos_cli.HF_CACHE_FORMATTER_VERSION
     assert success["cache_payload"]["alpaca_input_role"] == "previous_context"
     assert success["cache_payload"]["train_prompt_tokens"] is True
@@ -751,6 +856,115 @@ def test_hf_token_cache_preserves_alpaca_input_and_all_token_labels():
     assert item["input_ids"].tolist() == expected_ids
     assert item["labels"].tolist() == expected_ids
     assert not (item["labels"] == -100).any()
+
+
+def test_local_jsonl_token_cache_reuses_exact_records_and_invalidates_on_change():
+    import hierarchos_cli
+
+    rows = [
+        {"text": "short cache row"},
+        {"text": "a somewhat longer cache row"},
+        {"text": "final cache row"},
+    ]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        source_path = os.path.join(tmpdir, "train.jsonl")
+        cache_root = os.path.join(tmpdir, "cache")
+        _write_jsonl(source_path, rows)
+        args = types.SimpleNamespace(
+            train=source_path,
+            hf_dataset=None,
+            hf_dataset_config=None,
+            hf_dataset_split="train",
+            local_token_cache_dir=cache_root,
+            hf_token_cache_dir=None,
+            refresh_local_token_cache=False,
+            tokenizer_path="tiny-test-tokenizer",
+            model_path=None,
+            max_length=64,
+            batch_size=2,
+            num_workers=0,
+            prefetch_factor=None,
+            dataset_size=None,
+            token_cache_build_batch_size=2,
+            token_cache_write_buffer_mb=1,
+            kayla=False,
+            alpaca=False,
+            text_column=None,
+            prompt_column=None,
+            completion_column=None,
+            train_prompt_tokens=True,
+            prompt_loss_weight=1.0,
+            response_loss_weight=1.0,
+            response_boundary_loss_weight=1.0,
+            response_boundary_tokens=0,
+            min_response_tokens=1,
+            drop_empty_completions=True,
+            use_rosa=True,
+            rosa_max_context=512,
+            training_chunk_size=256,
+        )
+        tokenizer = RecordingTokenizer()
+
+        first_cache = hierarchos_cli.materialize_local_token_cache(args, tokenizer)
+        calls_after_build = len(tokenizer.calls)
+        reused_cache = hierarchos_cli.materialize_local_token_cache(args, tokenizer)
+
+        assert reused_cache == first_cache
+        assert len(tokenizer.calls) == calls_after_build
+
+        portable_source_dir = os.path.join(tmpdir, "portable-copy")
+        os.makedirs(portable_source_dir)
+        portable_source = os.path.join(portable_source_dir, "train.jsonl")
+        shutil.copy2(source_path, portable_source)
+        args.train = portable_source
+        assert hierarchos_cli.materialize_local_token_cache(args, tokenizer) == first_cache
+        assert len(tokenizer.calls) == calls_after_build
+        args.train = source_path
+
+        dataset = TokenizedBinaryDataset(first_cache, max_length=64)
+        try:
+            assert len(dataset) == len(rows)
+            for row_idx, row in enumerate(rows):
+                expected = process_text_sample(TinyTokenizer(), row, 64)
+                actual = dataset[row_idx]
+                assert torch.equal(actual["input_ids"], expected["input_ids"])
+                assert torch.equal(actual["labels"], expected["labels"])
+                assert actual["_length"] == expected["_length"]
+                expected_rosa = torch.tensor(
+                    hierarchos_cli.precompute_rosa_ids_for_chunks(
+                        expected["input_ids"].tolist(),
+                        vocab_size=actual["_rosa_sentinel"],
+                        chunk_size=args.training_chunk_size,
+                        rosa_max_ctx=args.rosa_max_context,
+                    ),
+                    dtype=torch.int32,
+                )
+                assert torch.equal(actual["rosa_ids"], expected_rosa)
+        finally:
+            dataset.close()
+
+        rows.append({"text": "a newly appended row invalidates the fingerprint"})
+        _write_jsonl(source_path, rows)
+        changed_cache = hierarchos_cli.materialize_local_token_cache(args, tokenizer)
+        changed_dataset = TokenizedBinaryDataset(changed_cache, max_length=64)
+        try:
+            assert changed_cache != first_cache
+            assert len(changed_dataset) == len(rows)
+        finally:
+            changed_dataset.close()
+
+
+def test_cache_effective_lengths_use_last_real_token_not_mask_sum():
+    import hierarchos_cli
+
+    batch = {
+        "input_ids": torch.arange(8, dtype=torch.long).reshape(2, 4),
+        "attention_mask": torch.tensor([
+            [0, 1, 1, 1],
+            [1, 0, 1, 0],
+        ], dtype=torch.long),
+    }
+    assert hierarchos_cli._batch_effective_lengths(batch) == [4, 3]
 
 
 def test_hf_cache_keys_reject_legacy_masked_or_ambiguous_formatter_versions():
@@ -777,7 +991,10 @@ def test_hf_cache_keys_reject_legacy_masked_or_ambiguous_formatter_versions():
 
     assert hierarchos_cli._hf_token_cache_key(args) != hierarchos_cli._legacy_hf_token_cache_key(args)
     assert hierarchos_cli._hf_shard_cache_key(args, 8) != hierarchos_cli._legacy_hf_shard_cache_key(args, 8)
-    payload = hierarchos_cli._hf_cache_key_payload(args, format_name="map-token-bin-v4")
+    payload = hierarchos_cli._hf_cache_key_payload(
+        args,
+        format_name=hierarchos_cli._hf_token_cache_format(args),
+    )
     assert payload["formatter"] == hierarchos_cli.HF_CACHE_FORMATTER_VERSION
     assert payload["alpaca_input_field"] == "input"
     assert payload["alpaca_input_role"] == "previous_context"

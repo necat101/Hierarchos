@@ -1,10 +1,11 @@
 # Hierarchos Architecture Audit
 
-> **2026-07-13 update:** This May audit is retained as historical architectural
-> context. The current v0.20.7 code and real epoch-13 checkpoint validation are
+> **2026-07-16 update:** This May audit is retained as historical architectural
+> context. The current v0.21 code and real epoch-13 checkpoint validation are
 > documented in [EPOCH13_CHECKPOINT_AUDIT.md](EPOCH13_CHECKPOINT_AUDIT.md). The
 > current executable audit reports `65 passed`, `1` documented legacy-quantization
-> warning, and `0` failures.
+> warning, and `0` failures. v0.21 changes training/data execution and exact
+> recurrence semantics without adding, removing, or reshaping learned tensors.
 
 Audit date: 2026-05-23
 

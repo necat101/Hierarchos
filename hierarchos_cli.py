@@ -4,6 +4,7 @@ import argparse
 import json
 import hashlib
 import shutil
+from array import array
 import torch
 import torch.nn as nn
 from transformers import AutoTokenizer
@@ -49,15 +50,80 @@ from hierarchos.utils.rosa import precompute_rosa_ids_for_chunks
 HF_CACHE_FORMATTER_VERSION = "alpaca-previous-context-v5"
 
 
-def load_hf_dataset(dataset_name, dataset_config=None, split="train", streaming=False):
+def load_hf_dataset(
+    dataset_name,
+    dataset_config=None,
+    split="train",
+    streaming=False,
+    revision=None,
+    num_proc=None,
+):
     try:
         from datasets import load_dataset
     except ImportError as exc:
         raise ImportError("Hugging Face dataset loading requires the 'datasets' package.") from exc
     kwargs = {"split": split, "streaming": bool(streaming)}
+    if revision:
+        kwargs["revision"] = revision
+    if not streaming and int(num_proc or 0) > 0:
+        kwargs["num_proc"] = int(num_proc)
     if dataset_config:
         return load_dataset(dataset_name, dataset_config, **kwargs)
     return load_dataset(dataset_name, **kwargs)
+
+
+def resolve_hf_dataset_revision(args, *, announce=False):
+    """Pin a Hub dataset to the commit used to key and build token caches.
+
+    Resolving before ``load_dataset`` prevents a mutable ``main`` branch from
+    silently reusing tokens from an older release. Explicit revisions still go
+    through the Hub so a branch/tag is converted to an immutable commit SHA.
+    Offline callers retain their explicit revision; callers without one receive
+    a warning because no implementation can detect a remote update while offline.
+    """
+    existing = getattr(args, "_resolved_hf_dataset_revision", None)
+    if existing:
+        return existing
+    dataset_name = getattr(args, "hf_dataset", None)
+    requested = getattr(args, "hf_dataset_revision", None)
+    if not dataset_name or os.path.exists(os.path.expanduser(str(dataset_name))):
+        if requested:
+            args._resolved_hf_dataset_revision = str(requested)
+        return requested
+
+    resolved = None
+    try:
+        from huggingface_hub import HfApi
+
+        info = HfApi().dataset_info(repo_id=dataset_name, revision=requested)
+        resolved = getattr(info, "sha", None)
+    except Exception as exc:
+        resolved = requested
+        if announce:
+            if requested:
+                print(
+                    "WARNING: Could not resolve the HF dataset revision to a commit SHA; "
+                    f"using explicit revision {requested!r}. {exc}"
+                )
+            else:
+                print(
+                    "WARNING: Could not resolve the mutable HF dataset revision. "
+                    "Use --hf-dataset-revision with an immutable commit SHA or a fresh "
+                    f"cache root before reusing a cache offline. {exc}"
+                )
+
+    if resolved:
+        args._resolved_hf_dataset_revision = str(resolved)
+        if announce:
+            print(f"INFO: Pinned HF dataset revision: {resolved}")
+    return resolved
+
+
+def _hf_revision_for_load(args):
+    return (
+        getattr(args, "_resolved_hf_dataset_revision", None)
+        or getattr(args, "hf_dataset_revision", None)
+    )
 
 
 def _parse_hf_split_count(base_count, selector):
@@ -108,6 +174,17 @@ def _steps_from_samples(sample_count, batch_size):
     sample_count = max(0, int(sample_count or 0))
     batch_size = max(1, int(batch_size or 1))
     return max(1, (sample_count + batch_size - 1) // batch_size)
+
+
+def _batch_effective_lengths(batch):
+    """Return the last non-padding position for each collated cache row."""
+    input_ids = batch["input_ids"]
+    masks = batch.get("attention_mask")
+    if masks is None:
+        return [int(input_ids.shape[1])] * int(input_ids.shape[0])
+    width = int(masks.shape[1])
+    positions = torch.arange(1, width + 1, device=masks.device, dtype=torch.long)
+    return torch.where(masks.ne(0), positions, 0).amax(dim=1).tolist()
 
 
 def _is_jsonl_path(path):
@@ -337,17 +414,59 @@ def auto_tune_length_bucket_size_from_token_cache(args, cache_dir):
     index_path = os.path.join(cache_dir, "index.pt")
     if not os.path.exists(index_path):
         return None
+    tuning_path = os.path.join(cache_dir, "bucket_tuning.json")
     try:
         index = torch.load(index_path, map_location="cpu")
         lengths = index["lengths"].to(dtype=torch.long, device="cpu")
         max_length = int(getattr(args, "max_length", 0) or 0)
         if max_length > 0:
             lengths = torch.clamp(lengths, max=max_length)
+        sample_limit = max(
+            0,
+            int(getattr(args, "length_bucket_auto_sample_size", 1_000_000) or 0),
+        )
+        settings = {
+            "version": 1,
+            "cache_key": index.get("cache_key"),
+            "source_samples": int(lengths.numel()),
+            "batch_size": int(getattr(args, "batch_size", 1) or 1),
+            "training_chunk_size": int(getattr(args, "training_chunk_size", 256) or 256),
+            "max_length": max_length,
+            "tolerance": float(getattr(args, "length_bucket_auto_tolerance", 0.005) or 0.0),
+            "sample_limit": sample_limit,
+        }
+        if os.path.exists(tuning_path):
+            try:
+                with open(tuning_path, "r", encoding="utf-8") as tuning_file:
+                    cached_tuning = json.load(tuning_file)
+                if cached_tuning.get("settings") == settings:
+                    bucket_size = int(cached_tuning["bucket_size"])
+                    args.length_bucket_size = bucket_size
+                    print(
+                        "INFO: Reusing persisted HF token-cache length bucket window "
+                        f"{bucket_size} (tuned from {cached_tuning.get('sampled_lengths', 0)} lengths)."
+                    )
+                    return bucket_size
+            except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+                pass
+
+        source_length_count = int(lengths.numel())
+        if sample_limit > 0 and source_length_count > sample_limit:
+            # Evenly spaced deterministic sampling covers the entire cache without
+            # allocating a full-size randperm. choose_length_bucket_size shuffles
+            # the compact sample before evaluating candidate windows.
+            sample_indices = torch.linspace(
+                0,
+                source_length_count - 1,
+                steps=sample_limit,
+                dtype=torch.float64,
+            ).round().to(dtype=torch.long)
+            lengths = lengths.index_select(0, sample_indices)
         bucket_size, summary = choose_length_bucket_size_from_lengths(
             lengths,
-            batch_size=getattr(args, "batch_size", 1),
-            chunk_size=getattr(args, "training_chunk_size", 256),
-            tolerance=getattr(args, "length_bucket_auto_tolerance", 0.005),
+            batch_size=settings["batch_size"],
+            chunk_size=settings["training_chunk_size"],
+            tolerance=settings["tolerance"],
         )
     except Exception as exc:
         print(f"WARNING: Length bucket auto-tune failed; using fallback. {exc}")
@@ -364,8 +483,22 @@ def auto_tune_length_bucket_size_from_token_cache(args, cache_dir):
         "INFO: Auto-tuned HF token-cache length bucket window to "
         f"{bucket_size} (estimated tok_eff={chosen['token_efficiency'] * 100.0:.1f}%; "
         f"best={best['bucket_size']} at {best['token_efficiency'] * 100.0:.1f}%; "
-        f"candidates: {result_text})."
+        f"sampled={int(lengths.numel())}/{settings['source_samples']}; candidates: {result_text})."
     )
+    try:
+        tuning_payload = {
+            "settings": settings,
+            "bucket_size": int(bucket_size),
+            "sampled_lengths": int(lengths.numel()),
+            "chosen": chosen,
+            "best": best,
+        }
+        tmp_tuning_path = tuning_path + ".tmp"
+        with open(tmp_tuning_path, "w", encoding="utf-8") as tuning_file:
+            json.dump(tuning_payload, tuning_file, indent=2)
+        os.replace(tmp_tuning_path, tuning_path)
+    except OSError as exc:
+        print(f"WARNING: Could not persist length bucket auto-tune result: {exc}")
     return int(bucket_size)
 
 
@@ -419,6 +552,294 @@ def _uses_weighted_token_loss(args):
     )
 
 
+def _token_cache_loss_weight_palette(args):
+    """Return the exact float32 values emitted by the current formatter."""
+    weights = _loss_weight_kwargs(args)
+    prompt_weight = (
+        weights["prompt_loss_weight"]
+        if bool(getattr(args, "train_prompt_tokens", True))
+        else 0.0
+    )
+    candidates = torch.tensor(
+        [
+            0.0,
+            1.0,
+            prompt_weight,
+            weights["response_loss_weight"],
+            weights["response_loss_weight"] * weights["response_boundary_loss_weight"],
+        ],
+        dtype=torch.float32,
+    )
+    palette = []
+    seen_bits = set()
+    for value, bits in zip(candidates.tolist(), candidates.view(torch.int32).tolist()):
+        if bits not in seen_bits:
+            seen_bits.add(bits)
+            palette.append(float(value))
+    if len(palette) > 255:
+        raise ValueError("Token-cache loss-weight palette exceeds uint8 capacity")
+    return palette
+
+
+def _token_cache_storage_layout(args, tokenizer, *, has_rosa_ids, has_loss_weights):
+    vocab_size = _tokenizer_vocab_size(tokenizer)
+    # 65535 is reserved for ignore_index in the compact label stream.
+    compact_u16 = 0 < vocab_size <= 65534
+    token_dtype = "uint16" if compact_u16 else "int32"
+    token_bytes = 2 if compact_u16 else 4
+    labels_elided = bool(getattr(args, "train_prompt_tokens", True))
+    return {
+        "storage_schema_version": 6,
+        "byte_order": "little",
+        "token_dtype": token_dtype,
+        "label_dtype": None if labels_elided else token_dtype,
+        "label_encoding": "input_ids_alias" if labels_elided else None,
+        "rosa_dtype": token_dtype if has_rosa_ids else None,
+        "token_bytes": token_bytes,
+        "label_bytes": 0 if labels_elided else token_bytes,
+        "rosa_bytes": token_bytes if has_rosa_ids else 0,
+        "label_ignore_sentinel": (
+            None if labels_elided else (65535 if compact_u16 else -100)
+        ),
+        "has_rosa_ids": bool(has_rosa_ids),
+        "has_loss_weights": bool(has_loss_weights),
+        "loss_weight_encoding": (
+            "float32_palette_rle" if has_loss_weights else None
+        ),
+        "loss_weight_palette": (
+            _token_cache_loss_weight_palette(args) if has_loss_weights else None
+        ),
+    }
+
+
+def _encode_cache_integer_tensor(values, *, layout, field_name, allow_ignore=False):
+    values = values.detach().cpu().to(dtype=torch.int64).contiguous()
+    if layout["token_dtype"] == "uint16":
+        valid = (values >= 0) & (values <= 65534)
+        if allow_ignore:
+            valid = valid | (values == -100)
+        if not bool(valid.all().item()):
+            bad = values[~valid][:8].tolist()
+            raise ValueError(
+                f"Cannot encode {field_name} in compact uint16 token cache; "
+                f"invalid values include {bad}"
+            )
+        if allow_ignore:
+            values = torch.where(
+                values == -100,
+                torch.full_like(values, layout["label_ignore_sentinel"]),
+                values,
+            )
+        return values.to(dtype=torch.uint16).contiguous()
+    if allow_ignore:
+        valid = (values == -100) | (
+            (values >= torch.iinfo(torch.int32).min)
+            & (values <= torch.iinfo(torch.int32).max)
+        )
+    else:
+        valid = (values >= 0) & (values <= torch.iinfo(torch.int32).max)
+    if not bool(valid.all().item()):
+        raise ValueError(f"Cannot encode out-of-range {field_name} in int32 token cache")
+    return values.to(dtype=torch.int32).contiguous()
+
+
+def _append_loss_weight_runs(
+    batch,
+    row,
+    length,
+    *,
+    palette,
+    run_offsets,
+    run_ends,
+    run_codes,
+):
+    cached_codes = batch.get("_cache_loss_weight_codes")
+    if cached_codes is not None:
+        codes = cached_codes[row, :length]
+    else:
+        cached_weights = batch.get("loss_weights")
+        if cached_weights is None:
+            weights = torch.ones(length, dtype=torch.float32)
+        else:
+            weights = cached_weights[row, :length].detach().cpu().to(dtype=torch.float32).contiguous()
+        palette_tensor = (
+            palette
+            if isinstance(palette, torch.Tensor)
+            else torch.tensor(palette, dtype=torch.float32)
+        )
+        matches = weights.unsqueeze(-1).eq(palette_tensor.view(1, -1))
+        matched = matches.any(dim=-1)
+        if not bool(matched.all().item()):
+            unknown = weights[~matched][:8].tolist()
+            raise ValueError(
+                "Loss weights are not representable by the exact cache palette; "
+                f"unexpected values include {unknown}"
+            )
+        codes = matches.to(dtype=torch.uint8).argmax(dim=-1).to(dtype=torch.uint8)
+    if length > 1:
+        changes = torch.nonzero(codes[1:] != codes[:-1], as_tuple=False).flatten() + 1
+    else:
+        changes = torch.empty(0, dtype=torch.long)
+    ends = torch.cat([changes, torch.tensor([length], dtype=torch.long)])
+    starts = torch.cat([torch.tensor([0], dtype=torch.long), changes])
+    sample_codes = codes.index_select(0, starts)
+    run_ends.extend(int(value) for value in ends.tolist())
+    run_codes.extend(int(value) for value in sample_codes.tolist())
+    run_offsets.append(len(run_ends))
+
+
+def _append_token_cache_record(
+    write_buffer,
+    batch,
+    row,
+    length,
+    *,
+    layout,
+    precompute_rosa,
+):
+    labels_elided = layout.get("label_encoding") == "input_ids_alias"
+    if batch.get("_cache_storage_encoded", False):
+        input_ids = batch["input_ids"][row, :length]
+        labels = None if labels_elided else batch["labels"][row, :length]
+    else:
+        input_ids = _encode_cache_integer_tensor(
+            batch["input_ids"][row, :length],
+            layout=layout,
+            field_name="input_ids",
+        )
+        labels = None
+        if labels_elided:
+            raw_inputs = batch["input_ids"][row, :length].detach().cpu().to(dtype=torch.long)
+            raw_labels = batch["labels"][row, :length].detach().cpu().to(dtype=torch.long)
+            if not torch.equal(raw_inputs, raw_labels):
+                raise ValueError(
+                    "Cannot elide token-cache labels because labels differ from input_ids"
+                )
+        else:
+            labels = _encode_cache_integer_tensor(
+                batch["labels"][row, :length],
+                layout=layout,
+                field_name="labels",
+                allow_ignore=True,
+            )
+    parts = [input_ids.numpy().tobytes()]
+    if labels is not None:
+        parts.append(labels.numpy().tobytes())
+    if precompute_rosa:
+        cached_rosa = batch.get("rosa_ids")
+        if cached_rosa is None:
+            raise RuntimeError("ROSA cache builder did not return precomputed ids")
+        if batch.get("_cache_storage_encoded", False):
+            rosa_ids = cached_rosa[row, :length]
+        else:
+            rosa_ids = _encode_cache_integer_tensor(
+                cached_rosa[row, :length],
+                layout=layout,
+                field_name="rosa_ids",
+            )
+        parts.append(rosa_ids.numpy().tobytes())
+    for part in parts:
+        write_buffer.extend(part)
+    return sum(len(part) for part in parts)
+
+
+def _prepare_token_cache_batch(batch, lengths, *, layout, precompute_rosa):
+    """Vectorize compact dtype conversion and palette lookup once per batch."""
+    lengths = [max(0, int(length)) for length in lengths]
+    max_length = max(lengths, default=0)
+    if max_length <= 0:
+        return batch
+    prepared = {
+        "_cache_storage_encoded": True,
+        "input_ids": _encode_cache_integer_tensor(
+            batch["input_ids"][:, :max_length],
+            layout=layout,
+            field_name="input_ids",
+        ),
+    }
+    if layout.get("label_encoding") == "input_ids_alias":
+        raw_inputs = batch["input_ids"][:, :max_length].detach().cpu().to(dtype=torch.long)
+        raw_labels = batch["labels"][:, :max_length].detach().cpu().to(dtype=torch.long)
+        valid_positions = (
+            torch.arange(max_length, dtype=torch.long).unsqueeze(0)
+            < torch.tensor(lengths, dtype=torch.long).unsqueeze(1)
+        )
+        mismatch = valid_positions & raw_labels.ne(raw_inputs)
+        if bool(mismatch.any().item()):
+            coordinates = torch.nonzero(mismatch, as_tuple=False)[:8].tolist()
+            raise ValueError(
+                "Cannot elide token-cache labels: labels differ from input_ids at "
+                f"real-token coordinates {coordinates}. Disable --train-prompt-tokens "
+                "or rebuild with an explicit-label cache format."
+            )
+    else:
+        prepared["labels"] = _encode_cache_integer_tensor(
+            batch["labels"][:, :max_length],
+            layout=layout,
+            field_name="labels",
+            allow_ignore=True,
+        )
+    if precompute_rosa:
+        cached_rosa = batch.get("rosa_ids")
+        if cached_rosa is None:
+            raise RuntimeError("ROSA cache builder did not return precomputed ids")
+        prepared["rosa_ids"] = _encode_cache_integer_tensor(
+            cached_rosa[:, :max_length],
+            layout=layout,
+            field_name="rosa_ids",
+        )
+    if layout["has_loss_weights"]:
+        cached_weights = batch.get("loss_weights")
+        if cached_weights is None:
+            weights = torch.ones(
+                (len(lengths), max_length),
+                dtype=torch.float32,
+            )
+        else:
+            weights = cached_weights[:, :max_length].detach().cpu().to(
+                dtype=torch.float32
+            ).contiguous()
+        palette = torch.tensor(layout["loss_weight_palette"], dtype=torch.float32)
+        matches = weights.unsqueeze(-1).eq(palette.view(1, 1, -1))
+        valid_positions = (
+            torch.arange(max_length, dtype=torch.long).unsqueeze(0)
+            < torch.tensor(lengths, dtype=torch.long).unsqueeze(1)
+        )
+        matched = matches.any(dim=-1)
+        invalid = valid_positions & ~matched
+        if bool(invalid.any().item()):
+            unknown = weights[invalid][:8].tolist()
+            raise ValueError(
+                "Loss weights are not representable by the exact cache palette; "
+                f"unexpected values include {unknown}"
+            )
+        prepared["_cache_loss_weight_codes"] = matches.to(
+            dtype=torch.uint8
+        ).argmax(dim=-1).to(dtype=torch.uint8)
+    return prepared
+
+
+def _token_cache_index_layout(layout, run_offsets, run_ends, run_codes):
+    metadata = {
+        "storage_schema_version": layout["storage_schema_version"],
+        "byte_order": layout["byte_order"],
+        "token_dtype": layout["token_dtype"],
+        "label_dtype": layout["label_dtype"],
+        "label_encoding": layout["label_encoding"],
+        "rosa_dtype": layout["rosa_dtype"],
+        "label_ignore_sentinel": layout["label_ignore_sentinel"],
+        "loss_weight_encoding": layout["loss_weight_encoding"],
+        "loss_weight_palette": layout["loss_weight_palette"],
+    }
+    if layout["has_loss_weights"]:
+        metadata.update({
+            "loss_run_offsets": torch.tensor(run_offsets, dtype=torch.long),
+            "loss_run_ends": torch.tensor(run_ends, dtype=torch.int32),
+            "loss_run_codes": torch.tensor(run_codes, dtype=torch.uint8),
+        })
+    return metadata
+
+
 def _hf_cache_key_payload(args, *, format_name, num_shards=None):
     payload = {
         "format": format_name,
@@ -426,6 +847,10 @@ def _hf_cache_key_payload(args, *, format_name, num_shards=None):
         "dataset": args.hf_dataset,
         "config": args.hf_dataset_config,
         "split": args.hf_dataset_split,
+        "dataset_revision": (
+            getattr(args, "_resolved_hf_dataset_revision", None)
+            or getattr(args, "hf_dataset_revision", None)
+        ),
         "tokenizer": (
             getattr(args, "tokenizer_path", None)
             or getattr(args, "model_path", None)
@@ -536,6 +961,7 @@ def _processed_sample_to_cached_item(processed, args=None, tokenizer=None):
 
 
 def materialize_hf_dataset_pt_cache(args, tokenizer, num_shards):
+    resolve_hf_dataset_revision(args, announce=True)
     num_shards = max(1, int(num_shards or 1))
     cache_root = getattr(args, "hf_shard_cache_dir", None) or os.path.join(os.getcwd(), ".hierarchos_hf_shards")
     shard_key = _hf_shard_cache_key(args, num_shards)
@@ -574,6 +1000,7 @@ def materialize_hf_dataset_pt_cache(args, tokenizer, num_shards):
         args.hf_dataset_config,
         split=args.hf_dataset_split,
         streaming=True,
+        revision=_hf_revision_for_load(args),
     )
 
     chunks_per_file = max(1, int(getattr(args, "hf_cache_chunks_per_file", 2048) or 2048))
@@ -677,7 +1104,14 @@ def _hf_token_cache_key(args):
 
 
 def _hf_token_cache_format(args):
-    return "map-token-bin-v5-weighted" if _uses_weighted_token_loss(args) else "map-token-bin-v4"
+    format_name = (
+        "map-token-bin-v6-compact-weighted"
+        if _uses_weighted_token_loss(args)
+        else "map-token-bin-v6-compact"
+    )
+    if bool(getattr(args, "train_prompt_tokens", True)):
+        format_name += "-label-alias"
+    return format_name
 
 
 def _legacy_hf_token_cache_key(args):
@@ -707,6 +1141,7 @@ def _legacy_hf_token_cache_key(args):
 
 
 def materialize_hf_token_cache(args, tokenizer):
+    resolve_hf_dataset_revision(args, announce=True)
     cache_root = (
         getattr(args, "hf_token_cache_dir", None)
         or getattr(args, "hf_shard_cache_dir", None)
@@ -744,127 +1179,157 @@ def materialize_hf_token_cache(args, tokenizer):
     os.makedirs(tmp_dir, exist_ok=True)
 
     if write_loss_weights:
-        print("INFO: Building weighted HF random-access token cache (fp16 per-token loss weights).")
+        print(
+            "INFO: Building weighted HF random-access token cache "
+            "(lossless float32-palette RLE loss weights)."
+        )
     else:
         print("INFO: Building HF random-access token cache...")
+    build_batch_size = max(
+        1,
+        int(
+            getattr(args, "token_cache_build_batch_size", 0)
+            or min(512, max(64, int(getattr(args, "batch_size", 1) or 1) * 4))
+        ),
+    )
+    build_workers = max(0, int(getattr(args, "num_workers", 0) or 0))
     hf_dataset = load_hf_dataset(
         args.hf_dataset,
         args.hf_dataset_config,
         split=args.hf_dataset_split,
         streaming=False,
+        revision=_hf_revision_for_load(args),
+        num_proc=build_workers,
     )
     try:
         total_samples = len(hf_dataset)
     except Exception:
         total_samples = _estimate_hf_total_for_progress(args)
 
-    offsets = []
-    lengths = []
-    skipped = 0
-    total_bytes = 0
-    tmp_data_path = os.path.join(tmp_dir, "tokens.bin")
     precompute_rosa = bool(getattr(args, "use_rosa", True))
     rosa_sentinel = _tokenizer_vocab_size(tokenizer)
     rosa_chunk_size = int(getattr(args, "training_chunk_size", 256) or 256)
     rosa_max_context = int(getattr(args, "rosa_max_context", 512) or 512)
+    storage_layout = _token_cache_storage_layout(
+        args,
+        tokenizer,
+        has_rosa_ids=precompute_rosa,
+        has_loss_weights=write_loss_weights,
+    )
+    loss_run_offsets = array("q", [0])
+    loss_run_ends = array("i")
+    loss_run_codes = array("B")
+    loss_weight_palette = (
+        torch.tensor(storage_layout["loss_weight_palette"], dtype=torch.float32)
+        if write_loss_weights else None
+    )
+    cache_dataset = HuggingFaceMapStyleDataset(
+        hf_dataset,
+        tokenizer,
+        getattr(args, "max_length", 1024),
+        getattr(args, "kayla", False),
+        getattr(args, "text_column", None),
+        getattr(args, "prompt_column", None),
+        getattr(args, "completion_column", None),
+        getattr(args, "alpaca", False),
+        getattr(args, "train_prompt_tokens", True),
+        **_loss_weight_kwargs(args),
+        **_response_quality_kwargs(args),
+        precompute_rosa=precompute_rosa,
+        rosa_vocab_size=rosa_sentinel,
+        rosa_chunk_size=rosa_chunk_size,
+        rosa_max_context=rosa_max_context,
+    )
+    builder = create_map_style_dataloader(
+        cache_dataset,
+        build_batch_size,
+        tokenizer.pad_token_id,
+        num_workers=build_workers,
+        shuffle=False,
+        use_length_bucketing=False,
+        device=torch.device("cpu"),
+        prefetch_factor=getattr(args, "prefetch_factor", None),
+        in_order=False,
+    )
+    print(
+        "INFO: Parallel HF cache preprocessing configured with "
+        f"batch_size={build_batch_size}, workers={build_workers}."
+    )
 
-    def iter_hf_samples():
-        nonlocal skipped
-        if total_samples is None:
-            yield from enumerate(hf_dataset)
-            return
-        for sample_idx in range(total_samples):
-            try:
-                yield sample_idx, hf_dataset[sample_idx]
-            except Exception:
-                skipped += 1
+    offsets = array("q")
+    lengths = array("i")
+    total_bytes = 0
+    write_buffer = bytearray()
+    flush_bytes = max(
+        1 << 20,
+        int(getattr(args, "token_cache_write_buffer_mb", 64) or 64) * (1 << 20),
+    )
+    tmp_data_path = os.path.join(tmp_dir, "tokens.bin")
 
-    with open(tmp_data_path, "wb") as data_file:
-        for sample_idx, sample in tqdm(
-            iter_hf_samples(),
-            desc="Tokenizing HF cache",
-            unit="sample",
-            total=total_samples,
-        ):
-            try:
-                processed = process_text_sample(
-                    tokenizer,
-                    sample,
-                    getattr(args, "max_length", 1024),
-                    getattr(args, "kayla", False),
-                    text_column=getattr(args, "text_column", None),
-                    prompt_column=getattr(args, "prompt_column", None),
-                    completion_column=getattr(args, "completion_column", None),
-                    alpaca_mode=getattr(args, "alpaca", False),
-                    train_prompt_tokens=getattr(args, "train_prompt_tokens", True),
-                    **_loss_weight_kwargs(args),
-                    **_response_quality_kwargs(args),
+    try:
+        with open(tmp_data_path, "wb", buffering=flush_bytes) as data_file:
+            for batch in tqdm(
+                builder,
+                desc="Tokenizing HF cache",
+                unit="batch",
+                total=(
+                    _steps_from_samples(total_samples, build_batch_size)
+                    if total_samples is not None else None
+                ),
+            ):
+                if batch is None:
+                    continue
+                batch_lengths = _batch_effective_lengths(batch)
+                cache_batch = _prepare_token_cache_batch(
+                    batch,
+                    batch_lengths,
+                    layout=storage_layout,
+                    precompute_rosa=precompute_rosa,
                 )
-            except Exception:
-                processed = None
-            if processed is None:
-                skipped += 1
-                continue
-
-            input_ids = processed["input_ids"].detach().cpu().to(dtype=torch.int32).contiguous()
-            labels = processed["labels"].detach().cpu().to(dtype=torch.int32).contiguous()
-            length = min(int(input_ids.numel()), int(labels.numel()))
-            if length <= 0:
-                skipped += 1
-                continue
-            if input_ids.numel() != length:
-                input_ids = input_ids[:length].contiguous()
-            if labels.numel() != length:
-                labels = labels[:length].contiguous()
-
-            offsets.append(total_bytes)
-            lengths.append(length)
-            input_bytes = input_ids.numpy().tobytes()
-            label_bytes = labels.numpy().tobytes()
-            data_file.write(input_bytes)
-            data_file.write(label_bytes)
-            total_bytes += len(input_bytes) + len(label_bytes)
-            if write_loss_weights:
-                loss_weights = processed.get("loss_weights")
-                if loss_weights is None:
-                    loss_weights = torch.ones(length, dtype=torch.float16)
-                else:
-                    loss_weights = (
-                        loss_weights
-                        .detach()
-                        .cpu()
-                        .to(dtype=torch.float16)
-                        .contiguous()
+                for row, length in enumerate(batch_lengths):
+                    length = max(0, int(length))
+                    if length <= 0:
+                        continue
+                    offsets.append(total_bytes)
+                    lengths.append(length)
+                    total_bytes += _append_token_cache_record(
+                        write_buffer,
+                        cache_batch,
+                        row,
+                        length,
+                        layout=storage_layout,
+                        precompute_rosa=precompute_rosa,
                     )
-                    if loss_weights.numel() != length:
-                        loss_weights = loss_weights[:length].contiguous()
-                        if loss_weights.numel() < length:
-                            loss_weights = torch.cat([
-                                loss_weights,
-                                torch.ones(length - loss_weights.numel(), dtype=torch.float16),
-                            ])
-                weight_bytes = loss_weights.numpy().tobytes()
-                data_file.write(weight_bytes)
-                total_bytes += len(weight_bytes)
-            if precompute_rosa:
-                rosa_ids = torch.tensor(
-                    precompute_rosa_ids_for_chunks(
-                        input_ids.tolist(),
-                        vocab_size=rosa_sentinel,
-                        chunk_size=rosa_chunk_size,
-                        rosa_max_ctx=rosa_max_context,
-                    ),
-                    dtype=torch.int32,
-                )
-                rosa_bytes = rosa_ids.numpy().tobytes()
-                data_file.write(rosa_bytes)
-                total_bytes += len(rosa_bytes)
+                    if write_loss_weights:
+                        _append_loss_weight_runs(
+                            cache_batch,
+                            row,
+                            length,
+                            palette=loss_weight_palette,
+                            run_offsets=loss_run_offsets,
+                            run_ends=loss_run_ends,
+                            run_codes=loss_run_codes,
+                        )
+
+                    if len(write_buffer) >= flush_bytes:
+                        data_file.write(write_buffer)
+                        write_buffer.clear()
+            if write_buffer:
+                data_file.write(write_buffer)
+                write_buffer.clear()
+    except Exception:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+    finally:
+        del builder
+
+    skipped = max(0, int(total_samples) - len(lengths)) if total_samples is not None else 0
 
     if not lengths:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise RuntimeError("HF token cache build produced no usable samples.")
 
-    torch.save({
+    index = {
         "format": cache_format,
         "formatter": HF_CACHE_FORMATTER_VERSION,
         "cache_key": cache_key,
@@ -872,12 +1337,19 @@ def materialize_hf_token_cache(args, tokenizer):
         "offsets": torch.tensor(offsets, dtype=torch.long),
         "lengths": torch.tensor(lengths, dtype=torch.int32),
         "has_loss_weights": write_loss_weights,
-        "loss_weight_dtype": "float16" if write_loss_weights else None,
+        "loss_weight_dtype": None,
         "has_rosa_ids": precompute_rosa,
         "rosa_sentinel": int(rosa_sentinel),
         "rosa_max_context": int(rosa_max_context),
         "rosa_training_chunk_size": int(rosa_chunk_size),
-    }, os.path.join(tmp_dir, "index.pt"))
+    }
+    index.update(_token_cache_index_layout(
+        storage_layout,
+        loss_run_offsets,
+        loss_run_ends,
+        loss_run_codes,
+    ))
+    torch.save(index, os.path.join(tmp_dir, "index.pt"))
     with open(os.path.join(tmp_dir, "_SUCCESS"), "w", encoding="utf-8") as f:
         json.dump({
             "format": cache_format,
@@ -890,7 +1362,14 @@ def materialize_hf_token_cache(args, tokenizer):
             "max_length": getattr(args, "max_length", 1024),
             "train_prompt_tokens": bool(getattr(args, "train_prompt_tokens", True)),
             "has_loss_weights": write_loss_weights,
-            "loss_weight_dtype": "float16" if write_loss_weights else None,
+            "loss_weight_dtype": None,
+            "loss_weight_encoding": storage_layout["loss_weight_encoding"],
+            "loss_weight_palette": storage_layout["loss_weight_palette"],
+            "storage_schema_version": storage_layout["storage_schema_version"],
+            "token_dtype": storage_layout["token_dtype"],
+            "label_dtype": storage_layout["label_dtype"],
+            "label_encoding": storage_layout["label_encoding"],
+            "rosa_dtype": storage_layout["rosa_dtype"],
             "has_rosa_ids": precompute_rosa,
             "rosa_max_context": int(rosa_max_context),
             "rosa_training_chunk_size": int(rosa_chunk_size),
@@ -906,11 +1385,263 @@ def materialize_hf_token_cache(args, tokenizer):
     return cache_dir
 
 
+def _local_token_cache_payload(args):
+    source_arg = os.path.abspath(os.path.expanduser(args.train))
+    source_is_directory = os.path.isdir(source_arg)
+    source_root = source_arg if source_is_directory else os.path.dirname(source_arg)
+    source_files = []
+    for path in _jsonl_source_files(args.train):
+        resolved = os.path.abspath(os.path.expanduser(path))
+        stat = os.stat(resolved)
+        source_files.append({
+            # Keep cache keys portable across a CPU preprocessing machine and
+            # the rented GPU host. Size/mtime plus the source-relative shard
+            # layout still invalidates ordinary edits without hashing 5B tokens.
+            "relative_path": os.path.normcase(os.path.relpath(resolved, source_root)),
+            "size": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns),
+        })
+    payload = _hf_cache_key_payload(
+        args,
+        format_name=_hf_token_cache_format(args),
+    )
+    payload.pop("dataset", None)
+    payload.pop("config", None)
+    payload.pop("split", None)
+    payload["source_kind"] = "local-jsonl"
+    payload["source_layout"] = "directory" if source_is_directory else "single-file"
+    payload["source_files"] = source_files
+    return payload
+
+
+def materialize_local_token_cache(args, tokenizer):
+    """Build/reuse the mmap token cache for local JSONL exactly once."""
+    cache_root = (
+        getattr(args, "local_token_cache_dir", None)
+        or getattr(args, "hf_token_cache_dir", None)
+        or os.path.join(os.getcwd(), ".hierarchos_token_cache")
+    )
+    payload = _local_token_cache_payload(args)
+    cache_key = hashlib.sha1(
+        json.dumps(payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
+    cache_dir = os.path.join(cache_root, "local-" + cache_key)
+    success_path = os.path.join(cache_dir, "_SUCCESS")
+    index_path = os.path.join(cache_dir, "index.pt")
+    data_path = os.path.join(cache_dir, "tokens.bin")
+
+    if (
+        not getattr(args, "refresh_local_token_cache", False)
+        and os.path.exists(success_path)
+        and os.path.exists(index_path)
+        and os.path.exists(data_path)
+    ):
+        print(f"INFO: Reusing local JSONL random-access token cache from {cache_dir}")
+        return cache_dir
+
+    tmp_dir = cache_dir + ".tmp"
+    if os.path.exists(tmp_dir):
+        shutil.rmtree(tmp_dir)
+    if getattr(args, "refresh_local_token_cache", False) and os.path.exists(cache_dir):
+        shutil.rmtree(cache_dir)
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    build_batch_size = max(
+        1,
+        int(
+            getattr(args, "token_cache_build_batch_size", 0)
+            or min(512, max(64, int(getattr(args, "batch_size", 1) or 1) * 4))
+        ),
+    )
+    build_workers = max(0, int(getattr(args, "num_workers", 0) or 0))
+    text_column, prompt_column, completion_column = _local_text_columns(args)
+    precompute_rosa = bool(getattr(args, "use_rosa", True))
+    rosa_sentinel = _tokenizer_vocab_size(tokenizer)
+    rosa_chunk_size = int(getattr(args, "training_chunk_size", 256) or 256)
+    rosa_max_context = int(getattr(args, "rosa_max_context", 512) or 512)
+    write_loss_weights = _uses_weighted_token_loss(args)
+    storage_layout = _token_cache_storage_layout(
+        args,
+        tokenizer,
+        has_rosa_ids=precompute_rosa,
+        has_loss_weights=write_loss_weights,
+    )
+    loss_run_offsets = array("q", [0])
+    loss_run_ends = array("i")
+    loss_run_codes = array("B")
+    loss_weight_palette = (
+        torch.tensor(storage_layout["loss_weight_palette"], dtype=torch.float32)
+        if write_loss_weights else None
+    )
+    print(
+        "INFO: Building local JSONL random-access token cache with "
+        f"batch_size={build_batch_size}, workers={build_workers}..."
+    )
+    builder = create_dataloader_for_jsonl(
+        args.train,
+        tokenizer,
+        args.max_length,
+        build_batch_size,
+        tokenizer.pad_token_id,
+        num_workers=build_workers,
+        kayla_mode=args.kayla,
+        text_column=text_column,
+        prompt_column=prompt_column,
+        completion_column=completion_column,
+        alpaca_mode=getattr(args, "alpaca", False),
+        train_prompt_tokens=getattr(args, "train_prompt_tokens", True),
+        **_loss_weight_kwargs(args),
+        **_response_quality_kwargs(args),
+        precompute_rosa=precompute_rosa,
+        rosa_vocab_size=rosa_sentinel,
+        rosa_chunk_size=rosa_chunk_size,
+        rosa_max_context=rosa_max_context,
+        use_length_bucketing=False,
+        device=torch.device("cpu"),
+        prefetch_factor=getattr(args, "prefetch_factor", None),
+        in_order=False,
+    )
+
+    offsets = array("q")
+    lengths = array("i")
+    total_bytes = 0
+    write_buffer = bytearray()
+    flush_bytes = max(
+        1 << 20,
+        int(getattr(args, "token_cache_write_buffer_mb", 64) or 64) * (1 << 20),
+    )
+    total_hint = getattr(args, "dataset_size", None)
+    tmp_data_path = os.path.join(tmp_dir, "tokens.bin")
+
+    try:
+        with open(tmp_data_path, "wb", buffering=flush_bytes) as data_file:
+            progress = tqdm(
+                builder,
+                desc="Caching local JSONL",
+                unit="batch",
+                total=(
+                    _steps_from_samples(total_hint, build_batch_size)
+                    if total_hint else None
+                ),
+            )
+            for batch in progress:
+                if batch is None:
+                    continue
+                batch_lengths = _batch_effective_lengths(batch)
+                cache_batch = _prepare_token_cache_batch(
+                    batch,
+                    batch_lengths,
+                    layout=storage_layout,
+                    precompute_rosa=precompute_rosa,
+                )
+                for row, length in enumerate(batch_lengths):
+                    length = max(0, int(length))
+                    if length <= 0:
+                        continue
+                    offsets.append(total_bytes)
+                    lengths.append(length)
+                    total_bytes += _append_token_cache_record(
+                        write_buffer,
+                        cache_batch,
+                        row,
+                        length,
+                        layout=storage_layout,
+                        precompute_rosa=precompute_rosa,
+                    )
+                    if write_loss_weights:
+                        _append_loss_weight_runs(
+                            cache_batch,
+                            row,
+                            length,
+                            palette=loss_weight_palette,
+                            run_offsets=loss_run_offsets,
+                            run_ends=loss_run_ends,
+                            run_codes=loss_run_codes,
+                        )
+
+                    if len(write_buffer) >= flush_bytes:
+                        data_file.write(write_buffer)
+                        write_buffer.clear()
+            if write_buffer:
+                data_file.write(write_buffer)
+                write_buffer.clear()
+    except Exception:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+    finally:
+        del builder
+
+    if not lengths:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise RuntimeError("Local JSONL token cache build produced no usable samples.")
+
+    index = {
+        "format": _hf_token_cache_format(args),
+        "formatter": HF_CACHE_FORMATTER_VERSION,
+        "cache_key": cache_key,
+        "cache_payload": payload,
+        "offsets": torch.tensor(offsets, dtype=torch.long),
+        "lengths": torch.tensor(lengths, dtype=torch.int32),
+        "has_loss_weights": write_loss_weights,
+        "loss_weight_dtype": None,
+        "has_rosa_ids": precompute_rosa,
+        "rosa_sentinel": int(rosa_sentinel),
+        "rosa_max_context": int(rosa_max_context),
+        "rosa_training_chunk_size": int(rosa_chunk_size),
+    }
+    index.update(_token_cache_index_layout(
+        storage_layout,
+        loss_run_offsets,
+        loss_run_ends,
+        loss_run_codes,
+    ))
+    torch.save(index, os.path.join(tmp_dir, "index.pt"))
+    with open(os.path.join(tmp_dir, "_SUCCESS"), "w", encoding="utf-8") as success_file:
+        json.dump({
+            "format": _hf_token_cache_format(args),
+            "formatter": HF_CACHE_FORMATTER_VERSION,
+            "cache_key": cache_key,
+            "cache_payload": payload,
+            "samples": len(lengths),
+            "bytes": total_bytes,
+            "build_batch_size": build_batch_size,
+            "build_workers": build_workers,
+            "has_loss_weights": write_loss_weights,
+            "loss_weight_dtype": None,
+            "loss_weight_encoding": storage_layout["loss_weight_encoding"],
+            "loss_weight_palette": storage_layout["loss_weight_palette"],
+            "storage_schema_version": storage_layout["storage_schema_version"],
+            "token_dtype": storage_layout["token_dtype"],
+            "label_dtype": storage_layout["label_dtype"],
+            "label_encoding": storage_layout["label_encoding"],
+            "rosa_dtype": storage_layout["rosa_dtype"],
+            "has_rosa_ids": precompute_rosa,
+        }, success_file, indent=2)
+
+    if os.path.exists(cache_dir):
+        shutil.rmtree(cache_dir)
+    os.replace(tmp_dir, cache_dir)
+    print(
+        f"INFO: Local JSONL token cache ready in {cache_dir} "
+        f"({len(lengths)} samples, {total_bytes / (1024 ** 3):.2f} GiB)."
+    )
+    return cache_dir
+
+
 def create_hf_training_dataloader(args, tokenizer, device):
+    resolve_hf_dataset_revision(args, announce=not bool(
+        getattr(args, "_resolved_hf_dataset_revision", None)
+    ))
+
     def create_indexed_hf_dataloader(reason=None):
         if reason:
             print(f"INFO: {reason}")
-        hf_dataset = load_hf_dataset(args.hf_dataset, args.hf_dataset_config, split=args.hf_dataset_split)
+        hf_dataset = load_hf_dataset(
+            args.hf_dataset,
+            args.hf_dataset_config,
+            split=args.hf_dataset_split,
+            revision=_hf_revision_for_load(args),
+        )
         dataset = HuggingFaceMapStyleDataset(
             hf_dataset,
             tokenizer,
@@ -967,6 +1698,7 @@ def create_hf_training_dataloader(args, tokenizer, device):
                 args.hf_dataset_config,
                 split=args.hf_dataset_split,
                 streaming=True,
+                revision=_hf_revision_for_load(args),
             )
             hf_num_workers = args.num_workers
             hf_num_shards = getattr(hf_dataset, "num_shards", None)
@@ -1029,6 +1761,27 @@ def create_hf_training_dataloader(args, tokenizer, device):
 def create_local_training_dataloader(args, tokenizer, device):
     text_column, prompt_column, completion_column = _local_text_columns(args)
     if getattr(args, "streaming_datasets", True) and _is_jsonl_source(args.train):
+        if getattr(args, "local_token_cache", False):
+            cache_dir = materialize_local_token_cache(args, tokenizer)
+            cache_length_bucketing = _length_bucketing_enabled(args, default=True)
+            if (
+                cache_length_bucketing
+                and getattr(args, "length_bucket_size", None) is None
+                and getattr(args, "auto_length_bucket_size", True)
+            ):
+                auto_tune_length_bucket_size_from_token_cache(args, cache_dir)
+            print("INFO: Using local JSONL random-access binary token cache.")
+            return create_dataloader_for_tokenized_cache(
+                cache_dir,
+                args.max_length,
+                args.batch_size,
+                tokenizer.pad_token_id,
+                num_workers=args.num_workers,
+                use_length_bucketing=cache_length_bucketing,
+                bucket_size=getattr(args, "length_bucket_size", None),
+                device=device,
+                prefetch_factor=args.prefetch_factor,
+            )
         print("INFO: Local JSONL dataset streaming enabled.")
         return create_dataloader_for_jsonl(
             args.train,
@@ -1136,7 +1889,7 @@ def validate_tokenizer_vocab(tokenizer, config, source: str = "model"):
         )
 
 
-def resolve_num_workers(requested_workers, device, batch_size):
+def resolve_num_workers(requested_workers, device, batch_size, *, token_cache_only=False):
     requested_workers = int(requested_workers)
     if requested_workers >= 0:
         return requested_workers
@@ -1153,6 +1906,11 @@ def resolve_num_workers(requested_workers, device, batch_size):
             by_cpu = max(4, by_cpu)
         by_batch = max(1, int(batch_size or 1) * 2)
         return min(target, by_cpu, by_batch)
+
+    if token_cache_only:
+        # Cache-only preprocessing has no model competing for CPU cores. A modest
+        # pool speeds tokenizer work while avoiding RAM/thread oversubscription.
+        return min(8, max(1, cpu_count - 1), max(1, int(batch_size or 1)))
 
     # CPU and DirectML training usually want the cores for model math. Users can
     # still override this for tokenizer-heavy Hugging Face datasets.
@@ -1177,6 +1935,7 @@ _CONTINUATION_SKIP_CONFIG_KEYS = {
     "device",
     "refresh_hf_token_cache",
     "refresh_hf_shards",
+    "refresh_local_token_cache",
     "max_ce_loss_for_backward",
     "startup_weight_max_abs",
 }
@@ -1187,6 +1946,9 @@ _CONTINUATION_SUMMARY_KEYS = (
     "alpaca",
     "max_length",
     "training_chunk_size",
+    "full_sample_bptt",
+    "full_sample_activation_checkpointing",
+    "full_sample_checkpoint_segment_size",
     "batch_size",
     "starting_lr",
     "min_lr",
@@ -1487,6 +2249,7 @@ def main():
     path_group.add_argument("--hf_dataset", type=str, default=None, help="Name or path to a Hugging Face dataset.")
     path_group.add_argument("--hf_dataset_config", type=str, default=None, help="Optional configuration name for the HF dataset.")
     path_group.add_argument("--hf_dataset_split", type=str, default="train", help="Dataset split to use.")
+    path_group.add_argument("--hf-dataset-revision", "--hf_dataset_revision", dest="hf_dataset_revision", type=str, default=None, help="HF dataset commit/tag/branch. Hub datasets are automatically pinned to a commit SHA before token-cache lookup.")
     path_group.add_argument("--text_column", type=str, default=None, help="Column name for text completion data.")
     path_group.add_argument("--prompt_column", type=str, default=None, help="Column name for prompt/instruction.")
     path_group.add_argument("--completion_column", type=str, default=None, help="Column name for completion/response.")
@@ -1663,8 +2426,58 @@ def main():
         help="When resuming, ignore optimizer/scheduler/scaler state and use the current LR schedule args.",
     )
     train_group.add_argument("--persist-state", action="store_true", default=False, help="Persist RNN/LTM states between batches. Default: False.")
-    train_group.add_argument("--no-persist-state", dest="persist_state", action="store_false", help="Disable state persistence between chunks.")
+    train_group.add_argument("--no-persist-state", dest="persist_state", action="store_false", help="Disable recurrent-value persistence between unrelated DataLoader batches; within-sample recurrence remains active.")
     train_group.add_argument("--training-chunk-size", "--training_chunk_size", type=int, default=256, help="TBPTT chunk size. Default 256 targets 96GB Blackwell CUDA runs; use 128 if memory gets tight.")
+    full_bptt_group = train_group.add_mutually_exclusive_group()
+    full_bptt_group.add_argument(
+        "--full-sample-bptt",
+        "--full_sample_bptt",
+        dest="full_sample_bptt",
+        action="store_true",
+        default=False,
+        help=(
+            "Use one attached autograd graph across every trimmed sample (exact per-sample BPTT). "
+            "Disables recurrent detachment and cross-sample state persistence without changing "
+            "training_chunk_size cache/compile metadata."
+        ),
+    )
+    full_bptt_group.add_argument(
+        "--no-full-sample-bptt",
+        "--no_full_sample_bptt",
+        dest="full_sample_bptt",
+        action="store_false",
+        help="Disable an inherited full-sample BPTT setting and use configured TBPTT chunking.",
+    )
+    full_checkpoint_group = train_group.add_mutually_exclusive_group()
+    full_checkpoint_group.add_argument(
+        "--full-sample-activation-checkpointing",
+        "--full_sample_activation_checkpointing",
+        dest="full_sample_activation_checkpointing",
+        action="store_true",
+        help=(
+            "Recompute attached temporal segments during one full-sample backward "
+            "to bound activation VRAM without truncating gradients."
+        ),
+    )
+    full_checkpoint_group.add_argument(
+        "--no-full-sample-activation-checkpointing",
+        "--no_full_sample_activation_checkpointing",
+        dest="full_sample_activation_checkpointing",
+        action="store_false",
+        help="Keep full-sample activations instead of recomputing them during backward.",
+    )
+    train_group.add_argument(
+        "--full-sample-checkpoint-segment-size",
+        "--full_sample_checkpoint_segment_size",
+        dest="full_sample_checkpoint_segment_size",
+        type=int,
+        default=128,
+        help=(
+            "Tokens per attached activation-checkpoint segment in full-sample BPTT. "
+            "This bounds activation memory without detaching gradients and does not "
+            "change training_chunk_size cache/ROSA/LTM metadata."
+        ),
+    )
     train_group.add_argument("--cuda-loss-chunk-rows", "--cuda_loss_chunk_rows", type=int, default=0, help="Rows per lm_head loss chunk on CUDA (0 = auto).")
     train_group.add_argument("--no-cuda-chunked-lm-loss", dest="cuda_chunked_lm_loss", action="store_false", help="Disable CUDA chunked LM loss and return full logits during training.")
     train_group.add_argument("--cpu-loss-chunk-rows", "--cpu_loss_chunk_rows", type=int, default=0, help="Rows per lm_head loss chunk on CPU (0 = all supervised rows).")
@@ -1677,6 +2490,7 @@ def main():
         ltm_cpu_gather_retrieval=True,
         ltm_cpu_sparse_update=True,
         memory_token_routers=True,
+        full_sample_activation_checkpointing=None,
     )
     train_group.add_argument("--debug-numerics", action="store_true", help="Enable per-token NaN/Inf debug checks. Slower on CUDA.")
     train_group.add_argument("--save-steps", type=int, default=0, help="Save a checkpoint/adapter every N steps during training/finetuning (0 to disable).")
@@ -1685,11 +2499,14 @@ def main():
     train_group.add_argument("--no-padding-metrics", dest="padding_metrics", action="store_false", help="Disable tok_eff/seq padding diagnostics during training.")
     train_group.add_argument("--num_workers", type=int, default=-1, help="DataLoader workers (-1 = auto; CUDA uses prefetched workers, CPU/DML uses 0).")
     train_group.add_argument("--prefetch-factor", "--prefetch_factor", dest="prefetch_factor", type=int, default=None, help="Batches prefetched per DataLoader worker (auto keeps total queued batches tied to worker count).")
+    train_group.add_argument("--cuda-prefetch", dest="cuda_prefetch", action="store_true", help="Overlap pinned host-to-device transfer for the next batch on a dedicated CUDA stream.")
+    train_group.add_argument("--no-cuda-prefetch", dest="cuda_prefetch", action="store_false", help="Disable dedicated-stream CUDA batch lookahead for diagnostics.")
     train_group.add_argument("--pt-cache-size", "--pt_cache_size", dest="pt_cache_size", type=int, default=2, help="Number of .pt chunk files to keep hot per worker for --pre_pt_dataset.")
     train_group.add_argument("--no-length-bucketing", dest="length_bucketing", action="store_false", help="Disable length-aware batching for training datasets.")
     train_group.add_argument("--length-bucket-size", "--length_bucket_size", dest="length_bucket_size", type=int, default=None, help="Samples per length bucket/window. Manual override; by default CUDA HF token-cache runs auto-tune this from cached sample lengths.")
     train_group.add_argument("--no-auto-length-bucket-size", dest="auto_length_bucket_size", action="store_false", help="Disable startup auto-tuning of HF token-cache length bucket size.")
     train_group.add_argument("--length-bucket-auto-tolerance", "--length_bucket_auto_tolerance", dest="length_bucket_auto_tolerance", type=float, default=0.005, help="Pick the smallest bucket within this absolute token-efficiency margin of the best auto-tuned bucket. Use 0 for max padding reduction.")
+    train_group.add_argument("--length-bucket-auto-sample-size", "--length_bucket_auto_sample_size", dest="length_bucket_auto_sample_size", type=int, default=1000000, help="Maximum cached lengths sampled once for bucket auto-tuning (0 = all); the result is persisted in the token cache.")
     train_group.add_argument("--no-streaming-datasets", dest="streaming_datasets", action="store_false", help="Disable streaming for raw JSONL/Hugging Face datasets and use map-style loading.")
     train_group.add_argument("--hf-streaming-shuffle-buffer", "--hf_streaming_shuffle_buffer", dest="hf_streaming_shuffle_buffer", type=int, default=10000, help="Buffered shuffle size for Hugging Face streaming datasets.")
     train_group.add_argument("--hf-auto-shard", dest="hf_auto_shard", action="store_true", help="Opt into local tokenized shard caching for single-shard HF streaming datasets.")
@@ -1698,6 +2515,7 @@ def main():
     train_group.set_defaults(length_bucketing=True)
     train_group.set_defaults(auto_length_bucket_size=True)
     train_group.set_defaults(padding_metrics=True)
+    train_group.set_defaults(cuda_prefetch=True)
     train_group.add_argument("--hf-shard-cache-dir", "--hf_shard_cache_dir", dest="hf_shard_cache_dir", type=str, default=None, help="Directory for cached local HF tokenized shard files.")
     train_group.add_argument("--refresh-hf-shards", "--refresh_hf_shards", dest="refresh_hf_shards", action="store_true", help="Rebuild cached local HF tokenized shards before training.")
     train_group.add_argument("--hf-cache-chunks-per-file", "--hf_cache_chunks_per_file", dest="hf_cache_chunks_per_file", type=int, default=2048, help="Tokenized samples per cached HF .pt shard chunk.")
@@ -1705,10 +2523,18 @@ def main():
     train_group.add_argument("--no-hf-token-cache", "--no_hf_token_cache", dest="hf_token_cache", action="store_false", help="Disable the default HF random-access token cache.")
     train_group.add_argument("--hf-token-cache-dir", "--hf_token_cache_dir", dest="hf_token_cache_dir", type=str, default=None, help="Directory for random-access HF token caches.")
     train_group.add_argument("--refresh-hf-token-cache", "--refresh_hf_token_cache", dest="refresh_hf_token_cache", action="store_true", help="Rebuild the random-access HF token cache before training.")
+    train_group.add_argument("--local-token-cache", dest="local_token_cache", action="store_true", help="Build/reuse a random-access binary token cache for local JSONL instead of tokenizing every epoch.")
+    train_group.add_argument("--no-local-token-cache", dest="local_token_cache", action="store_false", help="Stream and tokenize local JSONL on every epoch without a binary cache.")
+    train_group.add_argument("--local-token-cache-dir", "--local_token_cache_dir", dest="local_token_cache_dir", type=str, default=None, help="Directory for fingerprinted local JSONL token caches.")
+    train_group.add_argument("--refresh-local-token-cache", "--refresh_local_token_cache", dest="refresh_local_token_cache", action="store_true", help="Rebuild the local JSONL token cache once.")
+    train_group.add_argument("--token-cache-build-batch-size", type=int, default=0, help="Local-cache preprocessing batch size (0 = auto, up to 512).")
+    train_group.add_argument("--token-cache-write-buffer-mb", type=int, default=64, help="Buffered binary-cache write size in MiB.")
+    train_group.add_argument("--token-cache-only", action="store_true", help="Build/reuse the selected token cache and exit before allocating the model (useful on a cheaper CPU machine).")
     train_group.add_argument("--amp", action="store_true", help="Enable mixed precision (auto-enabled on CUDA).")
     train_group.add_argument("--no-amp", dest="amp", action="store_false", help="Explicitly disable mixed precision.")
     train_group.add_argument("--dataset-size", type=int, default=None, help="Force a specific dataset size (total samples) to calculate steps for the LR scheduler.")
     train_group.set_defaults(hf_token_cache=True)
+    train_group.set_defaults(local_token_cache=True)
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile (auto-enabled on CUDA).")
     parser.add_argument("--no-compile", "--no_compile", dest="compile", action="store_false", help="Explicitly disable torch.compile, including CUDA auto-enable. Useful for stability diagnostics/rescue resumes.")
     parser.add_argument("--force-compile", action="store_true")
@@ -1856,12 +2682,24 @@ def main():
     if args.compile or args.force_compile:
         setup_msvc_environment()
     pt_device = pick_device(args)
-    args.num_workers = resolve_num_workers(args.num_workers, pt_device, args.batch_size)
+    args.num_workers = resolve_num_workers(
+        args.num_workers,
+        pt_device,
+        args.batch_size,
+        token_cache_only=bool(getattr(args, "token_cache_only", False)),
+    )
+    random_access_token_cache = (
+        bool(args.hf_dataset) and bool(getattr(args, "hf_token_cache", False))
+    ) or (
+        bool(getattr(args, "train", None))
+        and _is_jsonl_source(args.train)
+        and bool(getattr(args, "local_token_cache", False))
+    )
     args.length_bucket_size, bucket_message = resolve_length_bucket_size(
         args.length_bucket_size,
         pt_device,
         args.batch_size,
-        hf_token_cache=getattr(args, "hf_token_cache", False) and _length_bucketing_enabled(args),
+        hf_token_cache=random_access_token_cache and _length_bucketing_enabled(args),
         auto_tune=getattr(args, "auto_length_bucket_size", True),
     )
     if bucket_message:
@@ -1888,7 +2726,13 @@ def main():
         max_found = 0
         if args.hf_dataset:
             print(f"Scanning HF dataset: {args.hf_dataset}...")
-            temp_ds = load_hf_dataset(args.hf_dataset, args.hf_dataset_config, split=args.hf_dataset_split)
+            resolve_hf_dataset_revision(args, announce=True)
+            temp_ds = load_hf_dataset(
+                args.hf_dataset,
+                args.hf_dataset_config,
+                split=args.hf_dataset_split,
+                revision=_hf_revision_for_load(args),
+            )
             for sample in tqdm(temp_ds, desc="Scanning HF"):
                 processed = process_text_sample(
                     tokenizer, sample, 9999, args.kayla,
@@ -1942,6 +2786,20 @@ def main():
         if max_found > 0:
             args.max_length = (max_found + 16 + 7) & -8 # Align to 8
             print(f"Auto-scan found max length {max_found}. Setting max_length={args.max_length}")
+
+    if getattr(args, "token_cache_only", False):
+        if args.mode not in ("train", "finetune"):
+            print("ERROR: --token-cache-only requires train or finetune mode.")
+            sys.exit(1)
+        if args.hf_dataset:
+            cache_dir = materialize_hf_token_cache(args, tokenizer)
+        elif args.train and isinstance(args.train, str) and _is_jsonl_source(args.train):
+            cache_dir = materialize_local_token_cache(args, tokenizer)
+        else:
+            print("ERROR: --token-cache-only requires --hf-dataset or a JSONL --train source.")
+            sys.exit(1)
+        print(f"INFO: Token-cache-only preparation complete: {cache_dir}")
+        return
 
     # Execution
     if args.mode == "train":

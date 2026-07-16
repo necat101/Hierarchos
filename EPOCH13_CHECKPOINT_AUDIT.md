@@ -166,7 +166,8 @@ beginning if validated Hebbian memory is a release goal.
 
 ## Verification
 
-- `python -m pytest -q`: `230 passed, 3 skipped`
+- `python -m pytest -q`: `283 passed, 4 skipped` after the exact-BPTT,
+  compact-cache, loader, clipping, and inference-parity changes
 - `python tools/check_architecture_integrity.py`: `65 passed`, `1` documented
   legacy-quantization warning, `0` failures
 - Real epoch-13 checkpoint audit: strict load, `270`-token boundary parity, finite

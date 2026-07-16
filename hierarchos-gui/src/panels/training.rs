@@ -441,6 +441,39 @@ fn draw_config_section(ui: &mut egui::Ui, state: &mut TrainingState) {
                 );
                 ui.checkbox(&mut state.config.amp, "AMP");
                 ui.end_row();
+
+                // Row 5
+                ui.label(
+                    RichText::new("Full-Sample BPTT")
+                        .color(HierarchosColors::TEXT_SECONDARY)
+                        .size(12.0),
+                );
+                if ui
+                    .checkbox(&mut state.config.full_sample_bptt, "Exact coherence")
+                    .on_hover_text(
+                        "Use one attached gradient graph per trimmed sample. This disables "
+                            .to_owned()
+                            + "cross-sample recurrent persistence and token-level detachment.",
+                    )
+                    .changed()
+                    && state.config.full_sample_bptt
+                {
+                    state.config.persist_state = false;
+                }
+                ui.label(
+                    RichText::new("Activation Recompute")
+                        .color(HierarchosColors::TEXT_SECONDARY)
+                        .size(12.0),
+                );
+                ui.add_enabled(
+                    state.config.full_sample_bptt,
+                    egui::Checkbox::new(
+                        &mut state.config.full_sample_activation_checkpointing,
+                        "Checkpoint",
+                    ),
+                )
+                .on_hover_text("Recompute the full forward during backward to save VRAM without truncating gradients.");
+                ui.end_row();
             });
 
         ui.add_space(8.0);

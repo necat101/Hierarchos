@@ -154,6 +154,7 @@ fn default_cpu_threads() -> u32 {
 
 /// Training configuration sent to the backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TrainingConfig {
     pub data_path: String,
     pub epochs: u32,
@@ -161,6 +162,8 @@ pub struct TrainingConfig {
     pub learning_rate: f64,
     pub min_lr: f64,
     pub training_chunk_size: u32,
+    pub full_sample_bptt: bool,
+    pub full_sample_activation_checkpointing: bool,
     pub accumulation_steps: u32,
     pub grad_clip: f32,
     pub persist_state: bool,
@@ -191,6 +194,8 @@ impl Default for TrainingConfig {
             learning_rate: 1e-4,
             min_lr: 1e-6,
             training_chunk_size: 256,
+            full_sample_bptt: false,
+            full_sample_activation_checkpointing: true,
             accumulation_steps: 1,
             grad_clip: 1.0,
             persist_state: false,
@@ -803,6 +808,8 @@ impl PythonBridge {
                 "learning_rate": config.learning_rate,
                 "min_lr": config.min_lr,
                 "training_chunk_size": config.training_chunk_size,
+                "full_sample_bptt": config.full_sample_bptt,
+                "full_sample_activation_checkpointing": config.full_sample_activation_checkpointing,
                 "accumulation_steps": config.accumulation_steps,
                 "grad_clip": config.grad_clip,
                 "persist_state": config.persist_state,

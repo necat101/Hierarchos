@@ -1,0 +1,392 @@
+{
+  "environment": {
+    "torch_version": "2.6.0+cu124",
+    "device": "cpu",
+    "cuda_available": false,
+    "cuda_version": "12.4",
+    "device_name": null,
+    "device_capability": null,
+    "cuda_arch_list": [],
+    "sm_120_supported": false
+  },
+  "config": {
+    "samples": 1024,
+    "batch_size": 64,
+    "min_length": 64,
+    "max_length": 256,
+    "vocab_size": 512,
+    "hidden_size": 32,
+    "workers": 0,
+    "prefetch_factor": null,
+    "bucket_size": 0,
+    "no_length_bucketing": false,
+    "warmup_batches": 2,
+    "batches": 5,
+    "repeats": 3,
+    "parity_batches": 3,
+    "learning_rate": 0.001,
+    "device": "cpu",
+    "amp_dtype": "auto",
+    "seed": 1234,
+    "require_blackwell": false,
+    "skip_loader": false,
+    "skip_training": false,
+    "skip_parity": false,
+    "json_out": "benchmark_results/training_pipeline_compact_cpu_final.json"
+  },
+  "setup": {
+    "dummy_generation_seconds": 0.0099465000021155,
+    "cache_build_seconds": 0.025111000002652872,
+    "cache_samples": 1024,
+    "cache_bytes": 666464
+  },
+  "pipelines": {
+    "in_memory_reference": {
+      "loader": {
+        "median_seconds": 0.006432000001950655,
+        "median_samples_per_second": 49751.24376600629,
+        "median_valid_tokens_per_second": 7722792.286215096,
+        "median_padded_tokens_per_second": 8079601.987599422,
+        "median_supervised_tokens_per_second": 7673041.04244909,
+        "median_token_efficiency": 0.9641818936877077,
+        "runs": [
+          {
+            "seconds": 0.006432000001950655,
+            "batches": 5,
+            "samples": 320,
+            "valid_tokens": 49673,
+            "padded_tokens": 51968,
+            "supervised_tokens": 49353,
+            "samples_per_second": 49751.24376600629,
+            "valid_tokens_per_second": 7722792.286215096,
+            "padded_tokens_per_second": 8079601.987599422,
+            "supervised_tokens_per_second": 7673041.04244909,
+            "token_efficiency": 0.9558382081280788
+          },
+          {
+            "seconds": 0.006357500002195593,
+            "batches": 5,
+            "samples": 320,
+            "valid_tokens": 37148,
+            "padded_tokens": 38528,
+            "supervised_tokens": 36828,
+            "samples_per_second": 50334.25086739858,
+            "valid_tokens_per_second": 5843177.347569132,
+            "padded_tokens_per_second": 6060243.804434789,
+            "supervised_tokens_per_second": 5792843.096701734,
+            "token_efficiency": 0.9641818936877077
+          },
+          {
+            "seconds": 0.0070071000009193085,
+            "batches": 5,
+            "samples": 320,
+            "valid_tokens": 63475,
+            "padded_tokens": 65600,
+            "supervised_tokens": 63155,
+            "samples_per_second": 45667.965343439806,
+            "valid_tokens_per_second": 9058669.063046379,
+            "padded_tokens_per_second": 9361932.89540516,
+            "supervised_tokens_per_second": 9013001.09770294,
+            "token_efficiency": 0.9676067073170732
+          }
+        ],
+        "first_batch_seconds": 0.001384800001687836,
+        "first_batch_all_cpu_tensors_pinned": false
+      },
+      "training": {
+        "median_seconds": 0.23366710000118474,
+        "median_samples_per_second": 1369.4696429166859,
+        "median_valid_tokens_per_second": 217313.62769087686,
+        "median_padded_tokens_per_second": 227157.56629388558,
+        "median_supervised_tokens_per_second": 215791.1238953414,
+        "median_token_efficiency": 0.9639953758949881,
+        "runs": [
+          {
+            "seconds": 0.2526311000037822,
+            "batches": 5,
+            "samples": 320,
+            "valid_tokens": 53134,
+            "padded_tokens": 54720,
+            "supervised_tokens": 52814,
+            "samples_per_second": 1266.6690680411446,
+            "valid_tokens_per_second": 210322.4820665568,
+            "padded_tokens_per_second": 216600.41063503572,
+            "supervised_tokens_per_second": 209055.81299851567,
+            "token_efficiency": 0.971016081871345
+          },
+          {
+            "seconds": 0.2101801000026171,
+            "batches": 5,
+            "samples": 320,
+            "valid_tokens": 45675,
+            "padded_tokens": 47744,
+            "supervised_tokens": 45355,
+            "samples_per_second": 1522.5037955354262,
+            "valid_tokens_per_second": 217313.62769087686,
+            "padded_tokens_per_second": 227157.56629388558,
+            "supervised_tokens_per_second": 215791.1238953414,
+            "token_efficiency": 0.9566647117962467
+          },
+          {
+            "seconds": 0.23366710000118474,
+            "batches": 5,
+            "samples": 320,
+            "valid_tokens": 51701,
+            "padded_tokens": 53632,
+            "supervised_tokens": 51381,
+            "samples_per_second": 1369.4696429166859,
+            "valid_tokens_per_second": 221259.21877636117,
+            "padded_tokens_per_second": 229523.11215283655,
+            "supervised_tokens_per_second": 219889.7491334445,
+            "token_efficiency": 0.9639953758949881
+          }
+        ],
+        "amp_dtype": "float32",
+        "final_loss": 6.373478889465332,
+        "peak_cuda_memory_bytes": null
+      }
+    },
+    "legacy_binary_token_cache": {
+      "loader": {
+        "median_seconds": 0.012922400004754309,
+        "median_samples_per_second": 24763.20187289266,
+        "median_valid_tokens_per_second": 3843945.395725616,
+        "median_padded_tokens_per_second": 4021543.9841577676,
+        "median_supervised_tokens_per_second": 3819182.193852723,
+        "median_token_efficiency": 0.9641818936877077,
+        "runs": [
+          {
+            "seconds": 0.012922400004754309,
+            "batches": 5,
+            "samples": 320,
+            "valid_tokens": 49673,
+            "padded_tokens": 51968,
+            "supervised_tokens": 49353,
+            "samples_per_second": 24763.20187289266,
+            "valid_tokens_per_second": 3843945.395725616,
+            "padded_tokens_per_second": 4021543.9841577676,
+            "supervised_tokens_per_second": 3819182.193852723,
+            "token_efficiency": 0.9558382081280788
+          },
+          {
+            "seconds": 0.01258129999769153,
+            "batches": 5,
+            "samples": 320,
+            "valid_tokens": 37148,
+            "padded_tokens": 38528,
+            "supervised_tokens": 36828,
+            "samples_per_second": 25434.57353840342,
+            "valid_tokens_per_second": 2952636.0556394067,
+            "padded_tokens_per_second": 3062322.6540237716,
+            "supervised_tokens_per_second": 2927201.4821010036,
+            "token_efficiency": 0.9641818936877077
+          },
+          {
+            "seconds": 0.013217200001236051,
+            "batches": 5,
+            "samples": 320,
+            "valid_tokens": 63475,
+            "padded_tokens": 65600,
+            "supervised_tokens": 63155,
+            "samples_per_second": 24210.876734109654,
+            "valid_tokens_per_second": 4802454.377180032,
+            "padded_tokens_per_second": 4963229.730492479,
+            "supervised_tokens_per_second": 4778243.500445923,
+            "token_efficiency": 0.9676067073170732
+          }
+        ],
+        "first_batch_seconds": 0.0030886000022292137,
+        "first_batch_all_cpu_tensors_pinned": false
+      },
+      "training": {
+        "median_seconds": 0.2529177999967942,
+        "median_samples_per_second": 1265.2332101736456,
+        "median_valid_tokens_per_second": 202824.51865583612,
+        "median_padded_tokens_per_second": 210720.5119712011,
+        "median_supervised_tokens_per_second": 201603.00614087644,
+        "median_token_efficiency": 0.9639953758949881,
+        "runs": [
+          {
+            "seconds": 0.26197030000184895,
+            "batches": 5,
+            "samples": 320,
+            "valid_tokens": 53134,
+            "padded_tokens": 54720,
+            "supervised_tokens": 52814,
+            "samples_per_second": 1221.5125149596786,
+            "valid_tokens_per_second": 202824.51865583612,
+            "padded_tokens_per_second": 208878.64005810503,
+            "supervised_tokens_per_second": 201603.00614087644,
+            "token_efficiency": 0.971016081871345
+          },
+          {
+            "seconds": 0.22657500000059372,
+            "batches": 5,
+            "samples": 320,
+            "valid_tokens": 45675,
+            "padded_tokens": 47744,
+            "supervised_tokens": 45355,
+            "samples_per_second": 1412.3358711206508,
+            "valid_tokens_per_second": 201588.87785448667,
+            "padded_tokens_per_second": 210720.5119712011,
+            "supervised_tokens_per_second": 200176.541983366,
+            "token_efficiency": 0.9566647117962467
+          },
+          {
+            "seconds": 0.2529177999967942,
+            "batches": 5,
+            "samples": 320,
+            "valid_tokens": 51701,
+            "padded_tokens": 53632,
+            "supervised_tokens": 51381,
+            "samples_per_second": 1265.2332101736456,
+            "valid_tokens_per_second": 204418.1943724614,
+            "padded_tokens_per_second": 212053.08602510302,
+            "supervised_tokens_per_second": 203152.96116228777,
+            "token_efficiency": 0.9639953758949881
+          }
+        ],
+        "amp_dtype": "float32",
+        "final_loss": 6.373478889465332,
+        "peak_cuda_memory_bytes": null
+      }
+    },
+    "binary_token_cache": {
+      "loader": {
+        "median_seconds": 0.011897700002009515,
+        "median_samples_per_second": 26895.954675773653,
+        "median_valid_tokens_per_second": 4175008.614405327,
+        "median_padded_tokens_per_second": 4367903.039345641,
+        "median_supervised_tokens_per_second": 4148112.6597295534,
+        "median_token_efficiency": 0.9641818936877077,
+        "runs": [
+          {
+            "seconds": 0.011897700002009515,
+            "batches": 5,
+            "samples": 320,
+            "valid_tokens": 49673,
+            "padded_tokens": 51968,
+            "supervised_tokens": 49353,
+            "samples_per_second": 26895.954675773653,
+            "valid_tokens_per_second": 4175008.614405327,
+            "padded_tokens_per_second": 4367903.039345641,
+            "supervised_tokens_per_second": 4148112.6597295534,
+            "token_efficiency": 0.9558382081280788
+          },
+          {
+            "seconds": 0.011659800002234988,
+            "batches": 5,
+            "samples": 320,
+            "valid_tokens": 37148,
+            "padded_tokens": 38528,
+            "supervised_tokens": 36828,
+            "samples_per_second": 27444.724604080806,
+            "valid_tokens_per_second": 3185989.4674762306,
+            "padded_tokens_per_second": 3304344.842331329,
+            "supervised_tokens_per_second": 3158544.7428721497,
+            "token_efficiency": 0.9641818936877077
+          },
+          {
+            "seconds": 0.01282080000237329,
+            "batches": 5,
+            "samples": 320,
+            "valid_tokens": 63475,
+            "padded_tokens": 65600,
+            "supervised_tokens": 63155,
+            "samples_per_second": 24959.440903903345,
+            "valid_tokens_per_second": 4950939.098047703,
+            "padded_tokens_per_second": 5116685.385300186,
+            "supervised_tokens_per_second": 4925979.6571438,
+            "token_efficiency": 0.9676067073170732
+          }
+        ],
+        "first_batch_seconds": 0.0025091999996220693,
+        "first_batch_all_cpu_tensors_pinned": false
+      },
+      "training": {
+        "median_seconds": 0.2434450000000652,
+        "median_samples_per_second": 1314.4652796315977,
+        "median_valid_tokens_per_second": 197956.94601908716,
+        "median_padded_tokens_per_second": 206213.70830323515,
+        "median_supervised_tokens_per_second": 196764.74850476286,
+        "median_token_efficiency": 0.9639953758949881,
+        "runs": [
+          {
+            "seconds": 0.26841190000413917,
+            "batches": 5,
+            "samples": 320,
+            "valid_tokens": 53134,
+            "padded_tokens": 54720,
+            "supervised_tokens": 52814,
+            "samples_per_second": 1192.19751432431,
+            "valid_tokens_per_second": 197956.94601908716,
+            "padded_tokens_per_second": 203865.77494945703,
+            "supervised_tokens_per_second": 196764.74850476286,
+            "token_efficiency": 0.971016081871345
+          },
+          {
+            "seconds": 0.23152680000202963,
+            "batches": 5,
+            "samples": 320,
+            "valid_tokens": 45675,
+            "padded_tokens": 47744,
+            "supervised_tokens": 45355,
+            "samples_per_second": 1382.1294122200748,
+            "valid_tokens_per_second": 197277.37782234972,
+            "padded_tokens_per_second": 206213.70830323515,
+            "supervised_tokens_per_second": 195895.24841012966,
+            "token_efficiency": 0.9566647117962467
+          },
+          {
+            "seconds": 0.2434450000000652,
+            "batches": 5,
+            "samples": 320,
+            "valid_tokens": 51701,
+            "padded_tokens": 53632,
+            "supervised_tokens": 51381,
+            "samples_per_second": 1314.4652796315977,
+            "valid_tokens_per_second": 212372.40444447886,
+            "padded_tokens_per_second": 220304.3808662558,
+            "supervised_tokens_per_second": 211057.93916484725,
+            "token_efficiency": 0.9639953758949881
+          }
+        ],
+        "amp_dtype": "float32",
+        "final_loss": 6.373478889465332,
+        "peak_cuda_memory_bytes": null
+      }
+    }
+  },
+  "comparisons": {
+    "binary_cache_loader_speedup": 0.5406086891470027,
+    "binary_cache_training_speedup": 0.9109274375589362,
+    "fused_vs_legacy_loader_speedup": 1.0861258900940285,
+    "fused_vs_legacy_training_speedup": 0.9760010640281191
+  },
+  "parity": {
+    "passed": true,
+    "batch_parity": {
+      "passed": true,
+      "batches_compared": 3,
+      "mismatch": null
+    },
+    "optimizer_parity": {
+      "passed": true,
+      "steps_compared": 3,
+      "reference_losses": [
+        6.409132480621338,
+        6.41334867477417,
+        6.3907928466796875
+      ],
+      "cached_losses": [
+        6.409132480621338,
+        6.41334867477417,
+        6.3907928466796875
+      ],
+      "max_loss_delta": 0.0,
+      "max_parameter_delta": 0.0,
+      "loss_tolerance": 1e-07,
+      "parameter_tolerance": 1e-08
+    }
+  }
+}

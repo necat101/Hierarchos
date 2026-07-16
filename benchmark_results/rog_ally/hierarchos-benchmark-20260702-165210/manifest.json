@@ -1,0 +1,98 @@
+{
+  "requested": [],
+  "suites": [
+    "rog-ally"
+  ],
+  "tasks": [
+    "arc_easy",
+    "hellaswag",
+    "truthfulqa_mc1"
+  ],
+  "benchmarks": [
+    {
+      "key": "arc_easy",
+      "display_name": "ARC-Easy",
+      "category": "commonsense",
+      "modality": "text",
+      "harness_task": "arc_easy",
+      "primary_metric": "acc_norm",
+      "description": "Easier ARC science question split.",
+      "citation_url": "https://arxiv.org/abs/1803.05457",
+      "notes": "",
+      "runnable": true
+    },
+    {
+      "key": "hellaswag",
+      "display_name": "HellaSwag",
+      "category": "commonsense",
+      "modality": "text",
+      "harness_task": "hellaswag",
+      "primary_metric": "acc_norm",
+      "description": "Commonsense natural-language continuation selection.",
+      "citation_url": "https://arxiv.org/abs/1905.07830",
+      "notes": "",
+      "runnable": true
+    },
+    {
+      "key": "truthfulqa_mc1",
+      "display_name": "TruthfulQA MC1",
+      "category": "truthfulness",
+      "modality": "text",
+      "harness_task": "truthfulqa_mc1",
+      "primary_metric": "acc",
+      "description": "Truthfulness under misconception-sensitive questions.",
+      "citation_url": "https://arxiv.org/abs/2109.07958",
+      "notes": "",
+      "runnable": true
+    }
+  ],
+  "external_or_skipped": [],
+  "resolved_lm_eval_tasks": [
+    "arc_easy",
+    "hellaswag",
+    "truthfulqa_mc1"
+  ],
+  "unknown_raw_tasks": [],
+  "runnable_benchmarks": [
+    {
+      "key": "arc_easy",
+      "display_name": "ARC-Easy",
+      "category": "commonsense",
+      "modality": "text",
+      "harness_task": "arc_easy",
+      "primary_metric": "acc_norm",
+      "description": "Easier ARC science question split.",
+      "citation_url": "https://arxiv.org/abs/1803.05457",
+      "notes": "",
+      "runnable": true
+    },
+    {
+      "key": "hellaswag",
+      "display_name": "HellaSwag",
+      "category": "commonsense",
+      "modality": "text",
+      "harness_task": "hellaswag",
+      "primary_metric": "acc_norm",
+      "description": "Commonsense natural-language continuation selection.",
+      "citation_url": "https://arxiv.org/abs/1905.07830",
+      "notes": "",
+      "runnable": true
+    },
+    {
+      "key": "truthfulqa_mc1",
+      "display_name": "TruthfulQA MC1",
+      "category": "truthfulness",
+      "modality": "text",
+      "harness_task": "truthfulqa_mc1",
+      "primary_metric": "acc",
+      "description": "Truthfulness under misconception-sensitive questions.",
+      "citation_url": "https://arxiv.org/abs/2109.07958",
+      "notes": "",
+      "runnable": true
+    }
+  ],
+  "sequential": true,
+  "failed_lm_eval_tasks": [],
+  "generated_at": "20260702-165210",
+  "skipped": []
+}

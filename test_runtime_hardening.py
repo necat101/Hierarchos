@@ -3,6 +3,7 @@ import random
 import tempfile
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 import torch.nn as nn
@@ -230,6 +231,37 @@ def test_loader_allows_tied_alias_and_transient_omissions():
     assert torch.equal(loaded.tok_emb.weight, expected)
     assert loaded.tok_emb.weight.data_ptr() == loaded.lm_head.weight.data_ptr()
     assert torch.count_nonzero(loaded.ltm.fast_vals).item() == 0
+
+
+def test_loader_accepts_legacy_numpy_rng_state_rejected_by_weights_only(tmp_path):
+    """Epoch checkpoints with NumPy RNG state remain loadable as model sources."""
+    config = _tiny_config()
+    model = HierarchosCore(config)
+    expected_weight = model.in_proj.weight.detach().clone()
+    path = tmp_path / "hierarchos_epoch_13.pt"
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "config": dict(config),
+            "completed_epoch": 13,
+            # capture_rng_state() has historically stored this NumPy tuple in
+            # every resumable training checkpoint.
+            "rng_state": {
+                "numpy": np.random.RandomState(13).get_state(),
+            },
+        },
+        path,
+    )
+
+    # Prove this fixture exercises the PyTorch 2.6 weights-only failure from
+    # real pre-v0.21 checkpoints rather than an already-supported payload.
+    with pytest.raises(Exception, match="Weights only load failed|Unsupported global"):
+        torch.load(path, map_location="cpu", weights_only=True)
+
+    loaded, loaded_config = load_full_model_with_config(str(path), "cpu")
+
+    assert torch.equal(loaded.in_proj.weight, expected_weight)
+    assert loaded_config.vocab_size == config.vocab_size
 
 
 def test_loader_rejects_conflicting_tied_alias_and_nonfinite_weight():

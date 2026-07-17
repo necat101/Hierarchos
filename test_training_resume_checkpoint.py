@@ -40,6 +40,10 @@ from hierarchos.utils.checkpoint import sanitize_model_state_dict
 import hierarchos_cli
 
 
+class _UnlistedCheckpointMetadata:
+    pass
+
+
 class _FakeLTM(nn.Module):
     def __init__(self):
         super().__init__()
@@ -668,6 +672,21 @@ def test_cli_model_path_continuation_prefers_checkpoint_config_over_sidecar():
     assert args.hf_dataset == "fresh/dataset"
     assert args.max_length == 8880
     assert args.base_completed_epoch == 9
+
+
+def test_cli_checkpoint_preflight_fails_before_dataset_work_on_unsafe_payload(tmp_path):
+    checkpoint_path = tmp_path / "hierarchos_epoch_13.pt"
+    torch.save(
+        {
+            "model_state_dict": {},
+            "config": {"completed_epoch": 13},
+            "unlisted_metadata": _UnlistedCheckpointMetadata(),
+        },
+        checkpoint_path,
+    )
+
+    with pytest.raises(RuntimeError, match="before dataset preparation"):
+        hierarchos_cli._read_model_config_defaults(str(checkpoint_path))
 
 
 def test_assistant_recovery_defaults_target_large_assistant_sft():

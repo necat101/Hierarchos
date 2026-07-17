@@ -16,6 +16,7 @@ from hierarchos.utils.checkpoint import (
     _infer_arch_flags_from_state_dict,
     _reject_unsupported_rwkv_state_dict,
     _resolve_weights_path,
+    load_checkpoint_payload_compatible,
     save_checkpoint_safely,
     sanitize_model_state_dict,
 )
@@ -2016,15 +2017,10 @@ def _read_model_config_defaults(model_path):
     if os.path.exists(resolved):
         try:
             local_checkpoint_path, _ = _resolve_weights_path(resolved)
-            try:
-                from torch.serialization import safe_globals
-                from hierarchos.utils.checkpoint import AttrDict as CheckpointAttrDict
-                with safe_globals([CheckpointAttrDict]):
-                    local_checkpoint = torch.load(local_checkpoint_path, map_location="cpu", weights_only=True)
-            except (ImportError, AttributeError):
-                local_checkpoint = torch.load(local_checkpoint_path, map_location="cpu")
-            except Exception:
-                local_checkpoint = torch.load(local_checkpoint_path, map_location="cpu", weights_only=False)
+            local_checkpoint = load_checkpoint_payload_compatible(
+                local_checkpoint_path,
+                map_location="cpu",
+            )
             if isinstance(local_checkpoint, dict):
                 if "model_state_dict" in local_checkpoint:
                     state_source = local_checkpoint["model_state_dict"]
@@ -2040,7 +2036,10 @@ def _read_model_config_defaults(model_path):
         except ValueError:
             raise
         except Exception as exc:
-            print(f"WARNING: Could not inspect checkpoint architecture from {resolved}: {exc}")
+            raise RuntimeError(
+                "Could not safely inspect the continuation checkpoint before dataset "
+                f"preparation: {resolved}. {exc}"
+            ) from exc
 
     if local_checkpoint is not None and isinstance(local_checkpoint, dict):
         if isinstance(local_checkpoint.get("config"), dict):
@@ -2058,15 +2057,10 @@ def _read_model_config_defaults(model_path):
 
     if os.path.isfile(resolved) and resolved.lower().endswith(".pt"):
         try:
-            try:
-                from torch.serialization import safe_globals
-                from hierarchos.utils.checkpoint import AttrDict as CheckpointAttrDict
-                with safe_globals([CheckpointAttrDict]):
-                    checkpoint = torch.load(resolved, map_location="cpu", weights_only=True)
-            except (ImportError, AttributeError):
-                checkpoint = torch.load(resolved, map_location="cpu")
-            except Exception:
-                checkpoint = torch.load(resolved, map_location="cpu", weights_only=False)
+            checkpoint = load_checkpoint_payload_compatible(
+                resolved,
+                map_location="cpu",
+            )
             if isinstance(checkpoint, dict) and isinstance(checkpoint.get("config"), dict):
                 config = dict(checkpoint["config"])
                 if "completed_epoch" not in config and checkpoint.get("completed_epoch") is not None:
@@ -2980,7 +2974,10 @@ def main():
         print(f"  Output: {output_dir}/")
         
         try:
-            checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+            checkpoint = load_checkpoint_payload_compatible(
+                ckpt_path,
+                map_location='cpu',
+            )
         except Exception as e:
             print(f"ERROR: Failed to load checkpoint: {e}")
             sys.exit(1)

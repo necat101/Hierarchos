@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 from types import SimpleNamespace
 
 import pytest
@@ -143,6 +144,82 @@ def test_local_compact_cache_is_lossless_small_and_backward_ready(tmp_path, monk
     # A completed immutable-key cache is reused rather than rebuilt.
     assert hierarchos_cli.materialize_local_token_cache(args, _GPT2SizedTokenizer()) == cache_dir
     assert len(build_calls) == 1
+
+
+def test_hf_schema_v6_cache_can_move_roots_without_retokenizing(tmp_path, monkeypatch, capsys):
+    """A complete immutable-key HF cache is self-contained and relocatable."""
+    original_root = tmp_path / "original-cache-root"
+    relocated_root = tmp_path / "relocated-cache-root"
+    args = _cache_args(tmp_path / "unused.jsonl", original_root)
+    revision = "4ef25be0ca46e7da7c70121b0b6d8e99cc232a51"
+    args.hf_dataset = "netcat420/Experiment_0.1"
+    args.hf_dataset_revision = revision
+    args._resolved_hf_dataset_revision = revision
+    args.hf_token_cache_dir = str(original_root)
+    args.hf_shard_cache_dir = None
+    args.refresh_hf_token_cache = False
+    args.prefetch_factor = None
+
+    batch = _dummy_weighted_batch()
+    load_calls = []
+
+    def _fake_hf_load(*_args, **_kwargs):
+        load_calls.append(1)
+        return [{}, {}]
+
+    monkeypatch.setattr(hierarchos_cli, "load_hf_dataset", _fake_hf_load)
+    monkeypatch.setattr(
+        hierarchos_cli,
+        "create_map_style_dataloader",
+        lambda *_args, **_kwargs: [batch],
+    )
+    original_leaf = hierarchos_cli.materialize_hf_token_cache(
+        args,
+        _GPT2SizedTokenizer(),
+    )
+    assert len(load_calls) == 1
+    assert {
+        "_SUCCESS",
+        "index.pt",
+        "tokens.bin",
+    }.issubset(set(os.listdir(original_leaf)))
+    index = torch.load(
+        os.path.join(original_leaf, "index.pt"),
+        map_location="cpu",
+        weights_only=True,
+    )
+    assert index["storage_schema_version"] == 6
+    assert index["cache_payload"]["dataset_revision"] == revision
+
+    cache_key = os.path.basename(original_leaf)
+    relocated_leaf = relocated_root / cache_key
+    shutil.copytree(original_leaf, relocated_leaf)
+    shutil.rmtree(original_root)
+
+    relocated_args = SimpleNamespace(**vars(args))
+    relocated_args.hf_token_cache_dir = str(relocated_root)
+
+    def _must_not_retokenize(*_args, **_kwargs):
+        raise AssertionError("a relocated complete cache must not reload the HF dataset")
+
+    monkeypatch.setattr(hierarchos_cli, "load_hf_dataset", _must_not_retokenize)
+    reused_leaf = hierarchos_cli.materialize_hf_token_cache(
+        relocated_args,
+        _GPT2SizedTokenizer(),
+    )
+    assert reused_leaf == str(relocated_leaf)
+    assert "Reusing HF random-access token cache" in capsys.readouterr().out
+
+    dataset = TokenizedBinaryDataset(reused_leaf, max_length=4, pad_token_id=99)
+    try:
+        assert len(dataset) == 2
+        assert torch.equal(
+            dataset[0]["input_ids"],
+            torch.tensor([10, 11, 12, 13], dtype=torch.int32),
+        )
+        assert torch.equal(dataset[0]["loss_weights"], batch["loss_weights"][0, :4])
+    finally:
+        dataset.close()
 
 
 def test_compact_cache_rejects_corrupt_loss_run_metadata(tmp_path, monkeypatch):

@@ -16,6 +16,7 @@ from .optimizers import DirectMLAdamW
 from ..utils.device import is_directml_device, set_threads
 from ..utils.checkpoint import (
     TRANSIENT_LTM_STATE_KEYS,
+    load_checkpoint_payload_compatible,
     save_checkpoint_safely,
     load_full_model_with_config,
     load_model_state_dict_compatible,
@@ -2664,7 +2665,10 @@ def train(args, device, tokenizer, dataloader, dataloader_len, model_override=No
 
     elif args.resume_from_ckpt:
         print(f"Resuming from checkpoint: {args.resume_from_ckpt}")
-        checkpoint = torch.load(args.resume_from_ckpt, map_location='cpu', weights_only=False)
+        checkpoint = load_checkpoint_payload_compatible(
+            args.resume_from_ckpt,
+            map_location='cpu',
+        )
         
         saved_config = checkpoint.get('config', {})
         model_config = AttrDict(saved_config)
@@ -3349,7 +3353,10 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
     checkpoint = None
     if getattr(args, 'resume_from_ckpt', None):
         print(f"Resuming LoRA finetune from: {args.resume_from_ckpt}")
-        checkpoint = torch.load(args.resume_from_ckpt, map_location='cpu', weights_only=False)
+        checkpoint = load_checkpoint_payload_compatible(
+            args.resume_from_ckpt,
+            map_location='cpu',
+        )
         if 'model_state_dict' in checkpoint:
             state_dict = sanitize_model_state_dict(checkpoint['model_state_dict'], reset_transient_ltm=False)
             _reject_unsupported_rwkv_state_dict(state_dict, args.resume_from_ckpt)

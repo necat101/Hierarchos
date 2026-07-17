@@ -77,6 +77,50 @@ class AttrDict(dict):
         super(AttrDict, self).__init__(*args, **kwargs)
         self.__dict__ = self
 
+
+def _legacy_numpy_checkpoint_safe_globals():
+    """Return the narrow NumPy allowlist needed by saved MT19937 RNG state."""
+    import numpy as np
+
+    try:
+        from numpy._core.multiarray import _reconstruct as numpy_reconstruct
+    except ImportError:  # NumPy 1.x
+        from numpy.core.multiarray import _reconstruct as numpy_reconstruct
+
+    # Training checkpoints saved before v0.21 contain np.random.get_state().
+    # NumPy changed the pickle module path at 2.0, so accept both spellings for
+    # this one function. The dynamically-created uint32 dtype class is not
+    # reported by get_unsafe_globals_in_checkpoint(), but PyTorch requires it.
+    reconstruct_globals = [numpy_reconstruct]
+    if hasattr(torch.serialization, "get_unsafe_globals_in_checkpoint"):
+        # PyTorch 2.6+ accepts an explicit pickle path alongside the callable,
+        # which makes NumPy 1.x-created checkpoints portable to NumPy 2.x and
+        # vice versa. PyTorch 2.5's safe_globals accepts callables only.
+        reconstruct_globals = [
+            (numpy_reconstruct, "numpy._core.multiarray._reconstruct"),
+            (numpy_reconstruct, "numpy.core.multiarray._reconstruct"),
+        ]
+
+    return [
+        *reconstruct_globals,
+        np.ndarray,
+        np.dtype,
+        type(np.dtype(np.uint32)),
+    ]
+
+
+def load_checkpoint_payload_compatible(path: str, map_location="cpu"):
+    """Load Hierarchos payloads safely, including legacy NumPy RNG metadata."""
+    try:
+        from torch.serialization import safe_globals
+    except (ImportError, AttributeError):
+        # PyTorch releases predating safe_globals retain their legacy loader.
+        return torch.load(path, map_location=map_location)
+
+    allowed_globals = [AttrDict, *_legacy_numpy_checkpoint_safe_globals()]
+    with safe_globals(allowed_globals):
+        return torch.load(path, map_location=map_location, weights_only=True)
+
 def _resolve_weights_path(model_path: str) -> Tuple[str, str]:
     """Resolve a Hierarchos model source to (weights_path, model_dir)."""
     if not model_path:
@@ -346,18 +390,7 @@ def load_full_model_with_config(model_path: str, device):
     weights_path, model_dir = _resolve_weights_path(model_path)
 
     try:
-        # Compatibility with different PyTorch versions and custom classes
-        try:
-            from torch.serialization import safe_globals
-            with safe_globals([AttrDict]):
-                checkpoint = torch.load(weights_path, map_location="cpu", weights_only=True)
-        except (ImportError, AttributeError):
-            checkpoint = torch.load(weights_path, map_location="cpu")
-            
-        if not isinstance(checkpoint, dict) or ('config' not in checkpoint and 'model_state_dict' not in checkpoint):
-            # Fallback for old style checkpoints
-            checkpoint = torch.load(weights_path, map_location="cpu", weights_only=False)
-
+        checkpoint = load_checkpoint_payload_compatible(weights_path, map_location="cpu")
     except Exception as e:
         raise RuntimeError(f"Failed to load checkpoint: {e}")
 
